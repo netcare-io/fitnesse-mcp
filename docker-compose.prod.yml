@@ -1,0 +1,10 @@
+services:
+  fitnesse-mcp:
+    image: fitnesse-mcp:latest
+    build:
+      context: .
+      dockerfile: .devcontainer/Dockerfile
+      target: production
+    ports:
+      - "8000:8000"
+    restart: unless-stopped

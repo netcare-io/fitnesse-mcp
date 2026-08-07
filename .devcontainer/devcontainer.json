@@ -1,0 +1,21 @@
+{
+    "name": "FastMCP Dev",
+    "build": {
+        "context": "..",
+        "dockerfile": "Dockerfile",
+        "target": "devcontainer"
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "charliermarsh.ruff"
+            ]
+        }
+    },
+    "forwardPorts": [
+        6274,
+        8000
+    ]
+}

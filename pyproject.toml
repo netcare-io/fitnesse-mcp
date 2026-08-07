@@ -1,0 +1,19 @@
+[project]
+name = "fitnesse-mcp"
+version = "0.1.0"
+description = "FastMCP development workspace"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "fastmcp>=4.0.0b2"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9",
+  "pytest-asyncio>=1.4",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 netcare GmbH. All rights reserved.
+# SPDX-License-Identifier: MIT
 """
 Behavioural tests for server.py.
 

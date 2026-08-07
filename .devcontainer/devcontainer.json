@@ -11,11 +11,26 @@
                 "ms-python.python",
                 "ms-python.vscode-pylance",
                 "charliermarsh.ruff"
-            ]
+            ],
+            "settings": {
+                "python.defaultInterpreterPath": "/opt/venv/bin/python",
+                "python.testing.pytestEnabled": true,
+                "[python]": {
+                    "editor.defaultFormatter": "charliermarsh.ruff",
+                    "editor.formatOnSave": true
+                }
+            }
         }
     },
+    // Re-install editable against the bind-mounted workspace, not the build-time stub.
+    "postCreateCommand": "pip install -e '.[dev]'",
     "forwardPorts": [
         6274,
+        6277,
         8000
+    ],
+    // Lets FITNESSE_BASE_URL=http://host.docker.internal:8080 resolve on plain Linux Docker.
+    "runArgs": [
+        "--add-host=host.docker.internal:host-gateway"
     ]
 }

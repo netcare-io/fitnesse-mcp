@@ -1,0 +1,27 @@
+# Version control
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Tests
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Dev tooling
+.devcontainer/
+scripts/
+
+# Docs
+README.md
+LICENSE
+
+# Environment files
+.env
+.env.*

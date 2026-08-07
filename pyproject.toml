@@ -1,11 +1,26 @@
 [project]
 name = "fitnesse-mcp"
 version = "0.1.0"
-description = "FastMCP development workspace"
+description = "An MCP server exposing FitNesse's REST responders as tools"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["mcp", "fastmcp", "fitnesse", "testing", "llm"]
+authors = [{ name = "netcare GmbH" }]
+
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Testing",
+]
+
+# Pinned exactly: FastMCP 4 is a prerelease and each beta has carried
+# breaking changes. Bump deliberately, and run the test suite after.
 dependencies = [
-  "fastmcp>=4.0.0b2"
+  "fastmcp==4.0.0b2",
 ]
 
 [project.optional-dependencies]
@@ -14,6 +29,29 @@ dev = [
   "pytest-asyncio>=1.4",
 ]
 
+[project.urls]
+Homepage = "https://netcare.de"
+Repository = "https://github.com/netcare-io/fitnesse-mcp"
+Issues = "https://github.com/netcare-io/fitnesse-mcp/issues"
+
+[project.scripts]
+fitnesse-mcp = "server:main"
+
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
+
+# server.py sits at the repo root alongside tests/ and scripts/, which
+# defeats setuptools' flat-layout auto-discovery. Name the module explicitly.
+[tool.setuptools]
+py-modules = ["server"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Without this, pytest-asyncio's strict mode ignores unmarked async tests.
+asyncio_mode = "auto"
+
+# uv only allows prereleases for packages named explicitly, and fastmcp-slim
+# arrives transitively at the same version.
+[tool.uv]
+constraint-dependencies = ["fastmcp-slim==4.0.0b2"]

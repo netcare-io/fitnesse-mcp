@@ -1,65 +1,111 @@
 # fitnesse-mcp
 
-Starter FastMCP workspace for local development in a VS Code devcontainer.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![FastMCP](https://img.shields.io/badge/FastMCP-4.0.0b2-blue.svg)](https://gofastmcp.com)
 
-## Running the tests
+An MCP server that exposes [FitNesse](http://fitnesse.org/)'s REST responders as
+tools, letting an MCP client read wiki pages, run tests and suites, manage the
+files section, and inspect test history on a FitNesse instance.
+
+Copyright (c) 2026 [netcare GmbH](https://github.com/netcare-io). Released under
+the [MIT License](LICENSE).
+
+---
+
+## Requirements
+
+- [VS Code](https://code.visualstudio.com/) with the
+  [Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers),
+  plus Docker — the devcontainer supplies the Python toolchain and dependencies
+- A reachable FitNesse instance
+
+Working outside the devcontainer? You'll need Python 3.12+ and FastMCP 4, which
+is **currently a prerelease** and must be pinned exactly:
 
 ```bash
-pip install -e ".[dev]"
-pytest tests/
+pip install "fastmcp==4.0.0b2"
 ```
 
-## FitNesse REST tools included
+Using uv? `fastmcp` is a thin wrapper that depends on `fastmcp-slim` at the same
+version, and uv only allows prereleases for packages you name explicitly:
 
-The server now exposes a set of MCP tools mapped to FitNesse REST responders
-from the official docs:
+```toml
+[project]
+dependencies = ["fastmcp==4.0.0b2"]
 
-- `fitnesse_add_child_page`: `responder=addChild`
-- `fitnesse_compare_history`: `responder=compareHistory`
-- `fitnesse_create_dir`: `responder=createDir`
-- `fitnesse_delete_page`: `responder=deletePage`
-- `fitnesse_delete_file`: `responder=deleteFile`
-- `fitnesse_edit_page`: `responder=edit` with redirect/nonExistent options
-- `fitnesse_execute_search_properties`: `responder=executeSearchProperties`
-- `fitnesse_list_files`: `responder=files`
-- `fitnesse_get_page`: `responder=getPage`
-- `fitnesse_import_pages`: `responder=import`
-- `fitnesse_import_and_view`: `responder=importAndView`
-- `fitnesse_get_instruction`: `responder=instruction`
-- `fitnesse_move_page`: `responder=movePage`
-- `fitnesse_list_names`: `responder=names`
-- `fitnesse_get_new_page_form`: `responder=new`
-- `fitnesse_get_packet`: `responder=packet`
-- `fitnesse_get_page_data`: `responder=pageData`
-- `fitnesse_get_page_history`: `responder=pageHistory`
-- `fitnesse_get_properties`: `responder=properties`
-- `fitnesse_publish`: `responder=publish`
-- `fitnesse_purge_history`: `responder=purgeHistory`
-- `fitnesse_get_raw`: `responder=raw`
-- `fitnesse_get_refactor_screen`: `responder=refactor`
-- `fitnesse_rename_file`: `responder=renameFile`
-- `fitnesse_rename_page`: `responder=renamePage`
-- `fitnesse_rollback_version`: `responder=rollback`
-- `fitnesse_get_rss`: `responder=rss`
-- `fitnesse_save_page_content`: `responder=saveData` (POST form data)
-- `fitnesse_save_properties`: `responder=saveProperties` (POST form data)
-- `fitnesse_search`: `responder=search`
-- `fitnesse_get_search_form`: `responder=searchForm`
-- `fitnesse_shutdown`: `responder=shutdown` _(requires `FITNESSE_ALLOW_SHUTDOWN=1`)_
-- `fitnesse_stop_test`: `responder=stoptest`
-- `fitnesse_run_suite`: `responder=suite` with suite filters/debug/nochunk
-- `fitnesse_manage_symlink`: `responder=symlink`
-- `fitnesse_run_test`: `responder=test`
-- `fitnesse_get_test_history`: `responder=testHistory`
-- `fitnesse_upload_file`: `responder=upload` (POST multipart form data)
-- `fitnesse_get_versions`: `responder=versions`
-- `fitnesse_view_version`: `responder=viewVersion`
-- `fitnesse_where_used`: `responder=whereUsed`
-- `fitnesse_get_variables`: `responder=variables`
+[tool.uv]
+constraint-dependencies = ["fastmcp-slim==4.0.0b2"]
+```
 
-Support utilities:
+> **Pin exactly, not `>=4.0.0b1`.** Each beta in the v4 line has carried
+> breaking changes. This project tracks the prerelease and the pin will move at
+> GA.
 
-- `fitnesse_get_page_content`: convenience alias for `responder=edit`
+---
+
+## Quickstart
+
+**1. Open the project in its devcontainer.**
+
+```bash
+git clone https://github.com/netcare-io/fitnesse-mcp.git
+cd fitnesse-mcp
+code .
+```
+
+VS Code detects `.devcontainer/` and prompts to reopen in the container — accept
+it, or run **Dev Containers: Reopen in Container** from the command palette
+(`F1`). The first build takes a few minutes; later starts are quick. Python and
+all dependencies are installed inside the container, so there's nothing to set
+up on your host.
+
+**2. Point the server at your FitNesse instance.**
+
+Run the remaining commands in the container's terminal:
+
+```bash
+export FITNESSE_BASE_URL=http://your-fitnesse-host:8080
+export FITNESSE_READONLY=1          # recommended for a first run
+
+fastmcp run server.py
+```
+
+`localhost` in that URL refers to the container, not your host — see
+[Troubleshooting](#troubleshooting) if the connection is refused.
+
+**3. Verify it works.**
+
+Start the inspector and call `fitnesse_get_raw` with `page_path=FrontPage`:
+
+```bash
+fastmcp-inspector
+```
+
+A successful call returns `"ok": true` and the raw wiki markup of the page.
+
+---
+
+## Security
+
+This server gives an LLM client the ability to **delete pages, purge test
+history, and roll back versions** on your FitNesse instance. Two controls limit
+that, and both are opt-in:
+
+- **Start with `FITNESSE_READONLY=1`.** This hides every write, execute, and
+  control tool, leaving the 23 read-only tools. Open it up deliberately once you
+  know which operations you actually want the model to perform.
+- **`fitnesse_shutdown` is not registered at all** unless
+  `FITNESSE_ALLOW_SHUTDOWN` is set. It stops the FitNesse server.
+
+Two further notes:
+
+- Uploads are disabled unless `FITNESSE_UPLOAD_ROOT` is set, and
+  `fitnesse_upload_file` will only read files resolving inside that directory.
+- Credentials in `claude_desktop_config.json` are stored in **cleartext**. For
+  shared machines, prefer the HTTP pattern below with the credentials in the
+  server's own environment.
+
+---
 
 ## Environment variables
 
@@ -68,48 +114,131 @@ Support utilities:
 | `FITNESSE_BASE_URL` | `http://localhost:8080` | FitNesse server base URL |
 | `FITNESSE_USERNAME` | _(none)_ | Basic Auth username |
 | `FITNESSE_PASSWORD` | _(none)_ | Basic Auth password |
-| `FITNESSE_READONLY` | `false` | Set to `1`/`true`/`yes`/`on` to hide all write, execute, and control tools |
-| `FITNESSE_ALLOW_SHUTDOWN` | `false` | Set to `1`/`true`/`yes`/`on` to expose `fitnesse_shutdown` |
-| `FITNESSE_UPLOAD_ROOT` | _(none, uploads disabled)_ | Absolute path on the host; `fitnesse_upload_file` only reads files under this directory |
-| `FITNESSE_MAX_RESPONSE_BYTES` | `1048576` (1 MB) | Truncate FitNesse responses larger than this many bytes |
-| `FITNESSE_MAX_UPLOAD_BYTES` | `10485760` (10 MB) | Reject upload files larger than this many bytes |
+| `FITNESSE_READONLY` | `false` | `1`/`true`/`yes`/`on` hides all write, execute, and control tools |
+| `FITNESSE_ALLOW_SHUTDOWN` | `false` | `1`/`true`/`yes`/`on` exposes `fitnesse_shutdown` |
+| `FITNESSE_UPLOAD_ROOT` | _(none — uploads disabled)_ | Absolute host path; `fitnesse_upload_file` only reads files beneath it |
+| `FITNESSE_MAX_RESPONSE_BYTES` | `1048576` (1 MB) | Responses above this are truncated and flagged `"truncated": true` |
+| `FITNESSE_MAX_UPLOAD_BYTES` | `10485760` (10 MB) | Uploads above this are rejected |
 
-Flag-style FitNesse inputs are supported by passing `None` values in query params (for example, `{"nohistory": None}`).
+---
 
-## Devcontainer
+## Tools
 
-This project uses a multi-stage Dockerfile at `.devcontainer/Dockerfile`.
+42 tools by default (43 with `FITNESSE_ALLOW_SHUTDOWN`), each mapping to one
+FitNesse responder. Under `FITNESSE_READONLY`, only the 23 **read** tools are
+exposed.
 
-- `devcontainer` target: used by VS Code for development
-- `production` target: used by Docker Compose for deployment
+<details>
+<summary><b>Full tool list</b></summary>
+
+### Pages — read
+
+| Tool | Responder |
+|---|---|
+| `fitnesse_get_page` | `getPage` |
+| `fitnesse_get_raw` | `raw` |
+| `fitnesse_get_page_data` | `pageData` |
+| `fitnesse_get_packet` | `packet` — all tables on a page, as JSON |
+| `fitnesse_get_properties` | `properties` |
+| `fitnesse_get_variables` | `variables` |
+| `fitnesse_list_names` | `names` |
+| `fitnesse_edit_page` | `edit` — with redirect/nonExistent options |
+| `fitnesse_get_page_content` | `edit` — convenience alias |
+| `fitnesse_get_new_page_form` | `new` |
+| `fitnesse_get_refactor_screen` | `refactor` |
+| `fitnesse_get_rss` | `rss` |
+
+### Pages — write
+
+| Tool | Responder |
+|---|---|
+| `fitnesse_add_child_page` | `addChild` |
+| `fitnesse_save_page_content` | `saveData` (POST form data) |
+| `fitnesse_save_properties` | `saveProperties` (POST form data) |
+| `fitnesse_rename_page` | `renamePage` |
+| `fitnesse_move_page` | `movePage` |
+| `fitnesse_delete_page` | `deletePage` |
+| `fitnesse_manage_symlink` | `symlink` |
+| `fitnesse_import_pages` | `import` |
+| `fitnesse_import_and_view` | `importAndView` |
+| `fitnesse_publish` | `publish` |
+
+### Tests
+
+| Tool | Responder | Mode |
+|---|---|---|
+| `fitnesse_run_test` | `test` | execute |
+| `fitnesse_run_suite` | `suite` — suite filters, debug, nochunk | execute |
+| `fitnesse_get_instruction` | `instruction` — Slim instructions | read |
+| `fitnesse_stop_test` | `stoptest` | control |
+| `fitnesse_shutdown` | `shutdown` _(needs `FITNESSE_ALLOW_SHUTDOWN`)_ | control |
+
+### History & versions
+
+| Tool | Responder | Mode |
+|---|---|---|
+| `fitnesse_get_test_history` | `testHistory` | read |
+| `fitnesse_get_page_history` | `pageHistory` | read |
+| `fitnesse_compare_history` | `compareHistory` | read |
+| `fitnesse_get_versions` | `versions` | read |
+| `fitnesse_view_version` | `viewVersion` | read |
+| `fitnesse_rollback_version` | `rollback` | write |
+| `fitnesse_purge_history` | `purgeHistory` | write |
+
+### Search
+
+| Tool | Responder |
+|---|---|
+| `fitnesse_search` | `search` — read |
+| `fitnesse_execute_search_properties` | `executeSearchProperties` — read |
+| `fitnesse_get_search_form` | `searchForm` — read |
+| `fitnesse_where_used` | `whereUsed` — read |
+
+### Files section
+
+| Tool | Responder | Mode |
+|---|---|---|
+| `fitnesse_list_files` | `files` | read |
+| `fitnesse_create_dir` | `createDir` | write |
+| `fitnesse_upload_file` | `upload` (POST multipart) | write |
+| `fitnesse_rename_file` | `renameFile` | write |
+| `fitnesse_delete_file` | `deleteFile` | write |
+
+</details>
+
+Flag-style FitNesse inputs are supported by passing `None` as a query param
+value — for example `{"nohistory": None}` produces `?nohistory`.
+
+---
 
 ## Connecting an MCP client
 
-There are two patterns depending on your use case.
+### Pattern 1 — stdio (simple, local)
 
-### Pattern 1 — Stdio (simple, local)
-
-No server process needed. The MCP client launches the server itself as a subprocess and communicates over stdin/stdout.
-
-Configure your client (e.g. `claude_desktop_config.json`):
+The client launches the server as a subprocess and talks over stdin/stdout. No
+server process to manage.
 
 ```json
 {
   "mcpServers": {
     "fitnesse": {
       "command": "fastmcp",
-      "args": ["run", "/workspaces/fitnesse-mcp/server.py"],
+      "args": ["run", "server.py"],
       "env": {
         "FITNESSE_BASE_URL": "http://your-fitnesse-host:8080",
         "FITNESSE_USERNAME": "your-username",
-        "FITNESSE_PASSWORD": "your-password"
+        "FITNESSE_PASSWORD": "your-password",
+        "FITNESSE_READONLY": "1"
       }
     }
   }
 }
 ```
 
-If the server runs in a Docker container, use `docker run` as the command. The `-i` flag keeps stdin open; `-e` forwards each variable from the `env` block into the container:
+Running the server from a Docker image instead? `-i` keeps stdin open, and each
+`-e` forwards one variable from the `env` block into the container. **Every
+variable you set in `env` needs its own `-e` flag** — anything missing here is
+silently ignored inside the container:
 
 ```json
 {
@@ -121,23 +250,25 @@ If the server runs in a Docker container, use `docker run` as the command. The `
         "-e", "FITNESSE_BASE_URL",
         "-e", "FITNESSE_USERNAME",
         "-e", "FITNESSE_PASSWORD",
+        "-e", "FITNESSE_READONLY",
         "fitnesse-mcp:latest"
       ],
       "env": {
         "FITNESSE_BASE_URL": "http://your-fitnesse-host:8080",
         "FITNESSE_USERNAME": "your-username",
-        "FITNESSE_PASSWORD": "your-password"
+        "FITNESSE_PASSWORD": "your-password",
+        "FITNESSE_READONLY": "1"
       }
     }
   }
 }
 ```
 
-### Pattern 2 — HTTP server (production, shared)
+### Pattern 2 — HTTP (shared, production)
 
-Use this when running in Docker or when multiple clients need to share one server instance.
-
-First start the server:
+Use this when several clients share one server instance, or when the server runs
+in Docker. Credentials live in the server's environment rather than in each
+client's config.
 
 ```bash
 FITNESSE_BASE_URL=http://your-fitnesse-host:8080 \
@@ -146,58 +277,103 @@ FITNESSE_PASSWORD=your-password \
 fastmcp run server.py --transport http
 ```
 
-Then connect a client directly via HTTP, or via the stdio proxy for clients that only speak stdio:
+Listens on port 8000 by default; override with `--port`.
+
+Most clients can point at the URL directly:
 
 ```json
 {
   "mcpServers": {
-    "fitnesse": {
-      "command": "fastmcp",
-      "args": ["run", "http://127.0.0.1:8000/mcp"]
-    }
+    "fitnesse": { "url": "http://127.0.0.1:8000/mcp" }
   }
 }
 ```
 
-## Interactive testing
+For clients that only speak stdio, `fastmcp run <url>` proxies to it.
 
-To call tools interactively via a browser UI:
+---
+
+## Interactive testing
 
 ```bash
 fastmcp-inspector
 ```
 
-Then open the exact URL printed in the terminal (it includes
-`?MCP_INSPECTOR_API_TOKEN=...`).
+Open the exact URL printed in the terminal — it carries a
+`?MCP_INSPECTOR_API_TOKEN=...` query parameter.
 
-In devcontainers (especially as root), prefer the wrapper below to avoid noisy
+In devcontainers (especially running as root), the wrapper suppresses noisy
 keyring/DBus warnings:
 
 ```bash
 ./scripts/run-inspector.sh
+
+INSPECTOR_RAW_LOGS=1 ./scripts/run-inspector.sh   # unfiltered logs
 ```
 
-If you want unfiltered raw logs for debugging:
+---
+
+## Troubleshooting
+
+**`401 Unauthorized`** — either `FITNESSE_USERNAME`/`FITNESSE_PASSWORD` are
+wrong, or FitNesse isn't configured for authentication and is rejecting the
+header. Confirm with `curl -u user:pass "$FITNESSE_BASE_URL/FrontPage?responder=raw"`.
+
+**`Connection refused`** — check `FITNESSE_BASE_URL`. Inside a container,
+`localhost` is the container, not your host; use `host.docker.internal` (Docker
+Desktop) or the host's LAN address.
+
+**A write tool is missing** — `FITNESSE_READONLY` is set. Note that any value
+other than `1`/`true`/`yes`/`on` counts as unset.
+
+**`"truncated": true` in a response** — the body exceeded
+`FITNESSE_MAX_RESPONSE_BYTES` and was cut. Common on suite runs with
+`includehtml`. Raise the limit or narrow the request.
+
+**`Invalid path`** — the page path contained `?`, `#`, `..`, or a null byte.
+FitNesse page paths are dotted (`FrontPage.MySuite.MyTest`) with no leading
+slash.
+
+**`ImportError` on startup** — almost certainly the FastMCP version. This
+project targets `4.0.0b2` exactly; v3 and the v4 alphas will not import.
+
+---
+
+## Development
 
 ```bash
-INSPECTOR_RAW_LOGS=1 ./scripts/run-inspector.sh
+pip install -e ".[dev]"
+pytest tests/
 ```
 
+The test suite runs the server in-process via `fastmcp.Client`, so it also
+verifies the pieces that only fail at call time: dependency injection of
+timeouts, tag-based tool visibility, and path-injection rejection. Run it after
+any FastMCP version bump — it doubles as the upgrade tripwire.
 
-## Production with Docker Compose
+### Devcontainer
+
+The devcontainer (see [Quickstart](#quickstart)) builds from a multi-stage
+Dockerfile at `.devcontainer/Dockerfile`:
+
+- `devcontainer` — used by VS Code for development
+- `production` — used by Docker Compose for deployment
+
+### Production with Docker Compose
 
 ```bash
 docker compose -f docker-compose.prod.yml up --build -d
 ```
 
-Pass env vars via a `.env` file alongside `docker-compose.prod.yml`:
+Env vars come from a `.env` file alongside `docker-compose.prod.yml`:
 
 ```bash
 FITNESSE_BASE_URL=http://your-fitnesse-host:8080
 FITNESSE_USERNAME=your-username
 FITNESSE_PASSWORD=your-password
-# FITNESSE_READONLY=1
+FITNESSE_READONLY=1
 # FITNESSE_ALLOW_SHUTDOWN=1
+# FITNESSE_UPLOAD_ROOT=/data/uploads
 ```
 
-Then open `http://localhost:8000/mcp`.
+The server is then available at `http://localhost:8000/mcp`.

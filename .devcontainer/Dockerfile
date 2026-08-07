@@ -12,9 +12,9 @@ WORKDIR /app
 RUN python -m venv "$VIRTUAL_ENV" \
 	&& "$VIRTUAL_ENV/bin/pip" install --no-cache-dir --upgrade pip uv
 
-# Install deps from pyproject.toml; stub my_server.py so setuptools doesn't complain.
+# Install deps from pyproject.toml; stub server.py so setuptools doesn't complain.
 COPY pyproject.toml ./
-RUN touch my_server.py \
+RUN touch server.py \
 	&& uv pip install --python "$VIRTUAL_ENV/bin/python" -e .
 
 FROM base AS devcontainer
@@ -30,7 +30,7 @@ RUN cat <<'EOF' > /usr/local/bin/fastmcp-inspector && chmod +x /usr/local/bin/fa
 #!/usr/bin/env bash
 set -euo pipefail
 
-dbus-run-session -- bash -lc 'source /workspaces/fitnesse-mcp/.venv/bin/activate && HOST=127.0.0.1 fastmcp dev inspector my_server.py:mcp --ui-port 6274 --server-port 6277'
+dbus-run-session -- bash -lc 'source /workspaces/fitnesse-mcp/.venv/bin/activate && HOST=127.0.0.1 fastmcp dev inspector server.py:mcp --ui-port 6274 --server-port 6277'
 EOF
 
 CMD ["bash"]
@@ -41,4 +41,4 @@ COPY . .
 
 EXPOSE 8000
 
-CMD ["fastmcp", "run", "my_server.py:mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["fastmcp", "run", "server.py:mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8000"]

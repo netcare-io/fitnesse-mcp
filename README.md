@@ -98,7 +98,7 @@ Configure your client (e.g. `claude_desktop_config.json`):
   "mcpServers": {
     "fitnesse": {
       "command": "fastmcp",
-      "args": ["run", "/workspaces/fitnesse-mcp/my_server.py"],
+      "args": ["run", "/workspaces/fitnesse-mcp/server.py"],
       "env": {
         "FITNESSE_BASE_URL": "http://your-fitnesse-host:8080",
         "FITNESSE_USERNAME": "your-username",
@@ -143,7 +143,7 @@ First start the server:
 FITNESSE_BASE_URL=http://your-fitnesse-host:8080 \
 FITNESSE_USERNAME=your-username \
 FITNESSE_PASSWORD=your-password \
-fastmcp run my_server.py --transport http
+fastmcp run server.py --transport http
 ```
 
 Then connect a client directly via HTTP, or via the stdio proxy for clients that only speak stdio:

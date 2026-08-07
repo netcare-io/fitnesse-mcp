@@ -1,5 +1,5 @@
 """
-Behavioural tests for my_server.py.
+Behavioural tests for server.py.
 
 Run with:  pytest tests/test_server.py -v
 """
@@ -11,7 +11,7 @@ import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-import my_server
+import server as my_server
 
 # ---------------------------------------------------------------------------
 # Helpers

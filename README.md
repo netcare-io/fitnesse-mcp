@@ -274,26 +274,12 @@ Most clients can point at the URL directly:
 ```json
 {
   "mcpServers": {
-    "fitnesse": { "url": "http://127.0.0.1:8000/mcp" }
+    "fitnesse": { "url": "http://localhost:8000/mcp" }
   }
 }
 ```
 
 For clients that only speak stdio, `fastmcp run <url>` proxies to it (internally).
-
-```json
-{
-  "mcpServers": {
-    "fitnesse": {
-      "command": "docker",
-      "args": [
-        "exec", "-i", "fitnesse-mcp",
-        "fastmcp", "run", "http://127.0.0.1:8000/mcp"
-      ]
-    }
-  }
-}
-```
 
 ---
 
@@ -374,4 +360,18 @@ FITNESSE_READONLY=1
 # FITNESSE_UPLOAD_ROOT=/data/uploads
 ```
 
-The server is then available at `http://localhost:8000/mcp`.
+The server is then available at `http://localhost:8000/mcp` or through the stdio-to-html-proxy for stdio-only clients:
+
+```json
+{
+  "mcpServers": {
+    "fitnesse": {
+      "command": "docker",
+      "args": [
+        "exec", "-i", "fitnesse-mcp",
+        "fastmcp", "run", "http://127.0.0.1:8000/mcp"
+      ]
+    }
+  }
+}
+```

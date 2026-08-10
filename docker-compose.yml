@@ -1,5 +1,6 @@
 services:
   fitnesse-mcp:
+    container_name: fitnesse-mcp
     image: fitnesse-mcp:latest
     build:
       context: .
@@ -8,6 +9,6 @@ services:
     env_file:
       - .env
     command: ["fastmcp", "run", "server.py:mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8000"]
-    ports:
-      - "8000:8000"
+    #ports:
+    #  - "8000:8000"
     restart: unless-stopped

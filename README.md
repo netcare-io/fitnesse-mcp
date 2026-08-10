@@ -279,7 +279,21 @@ Most clients can point at the URL directly:
 }
 ```
 
-For clients that only speak stdio, `fastmcp run <url>` proxies to it.
+For clients that only speak stdio, `fastmcp run <url>` proxies to it (internally).
+
+```json
+{
+  "mcpServers": {
+    "fitnesse": {
+      "command": "docker",
+      "args": [
+        "exec", "-i", "fitnesse-mcp",
+        "fastmcp", "run", "http://127.0.0.1:8000/mcp"
+      ]
+    }
+  }
+}
+```
 
 ---
 

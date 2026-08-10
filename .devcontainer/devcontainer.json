@@ -5,6 +5,8 @@
         "dockerfile": "Dockerfile",
         "target": "devcontainer"
     },
+    "workspaceMount": "source=${localWorkspaceFolder},target=/app,type=bind",
+    "workspaceFolder": "/app",
     "customizations": {
         "vscode": {
             "extensions": [
@@ -23,8 +25,6 @@
         }
     },
     "remoteUser": "vscode",
-    // Re-install editable against the bind-mounted workspace, not the build-time stub.
-    "postCreateCommand": "pip install -e '.[dev]'",
     "forwardPorts": [
         6274,
         6277,
@@ -32,6 +32,7 @@
     ],
     // Lets FITNESSE_BASE_URL=http://host.docker.internal:8080 resolve on plain Linux Docker.
     "runArgs": [
+        "--name=fitnesse-mcp-devcontainer",
         "--add-host=host.docker.internal:host-gateway"
     ]
 }

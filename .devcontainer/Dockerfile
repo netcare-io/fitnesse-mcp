@@ -22,8 +22,11 @@ FROM base AS devcontainer
 RUN useradd --create-home --uid 1000 --shell /bin/bash vscode \
 	&& chown -R vscode:vscode /opt/venv
 
+RUN mkdir -p /workspaces \
+	&& ln -sfn /app /workspaces/fitnesse-mcp
+
 RUN apt-get update \
-	&& apt-get install -y --no-install-recommends git ca-certificates curl dbus dbus-user-session libsecret-1-0 gnome-keyring \
+	&& apt-get install -y --no-install-recommends git ca-certificates curl dbus dbus-user-session libsecret-1-0 gnome-keyring gnupg \
 	&& curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 	&& apt-get install -y --no-install-recommends nodejs \
 	&& npm install -g @modelcontextprotocol/inspector@2.1.0 \

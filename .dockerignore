@@ -21,6 +21,7 @@ scripts/
 # Docs
 README.md
 
-# Environment files
+# Environment files (may contain secrets)
 .env
 .env.*
+fastmcp.json

@@ -29,11 +29,16 @@ RUN apt-get update \
 	&& npm install -g @modelcontextprotocol/inspector@2.1.0 \
 	&& rm -rf /var/lib/apt/lists/*
 
+# cwd is captured at runtime so the script works from any project directory.
 RUN cat <<'EOF' > /usr/local/bin/fastmcp-inspector && chmod +x /usr/local/bin/fastmcp-inspector
 #!/usr/bin/env bash
 set -euo pipefail
 
-dbus-run-session -- bash -lc 'HOST=127.0.0.1 fastmcp dev inspector server.py:mcp --ui-port 6274 --server-port 6277'
+_PROJECT_DIR="$(pwd)"
+dbus-run-session -- bash -lc "
+  cd \"$_PROJECT_DIR\"
+  HOST=127.0.0.1 fastmcp dev inspector --ui-port 6274 --server-port 6277
+"
 EOF
 
 CMD ["bash"]
@@ -44,4 +49,4 @@ COPY --chown=app:app . .
 USER app
 EXPOSE 8000
 
-CMD ["fastmcp", "run", "server.py:mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["fastmcp", "run", "server.py:mcp"]

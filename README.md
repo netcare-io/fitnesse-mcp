@@ -73,16 +73,6 @@ fastmcp run server.py
 `localhost` in that URL refers to the container, not your host — see
 [Troubleshooting](#troubleshooting) if the connection is refused.
 
-**3. Verify it works.**
-
-Start the inspector and call `fitnesse_get_raw` with `page_path=FrontPage`:
-
-```bash
-fastmcp-inspector
-```
-
-A successful call returns `"ok": true` and the raw wiki markup of the page.
-
 ---
 
 ## Security
@@ -295,21 +285,15 @@ For clients that only speak stdio, `fastmcp run <url>` proxies to it.
 
 ## Interactive testing
 
+Create fastmcp.json file.
+
 ```bash
-fastmcp-inspector
+./scripts/run-inspector.sh
 ```
 
 Open the exact URL printed in the terminal — it carries a
 `?MCP_INSPECTOR_API_TOKEN=...` query parameter.
 
-In devcontainers (especially running as root), the wrapper suppresses noisy
-keyring/DBus warnings:
-
-```bash
-./scripts/run-inspector.sh
-
-INSPECTOR_RAW_LOGS=1 ./scripts/run-inspector.sh   # unfiltered logs
-```
 
 ---
 
@@ -362,10 +346,10 @@ Dockerfile at `.devcontainer/Dockerfile`:
 ### Production with Docker Compose
 
 ```bash
-docker compose -f docker-compose.prod.yml up --build -d
+docker compose up --build -d
 ```
 
-Env vars come from a `.env` file alongside `docker-compose.prod.yml`:
+Env vars come from a `.env` file alongside `docker-compose.yml`:
 
 ```bash
 FITNESSE_BASE_URL=http://your-fitnesse-host:8080

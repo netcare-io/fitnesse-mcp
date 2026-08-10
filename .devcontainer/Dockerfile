@@ -19,6 +19,9 @@ RUN touch server.py \
 
 FROM base AS devcontainer
 
+RUN useradd --create-home --uid 1000 --shell /bin/bash vscode \
+	&& chown -R vscode:vscode /opt/venv
+
 RUN apt-get update \
 	&& apt-get install -y --no-install-recommends git ca-certificates curl dbus dbus-user-session libsecret-1-0 gnome-keyring \
 	&& curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \

@@ -22,6 +22,7 @@
             }
         }
     },
+    "remoteUser": "vscode",
     // Re-install editable against the bind-mounted workspace, not the build-time stub.
     "postCreateCommand": "pip install -e '.[dev]'",
     "forwardPorts": [

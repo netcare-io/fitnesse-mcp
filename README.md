@@ -343,6 +343,33 @@ Dockerfile at `.devcontainer/Dockerfile`:
 - `devcontainer` — used by VS Code for development
 - `production` — used by Docker Compose for deployment
 
+### Release
+
+Prerequisites:
+
+- Clean working tree, checked out on `main`
+- `docker login harbor.netcare.local` (or export `FITNESSE_MCP_REGISTRY` to
+  target a different registry)
+- Push access to `origin`
+- `gh auth login`, if you want the GitHub release created automatically
+
+Steps:
+
+```bash
+scripts/release.sh 0.2.0
+```
+
+This runs, in order:
+
+1. Runs `pytest` — aborts the release on failure
+2. Bumps `version` in `pyproject.toml` to `0.2.0`
+3. Commits the bump and tags it `v0.2.0`
+4. Builds the `production` Docker target, tagged `0.2.0` and `latest`
+5. Pushes both tags to `harbor.netcare.local/fitnesse-mcp`
+6. Pushes the commit and the `v0.2.0` tag to `origin`
+7. Opens a GitHub release for `v0.2.0` via `gh` (prints the manual-create
+   link instead if `gh` isn't installed)
+
 ### Production with Docker Compose
 
 ```bash

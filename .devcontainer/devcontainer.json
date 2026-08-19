@@ -7,12 +7,19 @@
     },
     "workspaceMount": "source=${localWorkspaceFolder},target=/app,type=bind",
     "workspaceFolder": "/app",
+    "features": {
+        // moby (the default engine) isn't packaged for Debian trixie, which python:3.12-slim is based on.
+        "ghcr.io/devcontainers/features/docker-in-docker:2": {
+            "moby": false
+        }
+    },
     "customizations": {
         "vscode": {
             "extensions": [
                 "ms-python.python",
                 "ms-python.vscode-pylance",
-                "charliermarsh.ruff"
+                "charliermarsh.ruff",
+                "Anthropic.claude-code"
             ],
             "settings": {
                 "python.defaultInterpreterPath": "/opt/venv/bin/python",
@@ -30,6 +37,8 @@
         6277,
         8000
     ],
+    // docker-in-docker needs elevated privileges to run its own dockerd.
+    "privileged": true,
     // Lets FITNESSE_BASE_URL=http://host.docker.internal:8080 resolve on plain Linux Docker.
     "runArgs": [
         "--name=fitnesse-mcp-devcontainer",

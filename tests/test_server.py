@@ -54,7 +54,7 @@ def _patch_urlopen(body: bytes = b'{"ok":true}', content_type: str = "applicatio
 async def test_tool_count_full():
     async with Client(my_server.mcp) as c:
         tools = await c.list_tools()
-    assert len(tools) == 42
+    assert len(tools) == 31
 
 
 @pytest.mark.asyncio
@@ -69,7 +69,7 @@ async def test_timeout_not_in_schema():
 async def test_page_path_description_in_schema():
     async with Client(my_server.mcp) as c:
         tools = await c.list_tools()
-    get_page = next(t for t in tools if t.name == "fitnesse_get_page")
+    get_page = next(t for t in tools if t.name == "fitnesse_get_page_data")
     schema = getattr(get_page, "input_schema", {})
     desc = schema["properties"]["page_path"]["description"]
     assert "FrontPage" in desc
@@ -84,7 +84,7 @@ async def test_page_path_description_in_schema():
 async def test_read_tool_returns_ok():
     with _patch_urlopen():
         async with Client(my_server.mcp) as c:
-            result = await c.call_tool("fitnesse_get_page", {"page_path": "FrontPage"})
+            result = await c.call_tool("fitnesse_get_page_data", {"page_path": "FrontPage"})
     assert result.data["ok"] is True
     assert "FrontPage" in result.data["url"]
 
@@ -100,7 +100,7 @@ async def test_timeout_resolved_to_float():
 
     with patch("urllib.request.urlopen", side_effect=spy):
         async with Client(my_server.mcp) as c:
-            await c.call_tool("fitnesse_get_page", {"page_path": "FrontPage"})
+            await c.call_tool("fitnesse_get_page_data", {"page_path": "FrontPage"})
 
     assert isinstance(captured["timeout"], float), f"expected float, got {type(captured['timeout'])}"
     assert captured["timeout"] == 30.0
@@ -114,14 +114,14 @@ async def test_timeout_resolved_to_float():
 async def test_query_injection_rejected():
     async with Client(my_server.mcp) as c:
         with pytest.raises(ToolError, match="Invalid path"):
-            await c.call_tool("fitnesse_get_page", {"page_path": "FrontPage?responder=deletePage"})
+            await c.call_tool("fitnesse_get_page_data", {"page_path": "FrontPage?responder=deletePage"})
 
 
 @pytest.mark.asyncio
 async def test_path_traversal_rejected():
     async with Client(my_server.mcp) as c:
         with pytest.raises(ToolError, match="Invalid path"):
-            await c.call_tool("fitnesse_get_page", {"page_path": "../../etc/passwd"})
+            await c.call_tool("fitnesse_get_page_data", {"page_path": "../../etc/passwd"})
 
 
 @pytest.mark.asyncio
@@ -129,7 +129,7 @@ async def test_reserved_param_injection_rejected():
     async with Client(my_server.mcp) as c:
         with pytest.raises(ToolError, match="Reserved query parameters"):
             await c.call_tool(
-                "fitnesse_get_page",
+                "fitnesse_run_test",
                 {"page_path": "FrontPage", "variables": {"responder": "deletePage"}},
             )
 
@@ -147,7 +147,7 @@ async def test_readonly_hides_write_tools():
             tools = {t.name for t in await c.list_tools()}
         assert "fitnesse_delete_page" not in tools
         assert "fitnesse_run_suite" not in tools
-        assert "fitnesse_get_page" in tools
+        assert "fitnesse_get_page_data" in tools
     finally:
         del os.environ["FITNESSE_READONLY"]
         importlib.reload(my_server)

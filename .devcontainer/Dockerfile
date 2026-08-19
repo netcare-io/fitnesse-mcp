@@ -25,6 +25,8 @@ FROM base AS devcontainer
 RUN useradd --create-home --uid 1000 --shell /bin/bash vscode \
 	&& chown -R vscode:vscode /opt/venv
 
+RUN uv pip install --python "$VIRTUAL_ENV/bin/python" -e ".[dev]"
+
 RUN mkdir -p /workspaces \
 	&& ln -sfn /app /workspaces/fitnesse-mcp
 

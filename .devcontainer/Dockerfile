@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-
 FROM python:3.12-slim AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -8,6 +6,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 	PATH="/opt/venv/bin:${PATH}"
 
 WORKDIR /app
+
+# Pull in current Debian security fixes from apt repositories.
+RUN apt-get update \
+	&& apt-get upgrade -y \
+	&& rm -rf /var/lib/apt/lists/*
 
 RUN python -m venv "$VIRTUAL_ENV" \
 	&& "$VIRTUAL_ENV/bin/pip" install --no-cache-dir --upgrade pip uv
@@ -26,10 +29,12 @@ RUN mkdir -p /workspaces \
 	&& ln -sfn /app /workspaces/fitnesse-mcp
 
 RUN apt-get update \
+	&& apt-get upgrade -y \
 	&& apt-get install -y --no-install-recommends git ca-certificates curl dbus dbus-user-session libsecret-1-0 gnome-keyring gnupg \
 	&& curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 	&& apt-get install -y --no-install-recommends nodejs \
 	&& npm install -g @modelcontextprotocol/inspector@2.1.0 \
+	&& apt-get clean \
 	&& rm -rf /var/lib/apt/lists/*
 
 # cwd is captured at runtime so the script works from any project directory.

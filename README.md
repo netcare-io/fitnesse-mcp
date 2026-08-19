@@ -356,7 +356,7 @@ Prerequisites:
 Steps:
 
 ```bash
-scripts/release.sh 0.2.0
+bash scripts/release.sh 0.2.0
 ```
 
 This runs, in order:

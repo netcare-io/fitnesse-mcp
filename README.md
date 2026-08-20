@@ -106,6 +106,7 @@ Two further notes:
 | `FITNESSE_PASSWORD` | _(none)_ | Basic Auth password |
 | `FITNESSE_READONLY` | `false` | `1`/`true`/`yes`/`on` hides all write, execute, and control tools |
 | `FITNESSE_ALLOW_SHUTDOWN` | `false` | `1`/`true`/`yes`/`on` exposes `fitnesse_shutdown` |
+| `FITNESSE_COMPLETE_TOOLSET` | `false` | `1`/`true`/`yes`/`on` exposes the 11 lower-traffic tools hidden by default (marked below) |
 | `FITNESSE_UPLOAD_ROOT` | _(none — uploads disabled)_ | Absolute host path; `fitnesse_upload_file` only reads files beneath it |
 | `FITNESSE_MAX_RESPONSE_BYTES` | `1048576` (1 MB) | Responses above this are truncated and flagged `"truncated": true` |
 | `FITNESSE_MAX_UPLOAD_BYTES` | `10485760` (10 MB) | Uploads above this are rejected |
@@ -114,9 +115,11 @@ Two further notes:
 
 ## Tools
 
-42 tools by default (43 with `FITNESSE_ALLOW_SHUTDOWN`), each mapping to one
-FitNesse responder. Under `FITNESSE_READONLY`, only the 23 **read** tools are
-exposed.
+31 tools by default, each mapping to one FitNesse responder. Set
+`FITNESSE_COMPLETE_TOOLSET=1` to expose 11 additional lower-traffic tools (42 total),
+and `FITNESSE_ALLOW_SHUTDOWN=1` to also expose `fitnesse_shutdown` (43 with
+both). Under `FITNESSE_READONLY`, only the **read** tools are exposed — 13 by
+default, or 23 with `FITNESSE_COMPLETE_TOOLSET=1`.
 
 <details>
 <summary><b>Full tool list</b></summary>
@@ -125,18 +128,18 @@ exposed.
 
 | Tool | Responder |
 |---|---|
-| `fitnesse_get_page` | `getPage` |
-| `fitnesse_get_raw` | `raw` |
+| `fitnesse_get_page` | `getPage` _(needs `FITNESSE_COMPLETE_TOOLSET`)_ |
+| `fitnesse_get_raw` | `raw` _(needs `FITNESSE_COMPLETE_TOOLSET`)_ |
 | `fitnesse_get_page_data` | `pageData` |
-| `fitnesse_get_packet` | `packet` — all tables on a page, as JSON |
+| `fitnesse_get_packet` | `packet` — all tables on a page, as JSON _(needs `FITNESSE_COMPLETE_TOOLSET`)_ |
 | `fitnesse_get_properties` | `properties` |
 | `fitnesse_get_variables` | `variables` |
 | `fitnesse_list_names` | `names` |
-| `fitnesse_edit_page` | `edit` — with redirect/nonExistent options |
-| `fitnesse_get_page_content` | `edit` — convenience alias |
-| `fitnesse_get_new_page_form` | `new` |
-| `fitnesse_get_refactor_screen` | `refactor` |
-| `fitnesse_get_rss` | `rss` |
+| `fitnesse_edit_page` | `edit` — with redirect/nonExistent options _(needs `FITNESSE_COMPLETE_TOOLSET`)_ |
+| `fitnesse_get_page_content` | `edit` — convenience alias _(needs `FITNESSE_COMPLETE_TOOLSET`)_ |
+| `fitnesse_get_new_page_form` | `new` _(needs `FITNESSE_COMPLETE_TOOLSET`)_ |
+| `fitnesse_get_refactor_screen` | `refactor` _(needs `FITNESSE_COMPLETE_TOOLSET`)_ |
+| `fitnesse_get_rss` | `rss` _(needs `FITNESSE_COMPLETE_TOOLSET`)_ |
 
 ### Pages — write
 
@@ -151,7 +154,7 @@ exposed.
 | `fitnesse_manage_symlink` | `symlink` |
 | `fitnesse_import_pages` | `import` |
 | `fitnesse_import_and_view` | `importAndView` |
-| `fitnesse_publish` | `publish` |
+| `fitnesse_publish` | `publish` _(needs `FITNESSE_COMPLETE_TOOLSET`)_ |
 
 ### Tests
 
@@ -167,7 +170,7 @@ exposed.
 
 | Tool | Responder | Mode |
 |---|---|---|
-| `fitnesse_get_test_history` | `testHistory` | read |
+| `fitnesse_get_test_history` | `testHistory` _(needs `FITNESSE_COMPLETE_TOOLSET`)_ | read |
 | `fitnesse_get_page_history` | `pageHistory` | read |
 | `fitnesse_compare_history` | `compareHistory` | read |
 | `fitnesse_get_versions` | `versions` | read |
@@ -181,7 +184,7 @@ exposed.
 |---|---|
 | `fitnesse_search` | `search` — read |
 | `fitnesse_execute_search_properties` | `executeSearchProperties` — read |
-| `fitnesse_get_search_form` | `searchForm` — read |
+| `fitnesse_get_search_form` | `searchForm` — read _(needs `FITNESSE_COMPLETE_TOOLSET`)_ |
 | `fitnesse_where_used` | `whereUsed` — read |
 
 ### Files section
@@ -384,6 +387,7 @@ FITNESSE_USERNAME=your-username
 FITNESSE_PASSWORD=your-password
 FITNESSE_READONLY=1
 # FITNESSE_ALLOW_SHUTDOWN=1
+# FITNESSE_COMPLETE_TOOLSET=1
 # FITNESSE_UPLOAD_ROOT=/data/uploads
 ```
 

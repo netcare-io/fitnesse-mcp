@@ -188,3 +188,32 @@ async def test_shutdown_exposed_when_flagged():
     finally:
         del os.environ["FITNESSE_ALLOW_SHUTDOWN"]
         importlib.reload(my_server)
+
+
+# ---------------------------------------------------------------------------
+# Complete toolset gate
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_complete_toolset_hidden_by_default():
+    async with Client(my_server.mcp) as c:
+        tools = {t.name for t in await c.list_tools()}
+    assert "fitnesse_get_page" not in tools
+    assert "fitnesse_get_raw" not in tools
+
+
+@pytest.mark.asyncio
+async def test_complete_toolset_exposed_when_flagged():
+    os.environ["FITNESSE_COMPLETE_TOOLSET"] = "1"
+    try:
+        importlib.reload(my_server)
+        async with Client(my_server.mcp) as c:
+            tools = await c.list_tools()
+        names = {t.name for t in tools}
+        assert "fitnesse_get_page" in names
+        assert "fitnesse_get_raw" in names
+        assert "fitnesse_publish" in names
+        assert len(tools) == 42
+    finally:
+        del os.environ["FITNESSE_COMPLETE_TOOLSET"]
+        importlib.reload(my_server)

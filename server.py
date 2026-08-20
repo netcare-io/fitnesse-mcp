@@ -56,6 +56,10 @@ def _env_flag(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+# Extra low-traffic/read-heavy tools trimmed from the default set; opt back in with FITNESSE_COMPLETE_TOOLSET=1.
+FITNESSE_COMPLETE_TOOLSET = _env_flag("FITNESSE_COMPLETE_TOOLSET")
+
+
 def _make_timeout(default: float):
     def factory() -> float:
         return default
@@ -344,6 +348,34 @@ def fitnesse_delete_file(
     )
 
 
+if FITNESSE_COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_edit_page",
+        description="Returns the edit screen for a wiki page and supports redirectToReferer, redirectAction, and nonExistent options.",
+        tags={"fitnesse", "rest", "pages", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_edit_page(
+        page_path: WikiPath,
+        redirect_to_referer: bool = False,
+        redirect_action: str | None = None,
+        non_existent: bool = False,
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """Open edit responder with optional redirect/nonExistent options."""
+        params: dict[str, str | None] = {"responder": "edit"}
+        if redirect_to_referer:
+            params["redirectToReferer"] = None
+        if redirect_action:
+            params["redirectAction"] = redirect_action
+        if non_existent:
+            params["nonExistent"] = None
+        return _request(
+            "GET", page_path, params=params, timeout_seconds=timeout_seconds
+        )
+
+
 @mcp.tool(
     name="fitnesse_execute_search_properties",
     description="Returns pages matching property criteria such as pageType, Suites, Action, and exclude flags for setup, teardown, or obsolete pages.",
@@ -394,6 +426,30 @@ def fitnesse_list_files(
         params={"responder": "files"},
         timeout_seconds=timeout_seconds,
     )
+
+
+if FITNESSE_COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_get_page",
+        description="Views the selected page, supports dontCreatePage, and accepts key value markup variables.",
+        tags={"fitnesse", "rest", "pages", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_get_page(
+        page_path: WikiPath,
+        dont_create_page: bool = False,
+        variables: dict[str, str] | None = None,
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """View a page via responder=getPage with optional markup variables."""
+        params: dict[str, str | None] = {"responder": "getPage"}
+        if dont_create_page:
+            params["dontCreatePage"] = None
+        params = _merge_extra(params, variables)
+        return _request(
+            "GET", page_path, params=params, timeout_seconds=timeout_seconds
+        )
 
 
 def _import_pages(
@@ -534,6 +590,53 @@ def fitnesse_list_names(
     return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
 
 
+if FITNESSE_COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_get_new_page_form",
+        description="Returns the new page form similar to edit, with optional pageTemplate and pageType.",
+        tags={"fitnesse", "rest", "pages", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_get_new_page_form(
+        page_path: WikiPath,
+        page_template: str | None = None,
+        page_type: PageType | None = None,
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """Open new-page form via responder=new."""
+        params: dict[str, str | None] = {"responder": "new"}
+        if page_template:
+            params["pageTemplate"] = page_template
+        if page_type:
+            params["pageType"] = page_type
+        return _request(
+            "GET", page_path, params=params, timeout_seconds=timeout_seconds
+        )
+
+
+if FITNESSE_COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_get_packet",
+        description="Returns a JSON packet containing all tables on a page and optionally wraps output using jsonp.",
+        tags={"fitnesse", "rest", "pages", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_get_packet(
+        page_path: WikiPath,
+        jsonp: str | None = None,
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """Get table packet JSON via responder=packet."""
+        params: dict[str, str | None] = {"responder": "packet"}
+        if jsonp:
+            params["jsonp"] = jsonp
+        return _request(
+            "GET", page_path, params=params, timeout_seconds=timeout_seconds
+        )
+
+
 @mcp.tool(
     name="fitnesse_get_page_data",
     description="Returns the raw wiki text of the selected page via pageData responder.",
@@ -590,6 +693,28 @@ def fitnesse_get_properties(
     )
 
 
+if FITNESSE_COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_publish",
+        description="Publishes the site as static HTML files using destination as the output root path.",
+        tags={"fitnesse", "rest", "pages", "write"},
+        annotations={"destructiveHint": False, "idempotentHint": True},
+    )
+    def fitnesse_publish(
+        page_path: WikiPath,
+        destination: str,
+        timeout_seconds: float = _make_timeout(120.0),
+    ) -> dict:
+        """Publish static HTML via responder=publish."""
+        return _request(
+            "GET",
+            page_path,
+            params={"responder": "publish", "destination": destination},
+            timeout_seconds=timeout_seconds,
+        )
+
+
 @mcp.tool(
     name="fitnesse_purge_history",
     description="Purges old test history files while preserving the configured number of days.",
@@ -608,6 +733,48 @@ def fitnesse_purge_history(
         params={"responder": "purgeHistory", "days": str(days)},
         timeout_seconds=timeout_seconds,
     )
+
+
+if FITNESSE_COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_get_raw",
+        description="Returns the raw wiki text of the selected page using the raw responder.",
+        tags={"fitnesse", "rest", "pages", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_get_raw(
+        page_path: WikiPath,
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """Get raw wiki text via responder=raw."""
+        return _request(
+            "GET",
+            page_path,
+            params={"responder": "raw"},
+            timeout_seconds=timeout_seconds,
+        )
+
+
+if FITNESSE_COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_get_refactor_screen",
+        description="Displays the refactoring screen for the selected page.",
+        tags={"fitnesse", "rest", "pages", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_get_refactor_screen(
+        page_path: WikiPath,
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """Get refactor screen via responder=refactor."""
+        return _request(
+            "GET",
+            page_path,
+            params={"responder": "refactor"},
+            timeout_seconds=timeout_seconds,
+        )
 
 
 @mcp.tool(
@@ -669,6 +836,27 @@ def fitnesse_rollback_version(
         params={"responder": "rollback", "version": version},
         timeout_seconds=timeout_seconds,
     )
+
+
+if FITNESSE_COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_get_rss",
+        description="Returns an RSS feed for the current page and all of its children.",
+        tags={"fitnesse", "rest", "pages", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_get_rss(
+        page_path: WikiPath,
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """Get RSS feed via responder=rss."""
+        return _request(
+            "GET",
+            page_path,
+            params={"responder": "rss"},
+            timeout_seconds=timeout_seconds,
+        )
 
 
 @mcp.tool(
@@ -781,6 +969,27 @@ def fitnesse_search(
         },
         timeout_seconds=timeout_seconds,
     )
+
+
+if FITNESSE_COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_get_search_form",
+        description="Returns the search form used to configure page searches.",
+        tags={"fitnesse", "rest", "search", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_get_search_form(
+        page_path: WikiPath = "",
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """Get search form via responder=searchForm."""
+        return _request(
+            "GET",
+            page_path,
+            params={"responder": "searchForm"},
+            timeout_seconds=timeout_seconds,
+        )
 
 
 if _env_flag("FITNESSE_ALLOW_SHUTDOWN"):
@@ -909,6 +1118,27 @@ def fitnesse_run_test(
     return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
 
 
+if FITNESSE_COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_get_test_history",
+        description="Displays current test history for a page subtree or all history. Returns XML.",
+        tags={"fitnesse", "rest", "history", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_get_test_history(
+        page_path: WikiPath = "",
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """Get test history via responder=testHistory."""
+        return _request(
+            "GET",
+            page_path,
+            params={"responder": "testHistory", "format": "xml"},
+            timeout_seconds=timeout_seconds,
+        )
+
+
 @mcp.tool(
     name="fitnesse_upload_file",
     description="Uploads a file object into the files section directory selected by the resource path.",
@@ -1035,6 +1265,27 @@ def fitnesse_get_variables(
         params={"responder": "variables"},
         timeout_seconds=timeout_seconds,
     )
+
+
+if FITNESSE_COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_get_page_content",
+        description="Convenience helper that reads edit responder output for page content retrieval workflows.",
+        tags={"fitnesse", "rest", "pages", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_get_page_content(
+        page_path: WikiPath,
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """Convenience helper for responder=edit response retrieval."""
+        return _request(
+            "GET",
+            page_path,
+            params={"responder": "edit", "format": "json"},
+            timeout_seconds=timeout_seconds,
+        )
 
 
 if _env_flag("FITNESSE_READONLY"):

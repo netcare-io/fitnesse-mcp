@@ -31,7 +31,6 @@ RUN mkdir -p /workspaces \
 	&& ln -sfn /app /workspaces/fitnesse-mcp
 
 RUN apt-get update \
-	&& apt-get upgrade -y \
 	&& apt-get install -y --no-install-recommends git ca-certificates curl dbus dbus-user-session libsecret-1-0 gnome-keyring gnupg \
 	&& curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 	&& apt-get install -y --no-install-recommends nodejs \

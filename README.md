@@ -344,19 +344,21 @@ The devcontainer (see [Quickstart](#quickstart)) builds from a multi-stage
 Dockerfile at `.devcontainer/Dockerfile`:
 
 - `devcontainer` — used by VS Code for development
+- `test` — installs dev dependencies; used by `scripts/release.sh` to run the
+  test suite without requiring Python on the host
 - `production` — used by Docker Compose for deployment
 
 ### Release
 
-Prerequisites:
+Releasing is split into two scripts so cutting a release doesn't require
+Docker registry access, and publishing the image doesn't require pushing to
+git. `scripts/release-and-publish.sh` runs both in sequence.
 
-- Clean working tree, checked out on `main`
-- `docker login harbor.netcare.local` (or export `FITNESSE_MCP_REGISTRY` to
-  target a different registry)
-- Push access to `origin`
-- `gh auth login`, if you want the GitHub release created automatically
+#### `scripts/release.sh` — tests, version bump, git tag
 
-Steps:
+Prerequisites: clean working tree, checked out on `main`; push access to
+`origin`; `docker` (to run the test suite — no local Python needed);
+`gh auth login`, if you want the GitHub release created automatically.
 
 ```bash
 bash scripts/release.sh 0.2.0
@@ -364,14 +366,33 @@ bash scripts/release.sh 0.2.0
 
 This runs, in order:
 
-1. Runs `pytest` — aborts the release on failure
+1. Builds the `test` Docker target and runs `pytest` inside it — aborts the
+   release on failure
 2. Bumps `version` in `pyproject.toml` to `0.2.0`
 3. Commits the bump and tags it `v0.2.0`
-4. Builds the `production` Docker target, tagged `0.2.0` and `latest`
-5. Pushes both tags to `harbor.netcare.local/fitnesse-mcp`
-6. Pushes the commit and the `v0.2.0` tag to `origin`
-7. Opens a GitHub release for `v0.2.0` via `gh` (prints the manual-create
+4. Pushes the commit and the `v0.2.0` tag to `origin`
+5. Opens a GitHub release for `v0.2.0` via `gh` (prints the manual-create
    link instead if `gh` isn't installed)
+
+#### `scripts/docker-build-and-publish.sh` — build + push the image
+
+Prerequisites: `docker login harbor.netcare.local` (or export
+`FITNESSE_MCP_REGISTRY` to target a different registry).
+
+```bash
+bash scripts/docker-build-and-publish.sh 0.2.0
+```
+
+Builds the `production` Docker target tagged `0.2.0` and `latest`, then
+pushes both to `harbor.netcare.local/fitnesse-mcp`. Run it from the tagged
+commit (e.g. right after `release.sh`, or after `git checkout v0.2.0` later);
+if the version is omitted it's read from `pyproject.toml`.
+
+#### `scripts/release-and-publish.sh` — both, in one step
+
+```bash
+bash scripts/release-and-publish.sh 0.2.0
+```
 
 ### Production with Docker Compose
 

@@ -1,6 +1,6 @@
 [project]
 name = "fitnesse-mcp"
-version = "0.2.2"
+version = "0.2.3"
 description = "An MCP server exposing FitNesse's REST responders as tools"
 readme = "README.md"
 requires-python = ">=3.12"

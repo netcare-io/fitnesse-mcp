@@ -14,7 +14,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 REGISTRY="${FITNESSE_MCP_REGISTRY:-harbor.netcare.local}"
-IMAGE="${REGISTRY}/fitnesse-mcp"
+IMAGE="${REGISTRY}/kdta/fitnesse-mcp"
 
 VERSION="${1:-$(sed -nE 's/^version = "(.*)"/\1/p' pyproject.toml)}"
 if [[ -z "$VERSION" ]]; then

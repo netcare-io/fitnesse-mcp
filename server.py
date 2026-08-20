@@ -70,7 +70,7 @@ def _make_timeout(default: float):
 def _apply_basic_auth(
     req: request.Request, username: str | None, password: str | None
 ) -> None:
-    if username is None or password is None:
+    if not username or not password:
         return
 
     token = b64encode(f"{username}:{password}".encode()).decode("ascii")

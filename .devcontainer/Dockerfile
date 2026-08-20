@@ -57,6 +57,13 @@ EOF
 
 CMD ["bash"]
 
+FROM base AS test
+RUN uv pip install --python "$VIRTUAL_ENV/bin/python" -e ".[dev]"
+# tests/ is excluded from the build context by .dockerignore (kept out of the
+# production image), so it's bind-mounted at `docker run` time instead of
+# COPYed here.
+CMD ["pytest"]
+
 FROM base AS production
 RUN useradd --create-home --uid 1000 app
 COPY --chown=app:app . .

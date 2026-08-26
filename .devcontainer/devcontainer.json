@@ -1,5 +1,5 @@
 {
-    "name": "FastMCP Dev",
+    "name": "fitnesse-mcp",
     "build": {
         "context": "..",
         "dockerfile": "Dockerfile",

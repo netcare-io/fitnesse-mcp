@@ -82,15 +82,17 @@ history, and roll back versions** on your FitNesse instance. Two controls limit
 that, and both are opt-in:
 
 - **Start with `FITNESSE_READONLY=1`.** This hides every write, execute, and
-  control tool, leaving the 23 read-only tools. Open it up deliberately once you
-  know which operations you actually want the model to perform.
+  control tool, leaving only the read-only tools (see [Tools](#tools) for
+  counts). Open it up deliberately once you know which operations you
+  actually want the model to perform.
 - **`fitnesse_shutdown` is not registered at all** unless
   `FITNESSE_ALLOW_SHUTDOWN` is set. It stops the FitNesse server.
 
 Two further notes:
 
-- Uploads are disabled unless `FITNESSE_UPLOAD_ROOT` is set, and
-  `fitnesse_upload_file` will only read files resolving inside that directory.
+- `fitnesse_list_files`, `fitnesse_upload_file`, and `fitnesse_download_file`
+  are **not registered at all** unless `FITNESSE_FILES_ROOT` is set; uploads
+  only read, and downloads only write, files resolving inside that directory.
 - Credentials in `claude_desktop_config.json` are stored in **cleartext**. For
   shared machines, prefer the HTTP pattern below with the credentials in the
   server's own environment.
@@ -107,7 +109,7 @@ Two further notes:
 | `FITNESSE_READONLY` | `false` | `1`/`true`/`yes`/`on` hides all write, execute, and control tools |
 | `FITNESSE_ALLOW_SHUTDOWN` | `false` | `1`/`true`/`yes`/`on` exposes `fitnesse_shutdown` |
 | `FITNESSE_COMPLETE_TOOLSET` | `false` | `1`/`true`/`yes`/`on` exposes the 11 lower-traffic tools hidden by default (marked below) |
-| `FITNESSE_UPLOAD_ROOT` | _(none — uploads disabled)_ | Absolute host path; `fitnesse_upload_file` only reads files beneath it |
+| `FITNESSE_FILES_ROOT` | _(none — files tools disabled)_ | Absolute host path; enables `fitnesse_list_files`, `fitnesse_upload_file` (reads beneath it), and `fitnesse_download_file` (writes beneath it) |
 | `FITNESSE_MAX_RESPONSE_BYTES` | `1048576` (1 MB) | Responses above this are truncated and flagged `"truncated": true` |
 | `FITNESSE_MAX_UPLOAD_BYTES` | `10485760` (10 MB) | Uploads above this are rejected |
 
@@ -115,11 +117,14 @@ Two further notes:
 
 ## Tools
 
-31 tools by default, each mapping to one FitNesse responder. Set
-`FITNESSE_COMPLETE_TOOLSET=1` to expose 11 additional lower-traffic tools (42 total),
-and `FITNESSE_ALLOW_SHUTDOWN=1` to also expose `fitnesse_shutdown` (43 with
-both). Under `FITNESSE_READONLY`, only the **read** tools are exposed — 13 by
-default, or 23 with `FITNESSE_COMPLETE_TOOLSET=1`.
+29 tools by default, each mapping to one FitNesse responder. Set
+`FITNESSE_FILES_ROOT` to a host path to also expose `fitnesse_list_files`,
+`fitnesse_upload_file`, and `fitnesse_download_file` (32 total),
+`FITNESSE_COMPLETE_TOOLSET=1` to expose 11 additional lower-traffic tools, and
+`FITNESSE_ALLOW_SHUTDOWN=1` to also expose `fitnesse_shutdown` (44 with all
+four). Under `FITNESSE_READONLY`, only the **read** tools are exposed — 12 by
+default, or up to 24 with `FITNESSE_FILES_ROOT` and `FITNESSE_COMPLETE_TOOLSET=1`
+both set.
 
 <details>
 <summary><b>Full tool list</b></summary>
@@ -192,6 +197,7 @@ default, or 23 with `FITNESSE_COMPLETE_TOOLSET=1`.
 | Tool | Responder | Mode |
 |---|---|---|
 | `fitnesse_list_files` | `files` | read |
+| `fitnesse_download_file` | _(direct file GET)_ | read |
 | `fitnesse_create_dir` | `createDir` | write |
 | `fitnesse_upload_file` | `upload` (POST multipart) | write |
 | `fitnesse_rename_file` | `renameFile` | write |
@@ -409,7 +415,7 @@ FITNESSE_PASSWORD=your-password
 FITNESSE_READONLY=1
 # FITNESSE_ALLOW_SHUTDOWN=1
 # FITNESSE_COMPLETE_TOOLSET=1
-# FITNESSE_UPLOAD_ROOT=/data/uploads
+# FITNESSE_FILES_ROOT=/data/files
 ```
 
 The server is then available at `http://localhost:8000/mcp` or through the stdio-to-html-proxy for stdio-only clients:

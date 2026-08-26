@@ -202,6 +202,64 @@ def _request(
         }
 
 
+def _request_bytes(
+    method: str,
+    path: str,
+    params: Mapping[str, str | None] | list[tuple[str, str | None]] | None = None,
+    timeout_seconds: float = 30.0,
+    username: str | None = None,
+    password: str | None = None,
+    base_url: str | None = None,
+) -> dict:
+    """Like _request, but returns the raw response body bytes undecoded."""
+    if base_url is None:
+        base_url = os.getenv("FITNESSE_BASE_URL", "http://localhost:8080")
+    if username is None:
+        username = os.getenv("FITNESSE_USERNAME")
+    if password is None:
+        password = os.getenv("FITNESSE_PASSWORD")
+    url = _build_url(base_url=base_url, path=path, params=params)
+    req = request.Request(url=url, method=method.upper())
+    _apply_basic_auth(req=req, username=username, password=password)
+
+    try:
+        with request.urlopen(req, timeout=timeout_seconds) as response:
+            raw_bytes = response.read(MAX_UPLOAD_BYTES + 1)
+            truncated = len(raw_bytes) > MAX_UPLOAD_BYTES
+            return {
+                "ok": True,
+                "status": response.status,
+                "url": url,
+                "content_type": response.headers.get("Content-Type", ""),
+                "truncated": truncated,
+                "body": raw_bytes[:MAX_UPLOAD_BYTES],
+            }
+    except HTTPError as exc:
+        return {
+            "ok": False,
+            "status": exc.code,
+            "url": url,
+            "error": f"HTTP error: {exc.reason}",
+            "body": exc.read(MAX_BYTES).decode("utf-8", errors="replace"),
+        }
+    except TimeoutError:
+        return {
+            "ok": False,
+            "status": None,
+            "url": url,
+            "error": "Timeout reading response",
+            "body": None,
+        }
+    except URLError as exc:
+        return {
+            "ok": False,
+            "status": None,
+            "url": url,
+            "error": f"Connection error: {exc.reason}",
+            "body": None,
+        }
+
+
 def _build_multipart_form_data(
     fields: dict[str, str], file_field: str, filename: str, file_bytes: bytes
 ) -> tuple[bytes, str]:
@@ -409,23 +467,64 @@ def fitnesse_execute_search_properties(
     return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
 
 
-@mcp.tool(
-    name="fitnesse_list_files",
-    description="Displays a directory listing in the files section for the selected files resource.",
-    tags={"fitnesse", "rest", "files", "read"},
-    annotations={"readOnlyHint": True},
-)
-def fitnesse_list_files(
-    files_path: FilesPath = "files",
-    timeout_seconds: float = _make_timeout(30.0),
-) -> dict:
-    """Display a file directory via responder=files."""
-    return _request(
-        "GET",
-        files_path,
-        params={"responder": "files"},
-        timeout_seconds=timeout_seconds,
+if os.getenv("FITNESSE_FILES_ROOT"):
+
+    @mcp.tool(
+        name="fitnesse_list_files",
+        description="Displays a directory listing in the files section for the selected files resource. Returns result as JSON.",
+        tags={"fitnesse", "rest", "files", "read"},
+        annotations={"readOnlyHint": True},
     )
+    def fitnesse_list_files(
+        files_path: FilesPath = "files",
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """Display a file directory via responder=files."""
+        return _request(
+            "GET",
+            files_path,
+            params={"responder": "files", "format": "json"},
+            timeout_seconds=timeout_seconds,
+        )
+
+    @mcp.tool(
+        name="fitnesse_download_file",
+        description="Downloads a file from the files section directory identified by the resource and filename, saving it beneath FITNESSE_FILES_ROOT.",
+        tags={"fitnesse", "rest", "files", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_download_file(
+        files_path: FilesPath,
+        filename: str,
+        local_filename: str | None = None,
+        timeout_seconds: float = _make_timeout(60.0),
+    ) -> dict:
+        """Download a file from the files section by GETing its direct resource path."""
+        root = Path(os.environ["FITNESSE_FILES_ROOT"]).resolve()
+        target = (root / (local_filename or filename)).resolve()
+        # Reject paths that escape the files root.
+        if not target.is_relative_to(root):
+            return {"ok": False, "error": "Path is outside the configured files root"}
+
+        result = _request_bytes(
+            "GET",
+            f"{files_path.rstrip('/')}/{filename}",
+            timeout_seconds=timeout_seconds,
+        )
+        if not result["ok"]:
+            return result
+        if result["truncated"]:
+            return {
+                "ok": False,
+                "error": f"File exceeds download limit of {MAX_UPLOAD_BYTES} bytes",
+            }
+
+        data = result.pop("body")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        result["local_path"] = str(target)
+        result["bytes_written"] = len(data)
+        return result
 
 
 if FITNESSE_COMPLETE_TOOLSET:
@@ -1139,55 +1238,51 @@ if FITNESSE_COMPLETE_TOOLSET:
         )
 
 
-@mcp.tool(
-    name="fitnesse_upload_file",
-    description="Uploads a file object into the files section directory selected by the resource path.",
-    tags={"fitnesse", "rest", "files", "write"},
-    annotations={"destructiveHint": False, "idempotentHint": True},
-)
-def fitnesse_upload_file(
-    files_path: FilesPath,
-    local_file_path: str,
-    upload_filename: str | None = None,
-    timeout_seconds: float = _make_timeout(60.0),
-) -> dict:
-    """Upload a file to files section via responder=upload and multipart form data."""
-    upload_root = os.getenv("FITNESSE_UPLOAD_ROOT")
-    if not upload_root:
-        return {
-            "ok": False,
-            "error": "FITNESSE_UPLOAD_ROOT env var must be set to enable file uploads",
-        }
-    root = Path(upload_root).resolve()
-    target = (root / local_file_path).resolve()
-    # Reject paths that escape the upload root.
-    if not target.is_relative_to(root):
-        return {"ok": False, "error": "Path is outside the configured upload root"}
+if os.getenv("FITNESSE_FILES_ROOT"):
 
-    if not target.is_file():
-        return {"ok": False, "error": f"File not found: {target.name!r}"}
-
-    size = target.stat().st_size
-    if size > MAX_UPLOAD_BYTES:
-        return {
-            "ok": False,
-            "error": f"File is {size} bytes, limit is {MAX_UPLOAD_BYTES}",
-        }
-    file_bytes = target.read_bytes()
-
-    filename = upload_filename or target.name
-    body, content_type = _build_multipart_form_data(
-        fields={}, file_field="file", filename=filename, file_bytes=file_bytes
+    @mcp.tool(
+        name="fitnesse_upload_file",
+        description="Uploads a file object into the files section directory selected by the resource path.",
+        tags={"fitnesse", "rest", "files", "write"},
+        annotations={"destructiveHint": False, "idempotentHint": True},
     )
+    def fitnesse_upload_file(
+        files_path: FilesPath,
+        local_file_path: str,
+        upload_filename: str | None = None,
+        timeout_seconds: float = _make_timeout(60.0),
+    ) -> dict:
+        """Upload a file to files section via responder=upload and multipart form data."""
+        root = Path(os.environ["FITNESSE_FILES_ROOT"]).resolve()
+        target = (root / local_file_path).resolve()
+        # Reject paths that escape the files root.
+        if not target.is_relative_to(root):
+            return {"ok": False, "error": "Path is outside the configured files root"}
 
-    return _request(
-        "POST",
-        files_path,
-        params={"responder": "upload"},
-        body=body,
-        content_type=content_type,
-        timeout_seconds=timeout_seconds,
-    )
+        if not target.is_file():
+            return {"ok": False, "error": f"File not found: {target.name!r}"}
+
+        size = target.stat().st_size
+        if size > MAX_UPLOAD_BYTES:
+            return {
+                "ok": False,
+                "error": f"File is {size} bytes, limit is {MAX_UPLOAD_BYTES}",
+            }
+        file_bytes = target.read_bytes()
+
+        filename = upload_filename or target.name
+        body, content_type = _build_multipart_form_data(
+            fields={}, file_field="file", filename=filename, file_bytes=file_bytes
+        )
+
+        return _request(
+            "POST",
+            files_path,
+            params={"responder": "upload"},
+            body=body,
+            content_type=content_type,
+            timeout_seconds=timeout_seconds,
+        )
 
 
 @mcp.tool(

@@ -1,12 +1,13 @@
 # Copyright (c) 2026 netcare GmbH. All rights reserved.
 # SPDX-License-Identifier: MIT
 
+import binascii
 import json
+import mimetypes
 import os
 import uuid
-from base64 import b64encode
+from base64 import b64decode, b64encode
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Annotated, Literal
 from urllib import parse, request
 from urllib.error import HTTPError, URLError
@@ -15,6 +16,8 @@ from fastmcp import FastMCP
 from fastmcp.dependencies import Depends
 from fastmcp.exceptions import ToolError
 from fastmcp.server.transforms import Visibility
+from fastmcp.tools import ToolResult
+from fastmcp.utilities.types import File, Image
 from pydantic import Field
 
 mcp = FastMCP("Fitnesse MCP Server")
@@ -22,8 +25,8 @@ mcp = FastMCP("Fitnesse MCP Server")
 MAX_BYTES = int(
     os.getenv("FITNESSE_MAX_RESPONSE_BYTES", str(1024 * 1024))
 )  # default 1 MB
-MAX_UPLOAD_BYTES = int(
-    os.getenv("FITNESSE_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024))
+MAX_TRANSFER_BYTES = int(
+    os.getenv("FITNESSE_FILES_MAX_TRANSFER_BYTES", str(10 * 1024 * 1024))
 )  # default 10 MB
 
 # Type aliases with per-parameter descriptions for model-facing schemas.
@@ -36,7 +39,7 @@ type WikiPath = Annotated[
 type FilesPath = Annotated[
     str,
     Field(
-        description="Path under the FitNesse files section, e.g. 'files/images'. No leading slash."
+        description="Path under the FitNesse files section, e.g. 'files/images'. Must start with the resource root configured via FITNESSE_FILES_ROOT (default 'files'). No leading slash."
     ),
 ]
 type PageName = Annotated[
@@ -109,6 +112,29 @@ def _merge_extra(
             f"Reserved query parameters cannot be overridden: {sorted(bad)}"
         )
     return {**params, **extra}
+
+
+def _files_root_parts() -> list[str]:
+    """The files-section resource root as configured for this FitNesse instance."""
+    root = os.environ.get("FITNESSE_FILES_ROOT", "").strip().strip("/")
+    return [p for p in root.split("/") if p and p != "."]
+
+
+def _files_resource(files_path: str) -> str:
+    """Normalize a files-section resource path, rejecting anything outside FITNESSE_FILES_ROOT."""
+    root_parts = _files_root_parts()
+    parts = [p for p in files_path.strip().strip("/").split("/") if p not in {"", "."}]
+    if not root_parts or ".." in parts or parts[: len(root_parts)] != root_parts:
+        root_display = "/".join(root_parts) or "<FITNESSE_FILES_ROOT unset>"
+        raise ToolError(f"files_path must stay below '{root_display}/': {files_path!r}")
+    return "/".join(parts)
+
+
+def _files_name(name: str, field: str) -> str:
+    """Require a plain file or directory name — no separators or traversal."""
+    if not name or name in {".", ".."} or set(name) & set('/\\\x00\r\n"'):
+        raise ToolError(f"{field} must be a plain name without separators: {name!r}")
+    return name
 
 
 def _build_url(
@@ -224,15 +250,15 @@ def _request_bytes(
 
     try:
         with request.urlopen(req, timeout=timeout_seconds) as response:
-            raw_bytes = response.read(MAX_UPLOAD_BYTES + 1)
-            truncated = len(raw_bytes) > MAX_UPLOAD_BYTES
+            raw_bytes = response.read(MAX_TRANSFER_BYTES + 1)
+            truncated = len(raw_bytes) > MAX_TRANSFER_BYTES
             return {
                 "ok": True,
                 "status": response.status,
                 "url": url,
                 "content_type": response.headers.get("Content-Type", ""),
                 "truncated": truncated,
-                "body": raw_bytes[:MAX_UPLOAD_BYTES],
+                "body": raw_bytes[:MAX_TRANSFER_BYTES],
             }
     except HTTPError as exc:
         return {
@@ -351,24 +377,29 @@ def fitnesse_compare_history(
     )
 
 
-@mcp.tool(
-    name="fitnesse_create_dir",
-    description="Creates a new directory in the files section below the given resource using dirname.",
-    tags={"fitnesse", "rest", "files", "write"},
-    annotations={"destructiveHint": False, "idempotentHint": True},
-)
-def fitnesse_create_dir(
-    files_path: FilesPath,
-    dirname: str,
-    timeout_seconds: float = _make_timeout(30.0),
-) -> dict:
-    """Create a new directory in the files section via responder=createDir."""
-    return _request(
-        "GET",
-        files_path,
-        params={"responder": "createDir", "dirname": dirname},
-        timeout_seconds=timeout_seconds,
+if os.getenv("FITNESSE_FILES_ROOT"):
+
+    @mcp.tool(
+        name="fitnesse_create_dir",
+        description="Creates a new directory in the files section below the given resource using dirname.",
+        tags={"fitnesse", "rest", "files", "write"},
+        annotations={"destructiveHint": False, "idempotentHint": True},
     )
+    def fitnesse_create_dir(
+        files_path: FilesPath,
+        dirname: str,
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """Create a new directory in the files section via responder=createDir."""
+        return _request(
+            "GET",
+            _files_resource(files_path),
+            params={
+                "responder": "createDir",
+                "dirname": _files_name(dirname, "dirname"),
+            },
+            timeout_seconds=timeout_seconds,
+        )
 
 
 @mcp.tool(
@@ -386,24 +417,29 @@ def fitnesse_delete_page(
     return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
 
 
-@mcp.tool(
-    name="fitnesse_delete_file",
-    description="Deletes a file from the files section directory identified by the resource and filename.",
-    tags={"fitnesse", "rest", "files", "write"},
-    annotations={"destructiveHint": True},
-)
-def fitnesse_delete_file(
-    files_path: FilesPath,
-    filename: str,
-    timeout_seconds: float = _make_timeout(30.0),
-) -> dict:
-    """Delete a file via responder=deleteFile."""
-    return _request(
-        "GET",
-        files_path,
-        params={"responder": "deleteFile", "filename": filename},
-        timeout_seconds=timeout_seconds,
+if os.getenv("FITNESSE_FILES_ROOT"):
+
+    @mcp.tool(
+        name="fitnesse_delete_file",
+        description="Deletes a file from the files section directory identified by the resource and filename.",
+        tags={"fitnesse", "rest", "files", "write"},
+        annotations={"destructiveHint": True},
     )
+    def fitnesse_delete_file(
+        files_path: FilesPath,
+        filename: str,
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """Delete a file via responder=deleteFile."""
+        return _request(
+            "GET",
+            _files_resource(files_path),
+            params={
+                "responder": "deleteFile",
+                "filename": _files_name(filename, "filename"),
+            },
+            timeout_seconds=timeout_seconds,
+        )
 
 
 if FITNESSE_COMPLETE_TOOLSET:
@@ -482,49 +518,55 @@ if os.getenv("FITNESSE_FILES_ROOT"):
         """Display a file directory via responder=files."""
         return _request(
             "GET",
-            files_path,
+            _files_resource(files_path),
             params={"responder": "files", "format": "json"},
             timeout_seconds=timeout_seconds,
         )
 
     @mcp.tool(
         name="fitnesse_download_file",
-        description="Downloads a file from the files section directory identified by the resource and filename, saving it beneath FITNESSE_FILES_ROOT.",
+        description="Downloads a file from the files section directory identified by the resource and filename, returning its content directly as an image or text/binary resource.",
         tags={"fitnesse", "rest", "files", "read"},
         annotations={"readOnlyHint": True},
     )
     def fitnesse_download_file(
         files_path: FilesPath,
         filename: str,
-        local_filename: str | None = None,
         timeout_seconds: float = _make_timeout(60.0),
-    ) -> dict:
+    ) -> ToolResult:
         """Download a file from the files section by GETing its direct resource path."""
-        root = Path(os.environ["FITNESSE_FILES_ROOT"]).resolve()
-        target = (root / (local_filename or filename)).resolve()
-        # Reject paths that escape the files root.
-        if not target.is_relative_to(root):
-            return {"ok": False, "error": "Path is outside the configured files root"}
+        resource = _files_resource(files_path)
+        filename = _files_name(filename, "filename")
 
         result = _request_bytes(
             "GET",
-            f"{files_path.rstrip('/')}/{filename}",
+            f"{resource}/{filename}",
             timeout_seconds=timeout_seconds,
         )
         if not result["ok"]:
-            return result
+            return ToolResult(structured_content=result)
         if result["truncated"]:
-            return {
-                "ok": False,
-                "error": f"File exceeds download limit of {MAX_UPLOAD_BYTES} bytes",
-            }
+            return ToolResult(
+                structured_content={
+                    "ok": False,
+                    "error": f"File exceeds transfer limit of {MAX_TRANSFER_BYTES} bytes",
+                }
+            )
 
         data = result.pop("body")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-        result["local_path"] = str(target)
-        result["bytes_written"] = len(data)
-        return result
+        content_type = (result.get("content_type") or "").split(";")[0].strip()
+        if not content_type or content_type == "application/octet-stream":
+            content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        result["content_type"] = content_type
+        result["bytes"] = len(data)
+
+        if content_type.startswith("image/"):
+            block = Image(data=data, format=content_type.split("/", 1)[1]).to_image_content()
+        else:
+            fmt = content_type.split("/", 1)[1] if "/" in content_type else None
+            block = File(data=data, format=fmt, name=filename).to_resource_content(mime_type=content_type)
+
+        return ToolResult(content=[block], structured_content=result)
 
 
 if FITNESSE_COMPLETE_TOOLSET:
@@ -876,25 +918,31 @@ if FITNESSE_COMPLETE_TOOLSET:
         )
 
 
-@mcp.tool(
-    name="fitnesse_rename_file",
-    description="Renames a file in the files section using filename and newName within the selected directory.",
-    tags={"fitnesse", "rest", "files", "write"},
-    annotations={"destructiveHint": False, "idempotentHint": True},
-)
-def fitnesse_rename_file(
-    files_path: FilesPath,
-    filename: str,
-    new_name: str,
-    timeout_seconds: float = _make_timeout(30.0),
-) -> dict:
-    """Rename a file via responder=renameFile."""
-    return _request(
-        "GET",
-        files_path,
-        params={"responder": "renameFile", "filename": filename, "newName": new_name},
-        timeout_seconds=timeout_seconds,
+if os.getenv("FITNESSE_FILES_ROOT"):
+
+    @mcp.tool(
+        name="fitnesse_rename_file",
+        description="Renames a file in the files section using filename and newName within the selected directory.",
+        tags={"fitnesse", "rest", "files", "write"},
+        annotations={"destructiveHint": False, "idempotentHint": True},
     )
+    def fitnesse_rename_file(
+        files_path: FilesPath,
+        filename: str,
+        new_name: str,
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """Rename a file via responder=renameFile."""
+        return _request(
+            "GET",
+            _files_resource(files_path),
+            params={
+                "responder": "renameFile",
+                "filename": _files_name(filename, "filename"),
+                "newName": _files_name(new_name, "new_name"),
+            },
+            timeout_seconds=timeout_seconds,
+        )
 
 
 @mcp.tool(
@@ -1242,42 +1290,45 @@ if os.getenv("FITNESSE_FILES_ROOT"):
 
     @mcp.tool(
         name="fitnesse_upload_file",
-        description="Uploads a file object into the files section directory selected by the resource path.",
+        description="Uploads file content into the files section directory selected by the resource path. Pass text content directly via `content`, or binary/base64-encoded content via `content_base64`.",
         tags={"fitnesse", "rest", "files", "write"},
         annotations={"destructiveHint": False, "idempotentHint": True},
     )
     def fitnesse_upload_file(
         files_path: FilesPath,
-        local_file_path: str,
-        upload_filename: str | None = None,
+        filename: str,
+        content: str | None = None,
+        content_base64: str | None = None,
         timeout_seconds: float = _make_timeout(60.0),
     ) -> dict:
-        """Upload a file to files section via responder=upload and multipart form data."""
-        root = Path(os.environ["FITNESSE_FILES_ROOT"]).resolve()
-        target = (root / local_file_path).resolve()
-        # Reject paths that escape the files root.
-        if not target.is_relative_to(root):
-            return {"ok": False, "error": "Path is outside the configured files root"}
+        """Upload file content to files section via responder=upload and multipart form data."""
+        resource = _files_resource(files_path)
+        filename = _files_name(filename, "filename")
 
-        if not target.is_file():
-            return {"ok": False, "error": f"File not found: {target.name!r}"}
+        if (content is None) == (content_base64 is None):
+            raise ToolError("Provide exactly one of content or content_base64")
 
-        size = target.stat().st_size
-        if size > MAX_UPLOAD_BYTES:
+        if content is not None:
+            file_bytes = content.encode("utf-8")
+        else:
+            try:
+                file_bytes = b64decode(content_base64, validate=True)
+            except binascii.Error as exc:
+                raise ToolError(f"content_base64 is not valid base64: {exc}") from exc
+
+        if len(file_bytes) > MAX_TRANSFER_BYTES:
             return {
                 "ok": False,
-                "error": f"File is {size} bytes, limit is {MAX_UPLOAD_BYTES}",
+                "error": f"File is {len(file_bytes)} bytes, limit is {MAX_TRANSFER_BYTES}",
             }
-        file_bytes = target.read_bytes()
 
-        filename = upload_filename or target.name
         body, content_type = _build_multipart_form_data(
             fields={}, file_field="file", filename=filename, file_bytes=file_bytes
         )
 
         return _request(
             "POST",
-            files_path,
+            resource,
             params={"responder": "upload"},
             body=body,
             content_type=content_type,

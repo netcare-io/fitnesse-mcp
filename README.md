@@ -88,11 +88,26 @@ that, and both are opt-in:
 - **`fitnesse_shutdown` is not registered at all** unless
   `FITNESSE_ALLOW_SHUTDOWN` is set. It stops the FitNesse server.
 
-Two further notes:
+Three further notes:
 
-- `fitnesse_list_files`, `fitnesse_upload_file`, and `fitnesse_download_file`
-  are **not registered at all** unless `FITNESSE_FILES_ROOT` is set; uploads
-  only read, and downloads only write, files resolving inside that directory.
+- `fitnesse_list_files`, `fitnesse_create_dir`, `fitnesse_upload_file`,
+  `fitnesse_download_file`, `fitnesse_delete_file`, and `fitnesse_rename_file`
+  are **not registered at all** unless `FITNESSE_FILES_ROOT` is set.
+- Every files tool is confined to the resource root named by
+  `FITNESSE_FILES_ROOT` on the **remote** FitNesse instance (default `files`,
+  but some instances configure a different root): `files_path` must start
+  with that root and may not contain `..`, and `filename` / `dirname` /
+  `new_name` must be plain names without path separators. A call aiming
+  outside it (e.g. `files_path: "FrontPage"`) is rejected before any request
+  goes out, so these tools cannot reach wiki pages or other responders.
+  Neither `fitnesse_upload_file` nor `fitnesse_download_file` touches local
+  disk: content travels through the tool call itself, so both work even when
+  the MCP server and the calling client don't share a filesystem.
+  `fitnesse_download_file` returns the file's content directly in its
+  result — as an inline image for `image/*` content, or as a text/binary
+  resource otherwise. `fitnesse_upload_file` takes the content as an
+  argument — plain text via `content`, or base64-encoded bytes via
+  `content_base64` — instead of a local file path.
 - Credentials in `claude_desktop_config.json` are stored in **cleartext**. For
   shared machines, prefer the HTTP pattern below with the credentials in the
   server's own environment.
@@ -109,17 +124,19 @@ Two further notes:
 | `FITNESSE_READONLY` | `false` | `1`/`true`/`yes`/`on` hides all write, execute, and control tools |
 | `FITNESSE_ALLOW_SHUTDOWN` | `false` | `1`/`true`/`yes`/`on` exposes `fitnesse_shutdown` |
 | `FITNESSE_COMPLETE_TOOLSET` | `false` | `1`/`true`/`yes`/`on` exposes the 11 lower-traffic tools hidden by default (marked below) |
-| `FITNESSE_FILES_ROOT` | _(none — files tools disabled)_ | Absolute host path; enables `fitnesse_list_files`, `fitnesse_upload_file` (reads beneath it), and `fitnesse_download_file` (writes beneath it) |
+| `FITNESSE_FILES_ROOT` | _(none — files tools disabled)_ | Resource root of the files section on the FitNesse instance (e.g. `files`); enables `fitnesse_list_files`, `fitnesse_create_dir`, `fitnesse_upload_file`, `fitnesse_download_file`, `fitnesse_delete_file`, and `fitnesse_rename_file` |
 | `FITNESSE_MAX_RESPONSE_BYTES` | `1048576` (1 MB) | Responses above this are truncated and flagged `"truncated": true` |
-| `FITNESSE_MAX_UPLOAD_BYTES` | `10485760` (10 MB) | Uploads above this are rejected |
+| `FITNESSE_FILES_MAX_TRANSFER_BYTES` | `10485760` (10 MB) | Uploads above this are rejected; downloads above this are truncated and rejected |
 
 ---
 
 ## Tools
 
-29 tools by default, each mapping to one FitNesse responder. Set
-`FITNESSE_FILES_ROOT` to a host path to also expose `fitnesse_list_files`,
-`fitnesse_upload_file`, and `fitnesse_download_file` (32 total),
+26 tools by default, each mapping to one FitNesse responder. Set
+`FITNESSE_FILES_ROOT` to the files-section resource root on your FitNesse
+instance to also expose `fitnesse_list_files`, `fitnesse_create_dir`,
+`fitnesse_upload_file`, `fitnesse_download_file`, `fitnesse_delete_file`, and
+`fitnesse_rename_file` (32 total),
 `FITNESSE_COMPLETE_TOOLSET=1` to expose 11 additional lower-traffic tools, and
 `FITNESSE_ALLOW_SHUTDOWN=1` to also expose `fitnesse_shutdown` (44 with all
 four). Under `FITNESSE_READONLY`, only the **read** tools are exposed — 12 by
@@ -196,12 +213,12 @@ both set.
 
 | Tool | Responder | Mode |
 |---|---|---|
-| `fitnesse_list_files` | `files` | read |
-| `fitnesse_download_file` | _(direct file GET)_ | read |
-| `fitnesse_create_dir` | `createDir` | write |
-| `fitnesse_upload_file` | `upload` (POST multipart) | write |
-| `fitnesse_rename_file` | `renameFile` | write |
-| `fitnesse_delete_file` | `deleteFile` | write |
+| `fitnesse_list_files` | `files` _(needs `FITNESSE_FILES_ROOT`)_ | read |
+| `fitnesse_download_file` | _(direct file GET, returned inline as image/text/binary)_ _(needs `FITNESSE_FILES_ROOT`)_ | read |
+| `fitnesse_create_dir` | `createDir` _(needs `FITNESSE_FILES_ROOT`)_ | write |
+| `fitnesse_upload_file` | `upload` (POST multipart, content passed inline) _(needs `FITNESSE_FILES_ROOT`)_ | write |
+| `fitnesse_rename_file` | `renameFile` _(needs `FITNESSE_FILES_ROOT`)_ | write |
+| `fitnesse_delete_file` | `deleteFile` _(needs `FITNESSE_FILES_ROOT`)_ | write |
 
 </details>
 
@@ -289,6 +306,36 @@ Most clients can point at the URL directly:
 ```
 
 For clients that only speak stdio, `fastmcp run <url>` proxies to it (internally).
+
+### Pattern 3 — devcontainer via `docker exec`
+
+If you already keep the project's devcontainer running (it's named
+`fitnesse-mcp-devcontainer`, see `.devcontainer/devcontainer.json`), an MCP
+client can attach to it directly instead of spinning up a separate image:
+
+```json
+{
+  "mcpServers": {
+    "fitnesse": {
+      "command": "docker",
+      "args": ["exec", "-i", "fitnesse-mcp-devcontainer", "fastmcp", "run", "server.py"]
+    }
+  }
+}
+```
+
+`FITNESSE_*` variables aren't passed on this command line — `docker exec`
+inherits whatever environment is already baked into the container.
+`devcontainer.json`'s `containerEnv` block sets them from your host
+environment (`${localEnv:FITNESSE_BASE_URL}` etc.) when the container is
+created; export the vars on your host and **rebuild the devcontainer** for
+changes to take effect, or edit the defaults in `containerEnv` directly.
+
+If you'd rather proxy to an already-running HTTP server on port 8000 inside
+the container (Pattern 2's stdio proxy), swap the last three args for `run
+http://127.0.0.1:8000/mcp` — but note nothing starts that server
+automatically; you'd still need to run `fastmcp run server.py --transport
+http` inside the container yourself first.
 
 ---
 
@@ -415,7 +462,7 @@ FITNESSE_PASSWORD=your-password
 FITNESSE_READONLY=1
 # FITNESSE_ALLOW_SHUTDOWN=1
 # FITNESSE_COMPLETE_TOOLSET=1
-# FITNESSE_FILES_ROOT=/data/files
+# FITNESSE_FILES_ROOT=files
 ```
 
 The server is then available at `http://localhost:8000/mcp` or through the stdio-to-html-proxy for stdio-only clients:

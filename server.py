@@ -1093,32 +1093,31 @@ def fitnesse_save_properties(
     )
 
 
-@mcp.tool(
-    name="fitnesse_search",
-    description="Searches for pages matching searchString with searchType for content or title matching.",
-    tags={"fitnesse", "rest", "search", "read"},
-    annotations={"readOnlyHint": True},
-)
-def fitnesse_search(
-    page_path: WikiPath,
-    search_string: str,
-    search_type: str = "content",
-    timeout_seconds: float = _make_timeout(30.0),
-) -> dict:
-    """Search pages with responder=search."""
-    return _request(
-        "GET",
-        page_path,
-        params={
-            "responder": "search",
-            "searchString": search_string,
-            "searchType": search_type,
-        },
-        timeout_seconds=timeout_seconds,
-    )
-
-
 if FITNESSE_COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_search",
+        description="Searches for pages matching searchString with searchType for content or title matching.",
+        tags={"fitnesse", "rest", "search", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_search(
+        page_path: WikiPath,
+        search_string: str,
+        search_type: str = "content",
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """Search pages with responder=search."""
+        return _request(
+            "GET",
+            page_path,
+            params={
+                "responder": "search",
+                "searchString": search_string,
+                "searchType": search_type,
+            },
+            timeout_seconds=timeout_seconds,
+        )
 
     @mcp.tool(
         name="fitnesse_get_search_form",
@@ -1375,23 +1374,25 @@ def fitnesse_view_version(
     )
 
 
-@mcp.tool(
-    name="fitnesse_where_used",
-    description="Returns pages that contain links or references to the selected page.",
-    tags={"fitnesse", "rest", "search", "read"},
-    annotations={"readOnlyHint": True},
-)
-def fitnesse_where_used(
-    page_path: WikiPath,
-    timeout_seconds: float = _make_timeout(30.0),
-) -> dict:
-    """Find references to a page via responder=whereUsed."""
-    return _request(
-        "GET",
-        page_path,
-        params={"responder": "whereUsed"},
-        timeout_seconds=timeout_seconds,
+if FITNESSE_COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_where_used",
+        description="Returns pages that contain links or references to the selected page.",
+        tags={"fitnesse", "rest", "search", "read"},
+        annotations={"readOnlyHint": True},
     )
+    def fitnesse_where_used(
+        page_path: WikiPath,
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """Find references to a page via responder=whereUsed."""
+        return _request(
+            "GET",
+            page_path,
+            params={"responder": "whereUsed"},
+            timeout_seconds=timeout_seconds,
+        )
 
 
 @mcp.tool(

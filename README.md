@@ -204,10 +204,10 @@ both set.
 
 | Tool | Responder |
 |---|---|
-| `fitnesse_search` | `search` — read |
+| `fitnesse_search` | `search` — read _(needs `FITNESSE_COMPLETE_TOOLSET`)_ |
 | `fitnesse_execute_search_properties` | `executeSearchProperties` — read |
 | `fitnesse_get_search_form` | `searchForm` — read _(needs `FITNESSE_COMPLETE_TOOLSET`)_ |
-| `fitnesse_where_used` | `whereUsed` — read |
+| `fitnesse_where_used` | `whereUsed` — read _(needs `FITNESSE_COMPLETE_TOOLSET`)_ |
 
 ### Files section
 

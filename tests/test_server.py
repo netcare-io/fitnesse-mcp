@@ -72,7 +72,7 @@ def clean_env():
 async def test_tool_count_full(clean_env):
     async with Client(my_server.mcp) as c:
         tools = await c.list_tools()
-    assert len(tools) == 26
+    assert len(tools) == 24
 
 
 @pytest.mark.asyncio

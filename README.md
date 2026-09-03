@@ -123,7 +123,7 @@ Three further notes:
 | `FITNESSE_PASSWORD` | _(none)_ | Basic Auth password |
 | `FITNESSE_READONLY` | `false` | `1`/`true`/`yes`/`on` hides all write, execute, and control tools |
 | `FITNESSE_ALLOW_SHUTDOWN` | `false` | `1`/`true`/`yes`/`on` exposes `fitnesse_shutdown` |
-| `FITNESSE_COMPLETE_TOOLSET` | `false` | `1`/`true`/`yes`/`on` exposes the 11 lower-traffic tools hidden by default (marked below) |
+| `FITNESSE_COMPLETE_TOOLSET` | `false` | `1`/`true`/`yes`/`on` exposes the 14 lower-traffic tools hidden by default (marked below) |
 | `FITNESSE_FILES_ROOT` | _(none — files tools disabled)_ | Resource root of the files section on the FitNesse instance (e.g. `files`); enables `fitnesse_list_files`, `fitnesse_create_dir`, `fitnesse_upload_file`, `fitnesse_download_file`, `fitnesse_delete_file`, and `fitnesse_rename_file` |
 | `FITNESSE_MAX_RESPONSE_BYTES` | `1048576` (1 MB) | Responses above this are truncated and flagged `"truncated": true` |
 | `FITNESSE_FILES_MAX_TRANSFER_BYTES` | `10485760` (10 MB) | Uploads above this are rejected; downloads above this are truncated and rejected |
@@ -132,14 +132,14 @@ Three further notes:
 
 ## Tools
 
-26 tools by default, each mapping to one FitNesse responder. Set
+23 tools by default, each mapping to one FitNesse responder. Set
 `FITNESSE_FILES_ROOT` to the files-section resource root on your FitNesse
 instance to also expose `fitnesse_list_files`, `fitnesse_create_dir`,
 `fitnesse_upload_file`, `fitnesse_download_file`, `fitnesse_delete_file`, and
-`fitnesse_rename_file` (32 total),
-`FITNESSE_COMPLETE_TOOLSET=1` to expose 11 additional lower-traffic tools, and
+`fitnesse_rename_file` (29 total),
+`FITNESSE_COMPLETE_TOOLSET=1` to expose 14 additional lower-traffic tools, and
 `FITNESSE_ALLOW_SHUTDOWN=1` to also expose `fitnesse_shutdown` (44 with all
-four). Under `FITNESSE_READONLY`, only the **read** tools are exposed — 12 by
+four). Under `FITNESSE_READONLY`, only the **read** tools are exposed — 9 by
 default, or up to 24 with `FITNESSE_FILES_ROOT` and `FITNESSE_COMPLETE_TOOLSET=1`
 both set.
 

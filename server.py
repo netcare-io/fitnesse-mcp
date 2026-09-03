@@ -470,37 +470,39 @@ if FITNESSE_COMPLETE_TOOLSET:
         )
 
 
-@mcp.tool(
-    name="fitnesse_execute_search_properties",
-    description="Returns pages matching property criteria such as pageType, Suites, Action, and exclude flags for setup, teardown, or obsolete pages.",
-    tags={"fitnesse", "rest", "search", "read"},
-    annotations={"readOnlyHint": True},
-)
-def fitnesse_execute_search_properties(
-    page_path: WikiPath,
-    page_type: PageType | None = None,
-    suites: str | None = None,
-    action: str | None = None,
-    exclude_setup: bool = False,
-    exclude_teardown: bool = False,
-    exclude_obsolete: bool = False,
-    timeout_seconds: float = _make_timeout(60.0),
-) -> dict:
-    """Search by properties via responder=executeSearchProperties."""
-    params: dict[str, str | None] = {"responder": "executeSearchProperties"}
-    if page_type:
-        params["pageType"] = page_type
-    if suites:
-        params["Suites"] = suites
-    if action:
-        params["Action"] = action
-    if exclude_setup:
-        params["ExcludeSetUp"] = None
-    if exclude_teardown:
-        params["ExcludeTearDown"] = None
-    if exclude_obsolete:
-        params["ExcludeObsolete"] = None
-    return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+if FITNESSE_COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_execute_search_properties",
+        description="Returns pages matching property criteria such as pageType, Suites, Action, and exclude flags for setup, teardown, or obsolete pages.",
+        tags={"fitnesse", "rest", "search", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_execute_search_properties(
+        page_path: WikiPath,
+        page_type: PageType | None = None,
+        suites: str | None = None,
+        action: str | None = None,
+        exclude_setup: bool = False,
+        exclude_teardown: bool = False,
+        exclude_obsolete: bool = False,
+        timeout_seconds: float = _make_timeout(60.0),
+    ) -> dict:
+        """Search by properties via responder=executeSearchProperties."""
+        params: dict[str, str | None] = {"responder": "executeSearchProperties"}
+        if page_type:
+            params["pageType"] = page_type
+        if suites:
+            params["Suites"] = suites
+        if action:
+            params["Action"] = action
+        if exclude_setup:
+            params["ExcludeSetUp"] = None
+        if exclude_teardown:
+            params["ExcludeTearDown"] = None
+        if exclude_obsolete:
+            params["ExcludeObsolete"] = None
+        return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
 
 
 if os.getenv("FITNESSE_FILES_ROOT"):

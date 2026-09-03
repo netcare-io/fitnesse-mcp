@@ -667,23 +667,25 @@ def fitnesse_import_and_view(
     )
 
 
-@mcp.tool(
-    name="fitnesse_get_instruction",
-    description="Displays Slim instructions for a suite of Slim tests for analysis or low level debugging.",
-    tags={"fitnesse", "rest", "tests", "read"},
-    annotations={"readOnlyHint": True},
-)
-def fitnesse_get_instruction(
-    page_path: WikiPath,
-    timeout_seconds: float = _make_timeout(120.0),
-) -> dict:
-    """Get Slim instructions via responder=instruction."""
-    return _request(
-        "GET",
-        page_path,
-        params={"responder": "instruction"},
-        timeout_seconds=timeout_seconds,
+if FITNESSE_COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_get_instruction",
+        description="Displays Slim instructions for a suite of Slim tests for analysis or low level debugging.",
+        tags={"fitnesse", "rest", "tests", "read"},
+        annotations={"readOnlyHint": True},
     )
+    def fitnesse_get_instruction(
+        page_path: WikiPath,
+        timeout_seconds: float = _make_timeout(120.0),
+    ) -> dict:
+        """Get Slim instructions via responder=instruction."""
+        return _request(
+            "GET",
+            page_path,
+            params={"responder": "instruction"},
+            timeout_seconds=timeout_seconds,
+        )
 
 
 @mcp.tool(

@@ -184,7 +184,7 @@ both set.
 |---|---|---|
 | `fitnesse_run_test` | `test` | execute |
 | `fitnesse_run_suite` | `suite` — suite filters, debug, nochunk | execute |
-| `fitnesse_get_instruction` | `instruction` — Slim instructions | read |
+| `fitnesse_get_instruction` | `instruction` — Slim instructions _(needs `FITNESSE_COMPLETE_TOOLSET`)_ | read |
 | `fitnesse_stop_test` | `stoptest` | control |
 | `fitnesse_shutdown` | `shutdown` _(needs `FITNESSE_ALLOW_SHUTDOWN`)_ | control |
 

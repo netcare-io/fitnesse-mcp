@@ -989,25 +989,23 @@ def fitnesse_rollback_version(
     )
 
 
-if FITNESSE_COMPLETE_TOOLSET:
-
-    @mcp.tool(
-        name="fitnesse_get_rss",
-        description="Returns an RSS feed for the current page and all of its children.",
-        tags={"fitnesse", "rest", "pages", "read"},
-        annotations={"readOnlyHint": True},
+@mcp.tool(
+    name="fitnesse_get_rss",
+    description="Returns an RSS feed for the current page and all of its children.",
+    tags={"fitnesse", "rest", "pages", "read"},
+    annotations={"readOnlyHint": True},
+)
+def fitnesse_get_rss(
+    page_path: WikiPath,
+    timeout_seconds: float = _make_timeout(30.0),
+) -> dict:
+    """Get RSS feed via responder=rss."""
+    return _request(
+        "GET",
+        page_path,
+        params={"responder": "rss"},
+        timeout_seconds=timeout_seconds,
     )
-    def fitnesse_get_rss(
-        page_path: WikiPath,
-        timeout_seconds: float = _make_timeout(30.0),
-    ) -> dict:
-        """Get RSS feed via responder=rss."""
-        return _request(
-            "GET",
-            page_path,
-            params={"responder": "rss"},
-            timeout_seconds=timeout_seconds,
-        )
 
 
 @mcp.tool(

@@ -161,7 +161,7 @@ both set.
 | `fitnesse_get_page_content` | `edit` — convenience alias _(needs `FITNESSE_COMPLETE_TOOLSET`)_ |
 | `fitnesse_get_new_page_form` | `new` _(needs `FITNESSE_COMPLETE_TOOLSET`)_ |
 | `fitnesse_get_refactor_screen` | `refactor` _(needs `FITNESSE_COMPLETE_TOOLSET`)_ |
-| `fitnesse_get_rss` | `rss` _(needs `FITNESSE_COMPLETE_TOOLSET`)_ |
+| `fitnesse_get_rss` | `rss` |
 
 ### Pages — write
 

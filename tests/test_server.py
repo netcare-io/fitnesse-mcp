@@ -125,6 +125,27 @@ async def test_timeout_resolved_to_float():
 
 
 @pytest.mark.parametrize("tool", ["fitnesse_run_test", "fitnesse_run_suite"])
+@pytest.mark.parametrize("configured", [120.0, 14400.0, None])
+@pytest.mark.asyncio
+async def test_run_timeout_configurable(tool, configured):
+    """FITNESSE_RUN_TIMEOUT_SECONDS sets the run tools' timeout; None disables it."""
+    captured = {}
+
+    def spy(*_, timeout="unset"):
+        captured["timeout"] = timeout
+        return _FakeResponse()
+
+    with (
+        patch.object(my_server, "RUN_TIMEOUT_SECONDS", configured),
+        patch("urllib.request.urlopen", side_effect=spy),
+    ):
+        async with Client(my_server.mcp) as c:
+            await c.call_tool(tool, {"page_path": "FrontPage"})
+
+    assert captured["timeout"] == configured
+
+
+@pytest.mark.parametrize("tool", ["fitnesse_run_test", "fitnesse_run_suite"])
 @pytest.mark.asyncio
 async def test_run_flags_forwarded(tool):
     captured = {}

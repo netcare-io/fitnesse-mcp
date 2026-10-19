@@ -28,6 +28,9 @@ MAX_BYTES = int(
 MAX_TRANSFER_BYTES = int(
     os.getenv("FITNESSE_FILES_MAX_TRANSFER_BYTES", str(10 * 1024 * 1024))
 )  # default 10 MB
+# Read timeout for fitnesse_run_test/fitnesse_run_suite; 0 or less disables it.
+_run_timeout_env = float(os.getenv("FITNESSE_RUN_TIMEOUT_SECONDS", "120"))
+RUN_TIMEOUT_SECONDS = _run_timeout_env if _run_timeout_env > 0 else None
 
 # Type aliases with per-parameter descriptions for model-facing schemas.
 type WikiPath = Annotated[
@@ -66,6 +69,13 @@ FITNESSE_COMPLETE_TOOLSET = _env_flag("FITNESSE_COMPLETE_TOOLSET")
 def _make_timeout(default: float):
     def factory() -> float:
         return default
+
+    return Depends(factory)
+
+
+def _make_run_timeout():
+    def factory() -> float | None:
+        return RUN_TIMEOUT_SECONDS
 
     return Depends(factory)
 
@@ -161,7 +171,7 @@ def _request(
     params: Mapping[str, str | None] | list[tuple[str, str | None]] | None = None,
     body: str | bytes | None = None,
     content_type: str | None = None,
-    timeout_seconds: float = 30.0,
+    timeout_seconds: float | None = 30.0,
     username: str | None = None,
     password: str | None = None,
     base_url: str | None = None,
@@ -232,7 +242,7 @@ def _request_bytes(
     method: str,
     path: str,
     params: Mapping[str, str | None] | list[tuple[str, str | None]] | None = None,
-    timeout_seconds: float = 30.0,
+    timeout_seconds: float | None = 30.0,
     username: str | None = None,
     password: str | None = None,
     base_url: str | None = None,
@@ -1191,7 +1201,7 @@ def fitnesse_run_suite(
     includehtml: bool = False,
     nochunk: bool = False,
     variables: dict[str, str] | None = None,
-    timeout_seconds: float = _make_timeout(120.0),
+    timeout_seconds: float | None = _make_run_timeout(),
 ) -> dict:
     """Run a suite with full documented controls for responder=suite."""
     params: dict[str, str | None] = {"responder": "suite", "format": "xml"}
@@ -1257,7 +1267,7 @@ def fitnesse_run_test(
     remote_debug: bool = False,
     nochunk: bool = False,
     variables: dict[str, str] | None = None,
-    timeout_seconds: float = _make_timeout(120.0),
+    timeout_seconds: float | None = _make_run_timeout(),
 ) -> dict:
     """Run a test with responder=test and optional controls."""
     params: dict[str, str | None] = {"responder": "test", "format": "xml"}

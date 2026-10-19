@@ -115,6 +115,7 @@ Three further notes:
 | `FITNESSE_FILES_ROOT` | _(none — files tools disabled)_ | Resource root of the files section on the FitNesse instance (e.g. `files`); enables `fitnesse_list_files`, `fitnesse_create_dir`, `fitnesse_upload_file`, `fitnesse_download_file`, `fitnesse_delete_file`, and `fitnesse_rename_file` |
 | `FITNESSE_MAX_RESPONSE_BYTES` | `1048576` (1 MB) | Responses above this are truncated and flagged `"truncated": true` |
 | `FITNESSE_FILES_MAX_TRANSFER_BYTES` | `10485760` (10 MB) | Uploads above this are rejected; downloads above this are truncated and rejected |
+| `FITNESSE_RUN_TIMEOUT_SECONDS` | `120` | Read timeout for `fitnesse_run_test` and `fitnesse_run_suite`; `0` disables it. Applies per socket read, so it caps idle time, not total run time. The MCP client and any proxy have their own timeouts |
 
 ---
 

@@ -1,7 +1,7 @@
 # fitnesse-mcp
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![FastMCP](https://img.shields.io/badge/FastMCP-4.0.0b2-blue.svg)](https://gofastmcp.com)
+[![FastMCP](https://img.shields.io/badge/FastMCP-4.1.1-blue.svg)](https://gofastmcp.com)
 
 An MCP server that exposes [FitNesse](http://fitnesse.org/)'s REST responders as
 tools, letting an MCP client read wiki pages, run tests and suites, manage the
@@ -19,27 +19,15 @@ the [MIT License](LICENSE).
   plus Docker — the devcontainer supplies the Python toolchain and dependencies
 - A reachable FitNesse instance
 
-Working outside the devcontainer? You'll need Python 3.12+ and FastMCP 4, which
-is **currently a prerelease** and must be pinned exactly:
+Working outside the devcontainer? You'll need Python 3.12+ and FastMCP 4,
+pinned exactly:
 
 ```bash
-pip install "fastmcp==4.0.0b2"
+pip install "fastmcp==4.1.1"
 ```
 
-Using uv? `fastmcp` is a thin wrapper that depends on `fastmcp-slim` at the same
-version, and uv only allows prereleases for packages you name explicitly:
-
-```toml
-[project]
-dependencies = ["fastmcp==4.0.0b2"]
-
-[tool.uv]
-constraint-dependencies = ["fastmcp-slim==4.0.0b2"]
-```
-
-> **Pin exactly, not `>=4.0.0b1`.** Each beta in the v4 line has carried
-> breaking changes. This project tracks the prerelease and the pin will move at
-> GA.
+> **Pin exactly, not `>=4`.** FastMCP has shipped breaking changes in minor
+> releases. Bump deliberately and run the test suite after.
 
 ---
 
@@ -375,7 +363,7 @@ FitNesse page paths are dotted (`FrontPage.MySuite.MyTest`) with no leading
 slash.
 
 **`ImportError` on startup** — almost certainly the FastMCP version. This
-project targets `4.0.0b2` exactly; v3 and the v4 alphas will not import.
+project targets `4.1.1` exactly; v3 and the v4 prereleases are not supported.
 
 ---
 

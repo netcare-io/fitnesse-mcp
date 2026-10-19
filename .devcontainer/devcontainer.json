@@ -44,5 +44,8 @@
         "--name=fitnesse-mcp-devcontainer",
         "--add-host=host.docker.internal:host-gateway",
         "--env-file=${localWorkspaceFolder}/.env"
+    ],
+    "mounts": [
+        "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind"
     ]
 }

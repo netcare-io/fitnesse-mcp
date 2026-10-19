@@ -22,10 +22,12 @@ RUN touch server.py \
 
 FROM base AS devcontainer
 
+# chown after the dev install, so everything in the venv belongs to vscode and
+# later `uv pip install` runs inside the container can replace packages.
+RUN uv pip install --python "$VIRTUAL_ENV/bin/python" -e ".[dev]"
+
 RUN useradd --create-home --uid 1000 --shell /bin/bash vscode \
 	&& chown -R vscode:vscode /opt/venv
-
-RUN uv pip install --python "$VIRTUAL_ENV/bin/python" -e ".[dev]"
 
 RUN mkdir -p /workspaces \
 	&& ln -sfn /app /workspaces/fitnesse-mcp

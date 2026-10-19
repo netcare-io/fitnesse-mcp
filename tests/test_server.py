@@ -124,6 +124,26 @@ async def test_timeout_resolved_to_float():
     assert captured["timeout"] == 30.0
 
 
+@pytest.mark.parametrize("tool", ["fitnesse_run_test", "fitnesse_run_suite"])
+@pytest.mark.asyncio
+async def test_run_flags_forwarded(tool):
+    captured = {}
+
+    def spy(req, timeout=None):
+        captured["url"] = req.full_url
+        return _FakeResponse()
+
+    with patch("urllib.request.urlopen", side_effect=spy):
+        async with Client(my_server.mcp) as c:
+            await c.call_tool(
+                tool,
+                {"page_path": "FrontPage", "debug": True, "remote_debug": True, "nochunk": True},
+            )
+
+    query = captured["url"].split("?", 1)[1].split("&")
+    assert {"debug", "remote_debug", "nochunk"} <= set(query)
+
+
 # ---------------------------------------------------------------------------
 # Security: path validation
 # ---------------------------------------------------------------------------

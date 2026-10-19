@@ -1197,6 +1197,8 @@ def fitnesse_run_suite(
     params: dict[str, str | None] = {"responder": "suite", "format": "xml"}
     if debug:
         params["debug"] = None
+    if remote_debug:
+        params["remote_debug"] = None
     if suite_filter:
         params["suiteFilter"] = suite_filter
     if exclude_suite_filter:
@@ -1261,7 +1263,10 @@ def fitnesse_run_test(
     params: dict[str, str | None] = {"responder": "test", "format": "xml"}
     if debug:
         params["debug"] = None
-
+    if remote_debug:
+        params["remote_debug"] = None
+    if nochunk:
+        params["nochunk"] = None
     params = _merge_extra(params, variables)
     return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
 

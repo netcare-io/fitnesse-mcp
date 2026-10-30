@@ -7,8 +7,12 @@ Run with:  pytest tests/test_server.py -v
 """
 import base64
 import importlib
+import io
+import json
 import os
 from unittest.mock import patch
+from urllib.error import HTTPError
+from urllib.parse import parse_qs
 
 import pytest
 from fastmcp import Client
@@ -54,7 +58,13 @@ def _patch_urlopen(body: bytes = b'{"ok":true}', content_type: str = "applicatio
 @pytest.fixture
 def clean_env():
     """Reload the server with every opt-in gate closed, whatever the ambient env."""
-    gates = ("FITNESSE_FILES_ROOT", "FITNESSE_COMPLETE_TOOLSET", "FITNESSE_ALLOW_SHUTDOWN", "FITNESSE_READONLY")
+    gates = (
+        "FITNESSE_FILES_ROOT",
+        "FITNESSE_COMPLETE_TOOLSET",
+        "FITNESSE_ALLOW_SHUTDOWN",
+        "FITNESSE_READONLY",
+        "FITNESSE_CUSTOM_TOOLS",
+    )
     previous = {k: os.environ.pop(k, None) for k in gates}
     try:
         importlib.reload(my_server)
@@ -204,7 +214,13 @@ def files_env():
     FITNESSE_FILES_ROOT names the resource root on the *remote* FitNesse
     instance ("files"); neither download nor upload touches local disk.
     """
-    gates = ("FITNESSE_FILES_ROOT", "FITNESSE_COMPLETE_TOOLSET", "FITNESSE_ALLOW_SHUTDOWN", "FITNESSE_READONLY")
+    gates = (
+        "FITNESSE_FILES_ROOT",
+        "FITNESSE_COMPLETE_TOOLSET",
+        "FITNESSE_ALLOW_SHUTDOWN",
+        "FITNESSE_READONLY",
+        "FITNESSE_CUSTOM_TOOLS",
+    )
     previous = {k: os.environ.pop(k, None) for k in gates}
     os.environ["FITNESSE_FILES_ROOT"] = "files"
     os.environ["FITNESSE_COMPLETE_TOOLSET"] = "1"
@@ -596,3 +612,242 @@ async def test_read_tool_logs_when_truncated(monkeypatch, caplog):
             result = await c.call_tool("fitnesse_get_page_data", {"page_path": "FrontPage"})
     assert result.data["truncated"] is True
     assert "truncated to FITNESSE_MAX_RESPONSE_BYTES=4" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Custom tools gate: interactive debugging (debugTest responder)
+# ---------------------------------------------------------------------------
+
+_DEBUG_TOOLS = {
+    "fitnesse_debug_start",
+    "fitnesse_debug_run_wiki",
+    "fitnesse_debug_run_table",
+    "fitnesse_debug_keywords",
+    "fitnesse_debug_end",
+}
+
+# Shortened from real debugTest output (fitlibrary.suite.InteractiveNetcareFitLibraryServer)
+_DEBUG_HTML = """<table>
+\t<tr>
+\t\t<td class="pass">dynamic variable exists</td>
+\t\t<td>x</td>
+\t</tr>
+</table>
+<br/><table>
+\t<tr>
+\t\t<td>check</td>
+\t\t<td>get</td>
+\t\t<td>abc</td>
+\t\t<td class="fail">abd <span class="fit_label">expected</span><hr>abc <span class="fit_label">actual</span></td>
+\t</tr>
+</table>
+<br/><table>
+\t<tr>
+\t\t<td>show</td>
+\t\t<td>get</td>
+\t\t<td>hello</td>
+\t<td bgcolor=#C0C0FF><span class="note">hello</span></td></tr>
+</table>
+<br/><table>
+\t<tr>
+\t\t<td class="error">no such keyword here<hr/> <span class="fit_label">Missing class or Missing method.</span></td>
+\t</tr>
+</table>
+<br/><table>
+\t<tr>
+\t\t<td>show after as</td>
+\t\t<td>My Title</td>
+\t\t<td>get</td>
+\t\t<td>titled text</td>
+\t</tr>
+</table><div class="included">
+<div style="float: right;" class="meta">
+<a href="javascript:expandAll();">Expand All</a> |
+ <a href="javascript:collapseAll();">Collapse All</a></div>
+<a href="javascript:toggleCollapsable('12346');">
+<img src="/files/images/collapsableClosed.gif" class="left" id="img12346"/></a>
+&nbsp;<span class="meta">My Title</span><div class="hidden" id="12346">
+<pre>line one<br/>  indented<br/></pre>
+</div></div>
+"""
+
+_KEYWORDS_HTML = (
+    '<table border="1" cellspacing="0"><tr><td>keywords</td><td>wiki</td><td>tooltip</td><td>author</td><td>class</td></tr>'
+    "<tr><td>simple</td><td>|''&lt;i&gt;with browser&lt;/i&gt;''|</td><td>Test websites using Web Browsers.</td>"
+    "<td>Dominik Schröter</td><td>fitlibrary.flow.GlobalActionScopeForWeb</td></tr>"
+    "<tr><td>simple</td><td>|'''&lt;b&gt;show after as&lt;/b&gt;'''|title|action...|</td><td>Show in a titled folding area.</td>"
+    "<td></td><td>fitlibrary.flow.GlobalActionScope</td></tr></table>"
+)
+
+# 1x1 transparent PNG
+_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+
+
+def _debug_json(html: str, wrong: int = 0, exceptions: int = 0, **extra) -> bytes:
+    counts = {"right": 1, "wrong": wrong, "ignores": 0, "exceptions": exceptions}
+    return json.dumps({"html": html, "counts": counts, **extra}).encode()
+
+
+@pytest.fixture
+def custom_env(clean_env):
+    os.environ["FITNESSE_CUSTOM_TOOLS"] = "1"
+    importlib.reload(my_server)
+    yield
+
+
+@pytest.mark.asyncio
+async def test_custom_tools_hidden_by_default(clean_env):
+    async with Client(my_server.mcp) as c:
+        tools = {t.name for t in await c.list_tools()}
+    assert not tools & _DEBUG_TOOLS
+
+
+@pytest.mark.asyncio
+async def test_custom_tools_exposed_when_flagged(custom_env):
+    async with Client(my_server.mcp) as c:
+        tools = await c.list_tools()
+    assert _DEBUG_TOOLS <= {t.name for t in tools}
+    assert len(tools) == 28
+
+
+@pytest.mark.asyncio
+async def test_custom_tools_hidden_by_readonly(custom_env):
+    os.environ["FITNESSE_READONLY"] = "1"
+    importlib.reload(my_server)
+    async with Client(my_server.mcp) as c:
+        tools = {t.name for t in await c.list_tools()}
+    assert not tools & _DEBUG_TOOLS
+
+
+@pytest.mark.asyncio
+async def test_debug_run_wiki_posts_form(custom_env):
+    captured = {}
+
+    def spy(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["method"] = req.get_method()
+        captured["body"] = req.data.decode()
+        return _FakeResponse(_debug_json("<table><tr><td>x</td></tr></table>"))
+
+    with patch("urllib.request.urlopen", side_effect=spy):
+        async with Client(my_server.mcp) as c:
+            await c.call_tool("fitnesse_debug_run_wiki", {"wiki": "|with browser|", "with_keywords": True})
+    assert captured["method"] == "POST"
+    assert captured["url"].endswith("/?responder=debugTest")
+    assert parse_qs(captured["body"]) == {
+        "action": ["runWiki"],
+        "wiki": ["|with browser|"],
+        "withKeywords": ["true"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_debug_run_parses_cells_and_foldings(custom_env):
+    with _patch_urlopen(body=_debug_json(_DEBUG_HTML, wrong=1, exceptions=1)):
+        async with Client(my_server.mcp) as c:
+            result = await c.call_tool("fitnesse_debug_run_wiki", {"wiki": "..."})
+    data = result.structured_content
+    assert data["passed"] is False
+    tables = data["tables"]
+    assert [t["status"] for t in tables] == ["pass", "fail", "none", "error", "none"]
+    assert tables[0]["rows"] == [[{"text": "dynamic variable exists", "status": "pass"}, {"text": "x"}]]
+    assert tables[1]["rows"][0][3] == {"text": "abd", "status": "fail", "expected": "abd", "actual": "abc"}
+    assert tables[2]["rows"][0][3] == {"text": "hello", "status": "show"}
+    assert tables[3]["rows"][0][0] == {
+        "text": "no such keyword here",
+        "status": "error",
+        "message": "Missing class or Missing method.",
+    }
+    assert tables[4]["foldings"] == [{"title": "My Title", "text": "line one\n  indented"}]
+    assert "links" not in tables[4] and "images" not in tables[4]
+    assert "html" not in data
+
+
+@pytest.mark.asyncio
+async def test_debug_run_returns_inline_screenshots(custom_env):
+    html = (
+        f'<table><tr><td class="fail">click</td></tr></table>'
+        f'<div class="included"><span class="meta">Screenshot</span><div class="hidden">'
+        f'<a href="/files/screenshots/shot.png">full size</a><img src="data:image/png;base64,{_PNG_B64}"/>'
+        f"</div></div>"
+    )
+    with _patch_urlopen(body=_debug_json(html, wrong=1)):
+        async with Client(my_server.mcp) as c:
+            result = await c.call_tool("fitnesse_debug_run_wiki", {"wiki": "|click|"})
+    folding = result.structured_content["tables"][0]["foldings"][0]
+    assert folding["links"] == [{"href": "/files/screenshots/shot.png", "text": "full size"}]
+    assert folding["images"] == [{"inline": True, "format": "png", "alt": "", "content_index": 1}]
+    assert [b.type for b in result.content] == ["text", "image"]
+    assert result.content[1].data == _PNG_B64
+
+
+@pytest.mark.asyncio
+async def test_debug_run_limits_inline_images(custom_env, monkeypatch):
+    monkeypatch.setattr(my_server, "_DEBUG_MAX_IMAGES", 1)
+    img = f'<img src="data:image/png;base64,{_PNG_B64}"/>'
+    with _patch_urlopen(body=_debug_json(f"<table><tr><td>{img}{img}</td></tr></table>")):
+        async with Client(my_server.mcp) as c:
+            result = await c.call_tool("fitnesse_debug_run_wiki", {"wiki": "|x|"})
+    images = result.structured_content["tables"][0]["images"]
+    assert "content_index" in images[0]
+    assert "omitted" in images[1]
+    assert [b.type for b in result.content] == ["text", "image"]
+
+
+@pytest.mark.asyncio
+async def test_debug_keywords_runnable_and_searchable(custom_env):
+    with _patch_urlopen(body=_debug_json(_KEYWORDS_HTML)):
+        async with Client(my_server.mcp) as c:
+            every = (await c.call_tool("fitnesse_debug_keywords", {})).structured_content["keywords"]
+            found = (await c.call_tool("fitnesse_debug_keywords", {"search": "FOLDING"})).structured_content["keywords"]
+    assert [k["wiki"] for k in every] == ["|with browser|", "|show after as|title|action...|"]
+    assert every[0]["author"] == "Dominik Schröter"
+    assert [k["wiki"] for k in found] == ["|show after as|title|action...|"]
+
+
+@pytest.mark.asyncio
+async def test_debug_run_with_keywords(custom_env):
+    with _patch_urlopen(body=_debug_json("<table><tr><td>with browser</td></tr></table>", keywords=_KEYWORDS_HTML)):
+        async with Client(my_server.mcp) as c:
+            result = await c.call_tool("fitnesse_debug_run_wiki", {"wiki": "|with browser|", "with_keywords": True})
+    assert len(result.structured_content["keywords"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_debug_error_message_surfaced(custom_env):
+    error = HTTPError(
+        "http://x/?responder=debugTest", 409, "Conflict", {},
+        io.BytesIO(b'{"error":"No running debug session; call action=start first"}'),
+    )
+    with patch("urllib.request.urlopen", side_effect=error):
+        async with Client(my_server.mcp) as c:
+            result = await c.call_tool("fitnesse_debug_keywords", {})
+    assert result.structured_content["ok"] is False
+    assert result.structured_content["status"] == 409
+    assert "call action=start first" in result.structured_content["error"]
+
+
+@pytest.mark.asyncio
+async def test_debug_non_json_response_rejected(custom_env):
+    with _patch_urlopen(body=b"<html>plain FitNesse page</html>", content_type="text/html"):
+        async with Client(my_server.mcp) as c:
+            result = await c.call_tool("fitnesse_debug_end", {})
+    assert result.data["ok"] is False
+    assert "debugTest responder" in result.data["error"]
+
+
+@pytest.mark.asyncio
+async def test_debug_start_forwards_remote_debug(custom_env):
+    captured = {}
+
+    def spy(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["body"] = req.data.decode()
+        return _FakeResponse(b'{"started":true,"page":"FrontPage.MyTest"}')
+
+    with patch("urllib.request.urlopen", side_effect=spy):
+        async with Client(my_server.mcp) as c:
+            result = await c.call_tool("fitnesse_debug_start", {"page_path": "FrontPage.MyTest", "remote_debug": True})
+    assert result.data["started"] is True
+    assert "/FrontPage.MyTest?responder=debugTest" in captured["url"]
+    assert parse_qs(captured["body"]) == {"action": ["start"], "debug": ["true"]}

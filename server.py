@@ -6,10 +6,12 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import uuid
 import xml.etree.ElementTree as ET
 from base64 import b64decode, b64encode
 from collections.abc import Mapping
+from html.parser import HTMLParser
 from typing import Annotated, Literal
 from urllib import parse, request
 from urllib.error import HTTPError, URLError
@@ -20,6 +22,7 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.transforms import Visibility
 from fastmcp.tools import ToolResult
 from fastmcp.utilities.types import File, Image
+from mcp.types import TextContent
 from pydantic import Field
 
 mcp = FastMCP("Fitnesse MCP Server")
@@ -67,6 +70,8 @@ def _env_flag(name: str) -> bool:
 
 # Extra low-traffic/read-heavy tools trimmed from the default set; opt back in with FITNESSE_COMPLETE_TOOLSET=1.
 FITNESSE_COMPLETE_TOOLSET = _env_flag("FITNESSE_COMPLETE_TOOLSET")
+# Tools for responders that only exist in customized FitNesse builds (e.g. netcare's debugTest); opt in with FITNESSE_CUSTOM_TOOLS=1.
+FITNESSE_CUSTOM_TOOLS = _env_flag("FITNESSE_CUSTOM_TOOLS")
 
 
 def _make_timeout(default: float):
@@ -255,6 +260,8 @@ def _request_bytes(
     username: str | None = None,
     password: str | None = None,
     base_url: str | None = None,
+    body: str | bytes | None = None,
+    content_type: str | None = None,
 ) -> dict:
     """Like _request, but returns the raw response body bytes undecoded."""
     if base_url is None:
@@ -264,8 +271,12 @@ def _request_bytes(
     if password is None:
         password = os.getenv("FITNESSE_PASSWORD")
     url = _build_url(base_url=base_url, path=path, params=params)
-    req = request.Request(url=url, method=method.upper())
+    data = body.encode() if isinstance(body, str) else body
+    req = request.Request(url=url, data=data, method=method.upper())
     _apply_basic_auth(req=req, username=username, password=password)
+
+    if content_type:
+        req.add_header("Content-Type", content_type)
 
     try:
         with request.urlopen(req, timeout=timeout_seconds) as response:
@@ -1521,6 +1532,437 @@ if FITNESSE_COMPLETE_TOOLSET:
             params={"responder": "edit", "format": "json"},
             timeout_seconds=timeout_seconds,
         )
+
+
+# Custom responders: interactive debugging (debugTest) of netcare's FitNesse build.
+# Not part of standard FitNesse, so only registered with FITNESSE_CUSTOM_TOOLS.
+
+_VOID_TAGS = {"area", "base", "br", "col", "hr", "img", "input", "link", "meta", "wbr"}
+_CELL_STATUSES = ("error", "fail", "pass", "ignore")
+_DEBUG_MAX_IMAGES = 4
+
+
+class _Node:
+    __slots__ = ("tag", "attrs", "children")
+
+    def __init__(self, tag: str, attrs: dict[str, str]):
+        self.tag = tag
+        self.attrs = attrs
+        self.children: list["_Node | str"] = []
+
+    def classes(self) -> set[str]:
+        return set(self.attrs.get("class", "").split())
+
+    def iter(self, tag: str):
+        for child in self.children:
+            if isinstance(child, _Node):
+                if child.tag == tag:
+                    yield child
+                yield from child.iter(tag)
+
+
+class _TreeBuilder(HTMLParser):
+    """Lenient HTML to _Node tree; FitNesse output is HTML, not XML (unquoted attributes, bare <hr>)."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.root = _Node("#root", {})
+        self._stack = [self.root]
+
+    def handle_starttag(self, tag, attrs):
+        node = _Node(tag, {k: v or "" for k, v in attrs})
+        self._stack[-1].children.append(node)
+        if tag not in _VOID_TAGS:
+            self._stack.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        self._stack[-1].children.append(_Node(tag, {k: v or "" for k, v in attrs}))
+
+    def handle_endtag(self, tag):
+        for i in range(len(self._stack) - 1, 0, -1):
+            if self._stack[i].tag == tag:
+                del self._stack[i:]
+                return
+
+    def handle_data(self, data):
+        self._stack[-1].children.append(data)
+
+
+def _parse_html(markup: str) -> _Node:
+    builder = _TreeBuilder()
+    builder.feed(markup)
+    builder.close()
+    return builder.root
+
+
+def _text(nodes: list["_Node | str"], pre: bool = False, skip_labels: bool = False) -> str:
+    """Visible text; <br>/<hr> and block elements become line breaks. pre keeps spacing (folding texts, logs)."""
+    parts: list[str] = []
+
+    def walk(children):
+        for child in children:
+            if isinstance(child, str):
+                parts.append(child)
+            elif child.tag in {"br", "hr"}:
+                parts.append("\n")
+            elif child.tag in {"script", "style"} or (skip_labels and "fit_label" in child.classes()):
+                continue
+            elif child.tag in {"p", "div", "li", "tr", "pre", "table"}:
+                parts.append("\n")
+                walk(child.children)
+                parts.append("\n")
+            else:
+                walk(child.children)
+
+    walk(nodes)
+    lines = "".join(parts).split("\n")
+    if pre:
+        return "\n".join(line.rstrip() for line in lines).strip("\n")
+    lines = [re.sub(r"\s+", " ", line).strip() for line in lines]
+    return "\n".join(line for line in lines if line)
+
+
+def _split_at_hr(children: list["_Node | str"]) -> list[list["_Node | str"]]:
+    segments: list[list[_Node | str]] = [[]]
+    for child in children:
+        if isinstance(child, _Node) and child.tag == "hr":
+            segments.append([])
+        else:
+            segments[-1].append(child)
+    return segments
+
+
+def _labels(nodes: list["_Node | str"]) -> list[str]:
+    found = []
+    for node in nodes:
+        if isinstance(node, _Node):
+            if "fit_label" in node.classes():
+                found.append(_text(node.children))
+            else:
+                found.extend(_labels(node.children))
+    return found
+
+
+def _parse_cell(td: _Node) -> dict:
+    """One table cell: its text, plus status, expected/actual or message where FitNesse marked it."""
+    status = next((s for s in _CELL_STATUSES if s in td.classes()), None)
+    segments = _split_at_hr(td.children)
+    cell: dict = {"text": _text(segments[0], skip_labels=True)}
+    if status is None and any("note" in n.classes() for n in td.iter("span")):
+        status = "show"
+    if status:
+        cell["status"] = status
+    if len(segments) > 1:
+        if status == "fail" and _labels(segments[0]) == ["expected"] and _labels(segments[1]) == ["actual"]:
+            cell["expected"] = cell["text"]
+            cell["actual"] = _text(segments[1], skip_labels=True)
+        else:
+            cell["message"] = "\n".join(_text(s) for s in segments[1:])
+    elif status != "show" and _labels(segments[0]):
+        cell["message"] = "\n".join(_labels(segments[0]))
+    return cell
+
+
+def _own_rows(table: _Node):
+    """Rows of this table, not of tables nested in its cells."""
+    def walk(node):
+        for child in node.children:
+            if isinstance(child, _Node):
+                if child.tag == "tr":
+                    yield child
+                elif child.tag != "table":
+                    yield from walk(child)
+    yield from walk(table)
+
+
+def _own_cells(tr: _Node):
+    return [c for c in tr.children if isinstance(c, _Node) and c.tag in {"td", "th"}]
+
+
+def _parse_folding(div: _Node) -> dict:
+    """A folding area: FitLibrary's div.included or FitNesse's div.collapsible."""
+    title = ""
+    content: list[_Node | str] = []
+    for child in div.children:
+        if not isinstance(child, _Node):
+            continue
+        classes = child.classes()
+        if child.tag == "span" and "meta" in classes or child.tag == "p" and "title" in classes:
+            title = _text(child.children)
+        elif child.tag == "div" and "meta" not in classes:
+            content.extend(child.children)
+    return {"title": title, "text": _text(content, pre=True)}
+
+
+class _Media:
+    """Collects links and images; inline (data:) images become MCP image content."""
+
+    def __init__(self):
+        self.images: list[Image] = []
+
+    def collect(self, node: _Node, into: dict) -> None:
+        for a in node.iter("a"):
+            href = a.attrs.get("href", "")
+            if href and not href.startswith(("javascript:", "#")):
+                into.setdefault("links", []).append({"href": href, "text": _text(a.children)})
+        for img in node.iter("img"):
+            src = img.attrs.get("src", "")
+            if not src or "/files/images/collapsable" in src:
+                continue
+            into.setdefault("images", []).append(self._image(src, img.attrs.get("alt", "")))
+
+    def _image(self, src: str, alt: str) -> dict:
+        match = re.match(r"data:image/([\w.+-]+);base64,(.*)", src, re.S)
+        if not match:
+            return {"src": src, "alt": alt}
+        entry: dict = {"inline": True, "format": match.group(1), "alt": alt}
+        if len(self.images) >= _DEBUG_MAX_IMAGES:
+            entry["omitted"] = f"more than {_DEBUG_MAX_IMAGES} images in this result"
+            return entry
+        try:
+            data = b64decode(match.group(2), validate=False)
+        except binascii.Error:
+            entry["omitted"] = "invalid base64"
+            return entry
+        self.images.append(Image(data=data, format=match.group(1)))
+        entry["content_index"] = len(self.images)
+        return entry
+
+
+def _table_status(rows: list[list[dict]]) -> str:
+    statuses = {c.get("status") for row in rows for c in row}
+    return next((s for s in _CELL_STATUSES if s in statuses), "none")
+
+
+def _parse_tables(markup: str, media: _Media) -> list[dict]:
+    """Top-level tables in document order, each with the folding areas that follow it."""
+    tables: list[dict] = []
+    orphan_foldings: list[dict] = []
+
+    def walk(node: _Node):
+        for child in node.children:
+            if not isinstance(child, _Node):
+                continue
+            classes = child.classes()
+            if child.tag == "table":
+                rows = [[_parse_cell(td) for td in _own_cells(tr)] for tr in _own_rows(child)]
+                table = {"index": len(tables), "status": _table_status(rows), "rows": rows}
+                media.collect(child, table)
+                tables.append(table)
+            elif child.tag == "div" and classes & {"included", "collapsible"}:
+                folding = _parse_folding(child)
+                media.collect(child, folding)
+                (tables[-1].setdefault("foldings", []) if tables else orphan_foldings).append(folding)
+            else:
+                walk(child)
+
+    walk(_parse_html(markup))
+    if orphan_foldings:
+        tables.insert(0, {"index": None, "status": "none", "rows": [], "foldings": orphan_foldings})
+    return tables
+
+
+def _runnable_wiki(wiki: str) -> str:
+    """Keyword annotations format the wiki for display (|''<i>with browser</i>''|); this is the runnable form."""
+    return re.sub(r"</?[ib]>", "", re.sub(r"'{2,3}", "", wiki))
+
+
+def _parse_keywords(markup: str, search: str | None = None) -> list[dict]:
+    keywords = []
+    for table in _parse_html(markup).iter("table"):
+        for tr in _own_rows(table):
+            cells = [_text(td.children) for td in _own_cells(tr)]
+            if len(cells) < 5 or cells[0] == "keywords":
+                continue
+            kind, wiki, tooltip, author, cls = cells[:5]
+            entry = {
+                "kind": kind,
+                "wiki": _runnable_wiki(wiki),
+                "tooltip": re.sub(r"<[^>]+>", "", tooltip),
+                "author": author,
+                "class": cls,
+            }
+            if search and search.lower() not in " ".join(entry.values()).lower():
+                continue
+            keywords.append(entry)
+        break
+    return keywords
+
+
+def _debug_request(
+    action: str,
+    timeout_seconds: float | None,
+    page_path: str = "",
+    form: dict[str, str] | None = None,
+) -> tuple[dict, dict | None]:
+    """POST an action to responder=debugTest; returns (result, parsed JSON payload or None on failure).
+
+    Read with the files transfer limit: inline screenshots easily exceed FITNESSE_MAX_RESPONSE_BYTES.
+    """
+    result = _request_bytes(
+        "POST",
+        page_path,
+        params={"responder": "debugTest"},
+        body=parse.urlencode({"action": action, **(form or {})}),
+        content_type="application/x-www-form-urlencoded",
+        timeout_seconds=timeout_seconds,
+    )
+    if not result["ok"]:
+        try:
+            message = json.loads(result["body"])["error"]
+            result["error"] = f"{result['error']}: {message}"
+            result["body"] = None
+        except (TypeError, ValueError, KeyError):
+            pass
+        return result, None
+    body: bytes = result.pop("body")
+    if result["truncated"]:
+        return {**result, "ok": False, "error": f"Response exceeds FITNESSE_FILES_MAX_TRANSFER_BYTES={MAX_TRANSFER_BYTES}"}, None
+    try:
+        return result, json.loads(body.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return {**result, "ok": False, "error": "Response is not JSON; does this FitNesse have the debugTest responder?"}, None
+
+
+def _debug_run(
+    action: str,
+    timeout_seconds: float | None,
+    form: dict[str, str] | None = None,
+    include_html: bool = False,
+    keyword_search: str | None = None,
+) -> ToolResult:
+    result, payload = _debug_request(action, timeout_seconds, form=form)
+    if payload is None:
+        return ToolResult(structured_content=result)
+    media = _Media()
+    counts = payload.get("counts") or {}
+    parsed: dict = {
+        "ok": True,
+        "status": result["status"],
+        "passed": not counts.get("wrong") and not counts.get("exceptions"),
+        "counts": counts,
+    }
+    if action == "keywords":
+        parsed["keywords"] = _parse_keywords(payload.get("html", ""), keyword_search)
+    else:
+        parsed["tables"] = _parse_tables(payload.get("html", ""), media)
+    if "keywords" in payload:
+        parsed["keywords"] = _parse_keywords(payload["keywords"], keyword_search)
+    if include_html:
+        parsed["html"] = payload.get("html", "")
+    content = [TextContent(type="text", text=json.dumps(parsed, ensure_ascii=False))]
+    content.extend(image.to_image_content() for image in media.images)
+    return ToolResult(content=content, structured_content=parsed)
+
+
+if FITNESSE_CUSTOM_TOOLS:
+
+    @mcp.tool(
+        name="fitnesse_debug_start",
+        description=(
+            "Starts an interactive debug session (custom debugTest responder): launches the Fit test process for the "
+            "page with its classpath and variables, without running the page itself. One session per FitNesse user; "
+            "starting again ends the previous session without teardown. Then run tables step by step with "
+            "fitnesse_debug_run_wiki; state (browser, variables, fixtures) carries over between calls. Always finish "
+            "with fitnesse_debug_end so the teardown runs (e.g. the browser is closed). Idle sessions are killed "
+            "after a server-side timeout. remote_debug makes the test process wait for a Java debugger on port 8000; "
+            "it has to attach within 60 seconds."
+        ),
+        tags={"fitnesse", "custom", "debug", "execute"},
+        annotations={"destructiveHint": False},
+    )
+    def fitnesse_debug_start(
+        page_path: WikiPath,
+        remote_debug: bool = False,
+        timeout_seconds: float = _make_timeout(120.0),
+    ) -> dict:
+        """Start a debug session via responder=debugTest&action=start."""
+        result, payload = _debug_request(
+            "start", timeout_seconds, page_path=page_path, form={"debug": "true"} if remote_debug else None
+        )
+        return result if payload is None else {**result, **payload}
+
+    @mcp.tool(
+        name="fitnesse_debug_run_wiki",
+        description=(
+            "Runs wiki tables in the running debug session, e.g. \"|with browser|\\n\\n|open|https://example.org|\". "
+            "Separate tables with a blank line. The text is rendered in the context of the session's page, so "
+            "page variables and !include work; ${name} is resolved at rendering, so for values set earlier in the "
+            "session (|set variables|, |set|...) use the dynamic form @{name}. Returns the counts and, per table, its status and rows of cells: each cell "
+            "has its text and, where FitNesse marked it, a status (pass, fail, error, ignore, show), expected/actual "
+            "for failed checks or an error message; plus folding texts shown after the table (logs, 'show after'), "
+            "links and screenshots (inline images follow as image content, referenced by content_index). "
+            "with_keywords also returns the keywords available after this step (see fitnesse_debug_keywords)."
+        ),
+        tags={"fitnesse", "custom", "debug", "execute"},
+        annotations={"destructiveHint": False},
+    )
+    def fitnesse_debug_run_wiki(
+        wiki: Annotated[str, Field(description="FitNesse wiki markup with one or more tables.")],
+        with_keywords: bool = False,
+        include_html: bool = False,
+        timeout_seconds: float | None = _make_run_timeout(),
+    ) -> ToolResult:
+        """Run wiki text via responder=debugTest&action=runWiki."""
+        form = {"wiki": wiki}
+        if with_keywords:
+            form["withKeywords"] = "true"
+        return _debug_run("runWiki", timeout_seconds, form=form, include_html=include_html)
+
+    @mcp.tool(
+        name="fitnesse_debug_run_table",
+        description=(
+            "Runs tables given as HTML (<table>...</table>, as FitNesse renders them) in the running debug session. "
+            "Same result as fitnesse_debug_run_wiki; prefer that one unless you already have rendered HTML."
+        ),
+        tags={"fitnesse", "custom", "debug", "execute"},
+        annotations={"destructiveHint": False},
+    )
+    def fitnesse_debug_run_table(
+        html_tables: Annotated[str, Field(description="One or more HTML tables.")],
+        with_keywords: bool = False,
+        include_html: bool = False,
+        timeout_seconds: float | None = _make_run_timeout(),
+    ) -> ToolResult:
+        """Run HTML tables via responder=debugTest&action=runTable."""
+        form = {"html": html_tables}
+        if with_keywords:
+            form["withKeywords"] = "true"
+        return _debug_run("runTable", timeout_seconds, form=form, include_html=include_html)
+
+    @mcp.tool(
+        name="fitnesse_debug_keywords",
+        description=(
+            "Lists the keywords (annotated actions) available at the current point of the debug session: kind "
+            "(simple or compound), runnable wiki syntax, tooltip, author and implementing class. The list depends on "
+            "the session state: at first only the global keywords exist; after e.g. |with browser| the browser "
+            "fixture's keywords are added. search filters case-insensitively over all fields."
+        ),
+        tags={"fitnesse", "custom", "debug", "execute"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_debug_keywords(
+        search: str | None = None,
+        timeout_seconds: float = _make_timeout(60.0),
+    ) -> ToolResult:
+        """List keywords via responder=debugTest&action=keywords."""
+        return _debug_run("keywords", timeout_seconds, keyword_search=search)
+
+    @mcp.tool(
+        name="fitnesse_debug_end",
+        description=(
+            "Ends the debug session: runs the storytest teardown (e.g. closes the browser) and stops the test "
+            "process."
+        ),
+        tags={"fitnesse", "custom", "debug", "control"},
+        annotations={"destructiveHint": False, "idempotentHint": True},
+    )
+    def fitnesse_debug_end(
+        timeout_seconds: float = _make_timeout(120.0),
+    ) -> dict:
+        """End the debug session via responder=debugTest&action=end."""
+        result, payload = _debug_request("end", timeout_seconds)
+        return result if payload is None else {**result, **payload}
 
 
 if _env_flag("FITNESSE_READONLY"):

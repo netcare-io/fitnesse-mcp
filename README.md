@@ -112,6 +112,7 @@ Three further notes:
 | `FITNESSE_READONLY` | `false` | `1`/`true`/`yes`/`on` hides all write, execute, and control tools |
 | `FITNESSE_ALLOW_SHUTDOWN` | `false` | `1`/`true`/`yes`/`on` exposes `fitnesse_shutdown` |
 | `FITNESSE_COMPLETE_TOOLSET` | `false` | `1`/`true`/`yes`/`on` exposes the 14 lower-traffic tools hidden by default (marked below) |
+| `FITNESSE_CUSTOM_TOOLS` | `false` | `1`/`true`/`yes`/`on` exposes the tools for responders that only exist in customized FitNesse builds: the `fitnesse_debug_*` tools for netcare's `debugTest` responder |
 | `FITNESSE_FILES_ROOT` | _(none — files tools disabled)_ | Resource root of the files section on the FitNesse instance (e.g. `files`); enables `fitnesse_list_files`, `fitnesse_create_dir`, `fitnesse_upload_file`, `fitnesse_download_file`, `fitnesse_delete_file`, and `fitnesse_rename_file` |
 | `FITNESSE_MAX_RESPONSE_BYTES` | `1048576` (1 MB) | Responses above this are truncated and flagged `"truncated": true` |
 | `FITNESSE_FILES_MAX_TRANSFER_BYTES` | `10485760` (10 MB) | Uploads above this are rejected; downloads above this are truncated and rejected |
@@ -128,7 +129,7 @@ instance to also expose `fitnesse_list_files`, `fitnesse_create_dir`,
 `fitnesse_rename_file` (29 total),
 `FITNESSE_COMPLETE_TOOLSET=1` to expose 14 additional lower-traffic tools, and
 `FITNESSE_ALLOW_SHUTDOWN=1` to also expose `fitnesse_shutdown` (44 with all
-four). Under `FITNESSE_READONLY`, only the **read** tools are exposed — 9 by
+four). `FITNESSE_CUSTOM_TOOLS=1` adds the 5 interactive debugging tools. Under `FITNESSE_READONLY`, only the **read** tools are exposed — 9 by
 default, or up to 24 with `FITNESSE_FILES_ROOT` and `FITNESSE_COMPLETE_TOOLSET=1`
 both set.
 
@@ -209,7 +210,50 @@ both set.
 | `fitnesse_rename_file` | `renameFile` _(needs `FITNESSE_FILES_ROOT`)_ | write |
 | `fitnesse_delete_file` | `deleteFile` _(needs `FITNESSE_FILES_ROOT`)_ | write |
 
+### Interactive debugging _(needs `FITNESSE_CUSTOM_TOOLS`)_
+
+| Tool | Responder | Mode |
+|---|---|---|
+| `fitnesse_debug_start` | `debugTest`, `action=start` — starts the page's test process, optionally waiting for a Java debugger | execute |
+| `fitnesse_debug_run_wiki` | `debugTest`, `action=runWiki` — runs wiki tables in the session | execute |
+| `fitnesse_debug_run_table` | `debugTest`, `action=runTable` — runs HTML tables in the session | execute |
+| `fitnesse_debug_keywords` | `debugTest`, `action=keywords` — keywords available at this point, filterable | execute |
+| `fitnesse_debug_end` | `debugTest`, `action=end` — teardown, stops the test process | control |
+
 </details>
+
+---
+
+## Interactive debugging
+
+With `FITNESSE_CUSTOM_TOOLS=1`, the `fitnesse_debug_*` tools drive the
+`debugTest` responder of netcare's FitNesse build (`fitnesse-netcare-mod`,
+with `fitlibrary.suite.InteractiveNetcareFitLibraryServer` from
+`fitlibrary-netcare-mod`). Standard FitNesse has no such responder; against it
+the tools fail with a "does this FitNesse have the debugTest responder?" error.
+
+A session keeps one Fit test process running between calls, so a client can
+run a test one table at a time and look at each result before the next step:
+
+1. `fitnesse_debug_start` on a test page: starts the test process with that
+   page's classpath and variables, without running the page. FitNesse allows
+   one session per user, so all clients sharing `FITNESSE_USERNAME` share it.
+2. `fitnesse_debug_run_wiki` per step. The wiki text is rendered in the context
+   of the page; values set during the session are read with `@{name}`, since
+   `${name}` is resolved at rendering.
+3. `fitnesse_debug_keywords` lists the keywords available at this point. The
+   list grows with the session state, e.g. after `|with browser|`.
+4. `fitnesse_debug_end` runs the teardown (closes the browser) and stops the
+   process. FitNesse kills idle sessions without a teardown.
+
+Runs return the raw counts plus the parsed result: for each table its status
+and rows of cells (status `pass`/`fail`/`error`/`ignore`/`show`, `expected` and
+`actual` for failed checks, error messages), the folding areas after it
+(`show after`, logs), and links and images. Inline (`data:`) screenshots are
+returned as MCP image content, at most 4 per result. Responses are read up to
+`FITNESSE_FILES_MAX_TRANSFER_BYTES` rather than `FITNESSE_MAX_RESPONSE_BYTES`,
+because inline screenshots easily exceed the latter; `include_html` adds the
+raw HTML.
 
 Flag-style FitNesse inputs are supported by passing `None` as a query param
 value — for example `{"nohistory": None}` produces `?nohistory`.
@@ -452,6 +496,7 @@ FITNESSE_READONLY=1
 # FITNESSE_ALLOW_SHUTDOWN=1
 # FITNESSE_COMPLETE_TOOLSET=1
 # FITNESSE_FILES_ROOT=files
+# FITNESSE_CUSTOM_TOOLS=1
 ```
 
 The server is then available at `http://localhost:8000/mcp` or through the stdio-to-html-proxy for stdio-only clients:

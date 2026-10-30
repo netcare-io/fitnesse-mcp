@@ -527,3 +527,72 @@ async def test_files_root_adds_files_tools(files_env):
         "fitnesse_create_dir",
     } <= names
     assert len(tools) == 43
+
+
+# ---------------------------------------------------------------------------
+# Page history executionLog filtering
+# ---------------------------------------------------------------------------
+
+_HISTORY_XML = (
+    b"<?xml version='1.0' encoding='utf-8'?><suiteResults><executionLog>"
+    b"<testSystem>slim</testSystem><command>java -jar x</command><exitCode>0</exitCode>"
+    b"<stdOut>lots of output</stdOut><stdErr>warn</stdErr></executionLog>"
+    b"<finalCounts><right>1</right></finalCounts></suiteResults>"
+)
+
+
+@pytest.mark.asyncio
+async def test_page_history_strips_execution_log_by_default():
+    with _patch_urlopen(body=_HISTORY_XML, content_type="text/xml"):
+        async with Client(my_server.mcp) as c:
+            result = await c.call_tool("fitnesse_get_page_history", {"page_path": "SuiteA"})
+    body = result.data["body"]
+    assert "<testSystem>slim</testSystem>" in body
+    assert "<exitCode>0</exitCode>" in body
+    assert "<finalCounts>" in body
+    for tag in ("command", "stdOut", "stdErr"):
+        assert f"<{tag}>" not in body
+
+
+@pytest.mark.asyncio
+async def test_page_history_include_flags_keep_elements():
+    with _patch_urlopen(body=_HISTORY_XML, content_type="text/xml"):
+        async with Client(my_server.mcp) as c:
+            result = await c.call_tool(
+                "fitnesse_get_page_history",
+                {"page_path": "SuiteA", "include_stdout": True, "include_stderr": True},
+            )
+    body = result.data["body"]
+    assert "<stdOut>lots of output</stdOut>" in body
+    assert "<stdErr>warn</stdErr>" in body
+    assert "<command>" not in body
+
+
+@pytest.mark.asyncio
+async def test_page_history_non_xml_passed_through(monkeypatch):
+    monkeypatch.setattr(my_server, "MAX_BYTES", 5)
+    with _patch_urlopen(body=b"<html>not xml", content_type="text/html"):
+        async with Client(my_server.mcp) as c:
+            result = await c.call_tool("fitnesse_get_page_history", {"page_path": "SuiteA"})
+    assert result.data["body"] == "<html"
+    assert result.data["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_page_history_logs_when_truncated(monkeypatch, caplog):
+    monkeypatch.setattr(my_server, "MAX_BYTES", 20)
+    with _patch_urlopen(body=_HISTORY_XML, content_type="text/xml"):
+        async with Client(my_server.mcp) as c:
+            result = await c.call_tool("fitnesse_get_page_history", {"page_path": "SuiteA"})
+    assert result.data["truncated"] is True
+    assert "FITNESSE_MAX_RESPONSE_BYTES=20" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_read_tool_logs_when_truncated(monkeypatch, caplog):
+    monkeypatch.setattr(my_server, "MAX_BYTES", 4)
+    with _patch_urlopen():
+        async with Client(my_server.mcp) as c:
+            result = await c.call_tool("fitnesse_get_page_data", {"page_path": "FrontPage"})
+    assert result.data["truncated"] is True
+    assert "truncated to FITNESSE_MAX_RESPONSE_BYTES=4" in caplog.text

@@ -3,9 +3,11 @@
 
 import binascii
 import json
+import logging
 import mimetypes
 import os
 import uuid
+import xml.etree.ElementTree as ET
 from base64 import b64decode, b64encode
 from collections.abc import Mapping
 from typing import Annotated, Literal
@@ -21,6 +23,7 @@ from fastmcp.utilities.types import File, Image
 from pydantic import Field
 
 mcp = FastMCP("Fitnesse MCP Server")
+logger = logging.getLogger("fitnesse_mcp")
 
 MAX_BYTES = int(
     os.getenv("FITNESSE_MAX_RESPONSE_BYTES", str(1024 * 1024))
@@ -194,6 +197,12 @@ def _request(
         with request.urlopen(req, timeout=timeout_seconds) as response:
             raw_bytes = response.read(MAX_BYTES + 1)
             truncated = len(raw_bytes) > MAX_BYTES
+            if truncated:
+                logger.warning(
+                    "Response from %s truncated to FITNESSE_MAX_RESPONSE_BYTES=%d",
+                    url,
+                    MAX_BYTES,
+                )
             raw = raw_bytes[:MAX_BYTES].decode("utf-8", errors="replace")
             content_type_header = response.headers.get("Content-Type", "")
             payload: str | dict | list = raw
@@ -262,6 +271,12 @@ def _request_bytes(
         with request.urlopen(req, timeout=timeout_seconds) as response:
             raw_bytes = response.read(MAX_TRANSFER_BYTES + 1)
             truncated = len(raw_bytes) > MAX_TRANSFER_BYTES
+            if truncated:
+                logger.warning(
+                    "Response from %s truncated to FITNESSE_FILES_MAX_TRANSFER_BYTES=%d",
+                    url,
+                    MAX_TRANSFER_BYTES,
+                )
             return {
                 "ok": True,
                 "status": response.status,
@@ -820,13 +835,63 @@ def fitnesse_get_page_data(
 def fitnesse_get_page_history(
     page_path: WikiPath,
     result_date: str | None = None,
+    include_command: bool = False,
+    include_stdout: bool = False,
+    include_stderr: bool = False,
     timeout_seconds: float = _make_timeout(30.0),
 ) -> dict:
-    """Get page history via responder=pageHistory."""
+    """Get page history via responder=pageHistory.
+
+    The executionLog's command, stdOut and stdErr are dropped unless requested;
+    stdOut alone can be megabytes and break MCP clients.
+    """
     params: dict[str, str | None] = {"responder": "pageHistory", "format": "xml"}
     if result_date:
         params["resultDate"] = result_date
-    return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+    result = _request_bytes("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+    if not result["ok"]:
+        return result
+    raw: bytes = result["body"]
+    if result["truncated"]:
+        logger.warning("Page history from %s not filtered: response was truncated", result["url"])
+    else:
+        raw = _strip_execution_log(
+            raw,
+            {
+                tag
+                for tag, keep in (
+                    ("command", include_command),
+                    ("stdOut", include_stdout),
+                    ("stdErr", include_stderr),
+                )
+                if not keep
+            },
+        )
+    if len(raw) > MAX_BYTES:
+        logger.warning(
+            "Page history from %s is %d bytes after filtering, truncated to "
+            "FITNESSE_MAX_RESPONSE_BYTES=%d",
+            result["url"],
+            len(raw),
+            MAX_BYTES,
+        )
+        result["truncated"] = True
+    result["body"] = raw[:MAX_BYTES].decode("utf-8", errors="replace")
+    return result
+
+
+def _strip_execution_log(raw: bytes, tags: set[str]) -> bytes:
+    """Remove the given child elements of every executionLog; non-XML is returned as is."""
+    if not tags:
+        return raw
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return raw
+    for execution_log in root.iter("executionLog"):
+        for child in [c for c in execution_log if c.tag in tags]:
+            execution_log.remove(child)
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
 @mcp.tool(
@@ -1333,6 +1398,12 @@ if os.getenv("FITNESSE_FILES_ROOT"):
                 raise ToolError(f"content_base64 is not valid base64: {exc}") from exc
 
         if len(file_bytes) > MAX_TRANSFER_BYTES:
+            logger.warning(
+                "Upload of %s rejected: %d bytes exceeds FITNESSE_FILES_MAX_TRANSFER_BYTES=%d",
+                filename,
+                len(file_bytes),
+                MAX_TRANSFER_BYTES,
+            )
             return {
                 "ok": False,
                 "error": f"File is {len(file_bytes)} bytes, limit is {MAX_TRANSFER_BYTES}",

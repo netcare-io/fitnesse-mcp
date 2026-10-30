@@ -182,7 +182,7 @@ both set.
 | Tool | Responder | Mode |
 |---|---|---|
 | `fitnesse_get_test_history` | `testHistory` _(needs `FITNESSE_COMPLETE_TOOLSET`)_ | read |
-| `fitnesse_get_page_history` | `pageHistory` | read |
+| `fitnesse_get_page_history` | `pageHistory` _(drops `executionLog` `command`/`stdOut`/`stdErr` unless `include_command`/`include_stdout`/`include_stderr`)_ | read |
 | `fitnesse_compare_history` | `compareHistory` | read |
 | `fitnesse_get_versions` | `versions` | read |
 | `fitnesse_view_version` | `viewVersion` | read |

@@ -4,6 +4,7 @@
 import importlib
 import io
 import json
+import logging
 import os
 from email.message import Message
 from unittest.mock import patch
@@ -341,6 +342,20 @@ async def test_replaced_session_is_forgotten(debug_env):
 async def test_non_json_answer_reported_as_login_problem(debug_env):
     with pytest.raises(ToolError, match="login"):
         await _call("fitnesse_debug_status", {}, (200, b"<html>SSO</html>", "text/html"))
+
+
+@pytest.mark.asyncio
+async def test_json_answer_that_is_no_object_shows_what_arrived(debug_env, caplog):
+    body = b'{"ended": true, "log": ["' + b"x" * 500 + b'", "cut'
+    with caplog.at_level(logging.WARNING), pytest.raises(ToolError) as err:
+        await _call("fitnesse_debug_status", {}, (200, body))
+    message = str(err.value)
+    assert "invalid JSON" in message and f"{len(body)} bytes received" in message
+    assert "'{\"ended\": true" in message and "\", \"cut'" in message  # start and end of the body
+    assert "login" not in message
+    assert body.decode() in caplog.text
+    with pytest.raises(ToolError, match="parsed as list, not an object"):
+        await _call("fitnesse_debug_status", {}, (200, b"[]"))
 
 
 @pytest.mark.asyncio

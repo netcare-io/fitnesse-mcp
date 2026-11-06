@@ -2157,6 +2157,32 @@ _DEBUG_CODE_HINTS = {
 }
 
 
+_BODY_LOG_BYTES = 64 * 1024  # bodies up to this size are logged whole, larger ones as start and end
+_BODY_EXCERPT_CHARS = 200
+
+
+def _not_a_json_object(
+    action: str, status: int, content_type: str, headers, raw_bytes: bytes, text: str, problem: str
+) -> ToolError:
+    """A JSON answer that isn't a JSON object: say what arrived (bytes against Content-Length, start
+    and end) instead of blaming the login, and log the body so the fork team can look at it."""
+    length = headers.get("Content-Length") if headers is not None else None
+    received = f"{len(raw_bytes)} bytes received" + (f" of Content-Length {length}" if length else "")
+    half = _BODY_LOG_BYTES // 2
+    logged = raw_bytes if len(raw_bytes) <= _BODY_LOG_BYTES else raw_bytes[:half] + b"\n[...]\n" + raw_bytes[-half:]
+    logger.warning(
+        "Answer to '%s' (HTTP %s, %s, %s) is not a JSON object (%s). Body:\n%s",
+        action, status, content_type, received, problem, logged.decode("utf-8", errors="replace"),
+    )
+    n = _BODY_EXCERPT_CHARS
+    excerpt = repr(text) if len(text) <= 2 * n else f"{text[:n]!r} … {text[-n:]!r}"
+    return ToolError(
+        f"FitNesse answered '{action}' with HTTP {status} and {content_type}, but not with a JSON "
+        f"object ({problem}; {received}). Body: {excerpt}. The MCP server's log has the body. "
+        "Check fitnesse_debug_status to see whether the call took effect."
+    )
+
+
 def _debug_post(
     responder: str,
     page_path: str,
@@ -2215,10 +2241,16 @@ def _debug_post(
             f"Response to '{action}' exceeds FITNESSE_DEBUG_MAX_RESPONSE_BYTES={DEBUG_MAX_BYTES}."
         )
     content_type = (headers.get("Content-Type", "") if headers is not None else "") or ""
-    try:
-        data = json.loads(raw_bytes.decode("utf-8", errors="replace")) if "json" in content_type else None
-    except json.JSONDecodeError:
-        data = None
+    data = None
+    if "json" in content_type:
+        text = raw_bytes.decode("utf-8", errors="replace")
+        try:
+            data = json.loads(text)
+            problem = f"parsed as {type(data).__name__}, not an object"
+        except json.JSONDecodeError as exc:
+            problem = f"invalid JSON: {exc}"
+        if not isinstance(data, dict):
+            raise _not_a_json_object(action, status, content_type, headers, raw_bytes, text, problem)
     if not isinstance(data, dict):
         raise ToolError(
             f"FitNesse answered '{action}' with HTTP {status} and {content_type or 'no content type'} "

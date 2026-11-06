@@ -590,7 +590,7 @@ async def test_inspect_defined_actions_from_the_json(debug_env):
 @pytest.mark.asyncio
 async def test_changed_definition_says_how_to_reload_it(debug_env):
     await _start()
-    with pytest.raises(ToolError, match=r"older version of \.Lib\.Js: run fitnesse_debug_run_wiki\('\|define actions at\|\.Lib\.Js\|'\).*reload_defined_actions=true.*defined_action_source again"):
+    with pytest.raises(ToolError, match=r"Reload: fitnesse_debug_run_wiki\('\|define actions at\|\.Lib\.Js\|'\), then fitnesse_debug_defined_action_source again"):
         await _call("fitnesse_debug_defined_action_source", {"action": "|greet|bob|"},
                     (409, {"error": "Lib.Js changed; run |define actions at|.Lib.Js|", "code": "changed", "page": "Lib.Js"}))
     # a save conflict has no code: read the source again
@@ -838,6 +838,25 @@ async def test_run_page_setup_only_runs_the_setup_tables(debug_env):
     )
     assert fake.actions == ["pageHtml"]
     assert data["setup_tables"] == [] and "no SetUp" in data["hint"]
+
+
+@pytest.mark.asyncio
+async def test_run_wiki_failing_before_the_setup_hints_at_setup_only(debug_env):
+    await _start()
+    wrong = (200, {"html": "<table><tr><td class=\"error\">greet</td></tr></table>", "counts": {"exceptions": 1}})
+    data, _ = await _call("fitnesse_debug_run_wiki", {"wiki": "|greet|"}, wrong)
+    assert "has not run in this test" in data["hint"] and "setup_only=true" in data["hint"]
+
+    data, _ = await _call("fitnesse_debug_run_wiki", {"wiki": "|ok|"}, (200, {"html": "<table><tr><td class=\"pass\">ok</td></tr></table>", "counts": {"right": 1}}))
+    assert "hint" not in data  # passing tables need no hint
+
+    await _call(
+        "fitnesse_debug_run_page", {"setup_only": True},
+        (200, {"page": "FrontPage.T", "html": TEARDOWN_HTML}),
+        (200, {"html": "<table><tr><td class=\"pass\">setup</td></tr></table>", "counts": {"right": 1}}),
+    )
+    data, _ = await _call("fitnesse_debug_run_wiki", {"wiki": "|greet|"}, wrong)
+    assert "hint" not in data  # SetUp ran: a real failure
 
 
 @pytest.mark.asyncio

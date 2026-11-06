@@ -2096,10 +2096,11 @@ class _DebugState:
     cookie: str | None = None  # only used without Basic Auth
     page_counts: dict[str, dict[str, int]] = field(default_factory=dict)
     setup_ran: str | None = None  # page whose SetUp run_page(setup_only=true) ran in the current test
+    setup_seen: str | None = None  # page whose SetUp ran in the current test, by setup_only or a full run
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def reset(self) -> None:
-        self.session = self.page = self.current_page = self.setup_ran = None
+        self.session = self.page = self.current_page = self.setup_ran = self.setup_seen = None
         self.suite = False
         self.log_next = 0
         self.page_counts = {}
@@ -2241,9 +2242,8 @@ def _debug_post(
         elif code == "changed" and action == "definedAction":
             page = str(data.get("page") or "").lstrip(".") or "<page>"
             hint = (
-                f"The session loaded an older version of .{page}: run fitnesse_debug_run_wiki("
-                f"'|define actions at|.{page}|') (or repeat the edit of .{page} with "
-                "reload_defined_actions=true), then call fitnesse_debug_defined_action_source again."
+                f"Reload: fitnesse_debug_run_wiki('|define actions at|.{page}|'), then "
+                "fitnesse_debug_defined_action_source again."
             )
         elif code in _DEBUG_CODE_HINTS:
             hint = _DEBUG_CODE_HINTS[code]
@@ -2640,6 +2640,20 @@ def _document_result(
     return result
 
 
+def _with_setup_hint(state: _DebugState, result: dict) -> dict:
+    """run_wiki before the SetUp: a failure there is often a defined action, browser or fixture
+    the SetUp would have provided."""
+    counts = result.get("counts") or {}
+    if state.setup_seen == state.current_page or not (counts.get("wrong") or counts.get("exceptions")):
+        return result
+    page = state.current_page or state.page
+    return {**result, "hint": (
+        f"The SetUp of {page} has not run in this test, so defined actions, the browser and "
+        "fixtures it provides may be missing: run fitnesse_debug_run_page(setup_only=true), then "
+        "these tables again."
+    )}
+
+
 def _next_page(state: _DebugState, page: str | None, timeout_seconds: float | None) -> dict:
     previous = state.current_page
     data = _session_action(state, "nextPage", {"page": page}, timeout_seconds=timeout_seconds)
@@ -2647,7 +2661,7 @@ def _next_page(state: _DebugState, page: str | None, timeout_seconds: float | No
     teardown["teardown_of"] = teardown.pop("page")
     state.current_page = data.get("page") or page or previous
     state.page_counts.pop(state.current_page, None)
-    state.setup_ran = None  # a new test begins: its SetUp has not run
+    state.setup_ran = state.setup_seen = None  # a new test begins: its SetUp has not run
     return teardown
 
 
@@ -3244,11 +3258,11 @@ if DEBUG_TOOLSET:
         with _document(state):
             return _with_images(_run_document(
                 state, None, restart, timeout_seconds,
-                lambda: _document_result(
+                lambda: _with_setup_hint(state, _document_result(
                     state,
                     _session_action(state, "runWiki", {"wiki": wiki}, timeout_seconds=timeout_seconds),
                     state.current_page, include_html,
-                ),
+                )),
             ))
 
     @mcp.tool(
@@ -3349,6 +3363,8 @@ if DEBUG_TOOLSET:
             data = _session_action(state, "runTable", {"html": html}, timeout_seconds=timeout_seconds)
             if setup_only:
                 state.setup_ran = page
+            if setup_only or tables is None:
+                state.setup_seen = page
             result = _document_result(state, data, page, include_html, only_failures)
             if skipped:
                 result["skipped_setup"] = skipped
@@ -3526,13 +3542,11 @@ if DEBUG_TOOLSET:
 
     # debugTable saves wiki pages for real: tagged write, so they need FITNESSE_TOOLSETS=write.
     _TABLE_EDIT = (
-        " This saves the wiki page for real (it shows up in recent changes): change only pages you "
-        "are asked to change. Read fitnesse_table_source first and pass the current wiki of exactly "
-        "the table or text you change as original (tables[index] or texts[index], not the whole "
-        "list); if the page has changed since, the call fails: read fitnesse_table_source again and "
-        "redo the change. The result's source (tables, texts, page; as fitnesse_table_source) is "
-        "the page after the change: take the next edit's original and indices from it, as indices "
-        "shift. A running debug session sees the change when the page's tables are run again."
+        " Saves the page for real (recent changes): change only pages you are asked to change. "
+        "original is tables[index] or texts[index] from fitnesse_table_source, unchanged; if the "
+        "page has changed since, this fails: read it again and redo the change. The result's source "
+        "is the page after the change: take the next original and indices from it. A running debug "
+        "session sees the change when the tables run again."
     )
     type TableIndex = Annotated[int, Field(description="Index among the page's own tables, as in fitnesse_table_source.", ge=0)]
 

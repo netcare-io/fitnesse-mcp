@@ -21,9 +21,11 @@ from urllib.error import HTTPError, URLError
 from fastmcp import FastMCP
 from fastmcp.dependencies import Depends
 from fastmcp.exceptions import ToolError
+from fastmcp.server.dependencies import get_http_headers
 from fastmcp.server.transforms import Visibility
 from fastmcp.tools import ToolResult
 from fastmcp.utilities.types import File, Image
+from mcp.types import TextContent
 from pydantic import Field
 
 mcp = FastMCP("Fitnesse MCP Server")
@@ -119,6 +121,24 @@ FITNESSE_TOOLSETS = _toolsets_from_env()
 # Extra low-traffic/read-heavy tools trimmed from the default set; opt in with FITNESSE_TOOLSETS=...,complete.
 COMPLETE_TOOLSET = "complete" in FITNESSE_TOOLSETS
 
+# Whose FitNesse account a call uses. env: FITNESSE_USERNAME/FITNESSE_PASSWORD for every caller.
+# headers: each HTTP request brings its own (HEADER_USERNAME/HEADER_PASSWORD); the env pair is
+# ignored, so a shared server never falls back to its own account.
+type AuthMode = Literal["env", "headers"]
+AUTH_MODES: tuple[str, ...] = get_args(AuthMode.__value__)
+HEADER_USERNAME = "X-FitNesse-Username"
+HEADER_PASSWORD = "X-FitNesse-Password"
+
+
+def _auth_mode_from_env() -> str:
+    raw = os.getenv("FITNESSE_AUTH_MODE", "").strip().lower() or "env"
+    if raw not in AUTH_MODES:
+        raise RuntimeError(f"FITNESSE_AUTH_MODE={raw!r}: expected one of {', '.join(AUTH_MODES)}.")
+    return raw
+
+
+FITNESSE_AUTH_MODE = _auth_mode_from_env()
+
 
 def _make_timeout(default: float):
     def factory() -> float:
@@ -132,6 +152,36 @@ def _make_run_timeout():
         return RUN_TIMEOUT_SECONDS
 
     return Depends(factory)
+
+
+def _credentials() -> tuple[str | None, str | None]:
+    """FitNesse username and password for the current call (see FITNESSE_AUTH_MODE)."""
+    if FITNESSE_AUTH_MODE == "env":
+        return os.getenv("FITNESSE_USERNAME"), os.getenv("FITNESSE_PASSWORD")
+    headers = get_http_headers()  # lower-case names; {} outside an HTTP request
+    username = headers.get(HEADER_USERNAME.lower())
+    password = headers.get(HEADER_PASSWORD.lower())
+    if not username or not password:
+        raise ToolError(
+            f"FITNESSE_AUTH_MODE=headers: send your FitNesse login in the {HEADER_USERNAME} and "
+            f"{HEADER_PASSWORD} headers of every request (HTTP transport only)."
+        )
+    return username, password
+
+
+HEADER_BASE_URL = "X-FitNesse-Url"
+
+
+def _base_url() -> str:
+    """FitNesse instance for the current call: the X-FitNesse-Url header (HTTP transport), else
+    FITNESSE_BASE_URL. Any http(s) URL is accepted; see the README on what that allows callers."""
+    url = (get_http_headers().get(HEADER_BASE_URL.lower()) or "").strip()
+    if not url:
+        return os.getenv("FITNESSE_BASE_URL", "http://localhost:8080")
+    parts = parse.urlsplit(url)
+    if parts.scheme not in {"http", "https"} or not parts.netloc or parts.query or parts.fragment:
+        raise ToolError(f"{HEADER_BASE_URL} must be an http(s) URL of a FitNesse, e.g. https://fitnesse.example.com")
+    return url.rstrip("/")
 
 
 def _apply_basic_auth(
@@ -231,11 +281,9 @@ def _request(
     base_url: str | None = None,
 ) -> dict:
     if base_url is None:
-        base_url = os.getenv("FITNESSE_BASE_URL", "http://localhost:8080")
-    if username is None:
-        username = os.getenv("FITNESSE_USERNAME")
-    if password is None:
-        password = os.getenv("FITNESSE_PASSWORD")
+        base_url = _base_url()
+    if username is None and password is None:
+        username, password = _credentials()
     url = _build_url(base_url=base_url, path=path, params=params)
     data = body.encode() if isinstance(body, str) else body
     req = request.Request(url=url, data=data, method=method.upper())
@@ -309,11 +357,9 @@ def _request_bytes(
 ) -> dict:
     """Like _request, but returns the raw response body bytes undecoded."""
     if base_url is None:
-        base_url = os.getenv("FITNESSE_BASE_URL", "http://localhost:8080")
-    if username is None:
-        username = os.getenv("FITNESSE_USERNAME")
-    if password is None:
-        password = os.getenv("FITNESSE_PASSWORD")
+        base_url = _base_url()
+    if username is None and password is None:
+        username, password = _credentials()
     url = _build_url(base_url=base_url, path=path, params=params)
     req = request.Request(url=url, method=method.upper())
     _apply_basic_auth(req=req, username=username, password=password)
@@ -1971,8 +2017,8 @@ if _env_flag("FITNESSE_ALLOW_ACCOUNT_ADMIN"):
     @mcp.tool(
         name="fitnesse_save_account",
         description=(
-            "Changes FitNesse accounts (responder=saveAccount), as the account FITNESSE_USERNAME "
-            "logs in with. action='change_password': new password for that account "
+            "Changes FitNesse accounts (responder=saveAccount), as the account this server logs "
+            "in with. action='change_password': new password for that account "
             "(current_password, new_password). 'create_user' and 'delete_user' need the admin "
             "user: user_name, plus user_password for create_user. Only on explicit request."
         ),
@@ -2049,10 +2095,11 @@ class _DebugState:
     log_next: int = 0
     cookie: str | None = None  # only used without Basic Auth
     page_counts: dict[str, dict[str, int]] = field(default_factory=dict)
+    setup_ran: str | None = None  # page whose SetUp run_page(setup_only=true) ran in the current test
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def reset(self) -> None:
-        self.session = self.page = self.current_page = None
+        self.session = self.page = self.current_page = self.setup_ran = None
         self.suite = False
         self.log_next = 0
         self.page_counts = {}
@@ -2064,8 +2111,8 @@ _DEBUG_STATES_LOCK = threading.Lock()
 
 def _debug_state() -> _DebugState:
     key = (
-        os.getenv("FITNESSE_BASE_URL", "http://localhost:8080").rstrip("/"),
-        os.getenv("FITNESSE_USERNAME") or "",
+        _base_url().rstrip("/"),
+        _credentials()[0] or "",
     )
     with _DEBUG_STATES_LOCK:
         return _DEBUG_STATES.setdefault(key, _DebugState())
@@ -2088,9 +2135,24 @@ _DEBUG_HINTS = {
     403: "No permission for this page.",
     404: "The page does not exist.",
     423: "The test process is still working on a document that timed out. Poll fitnesse_debug_status until busy is false, or call fitnesse_debug_end with abort=true.",
-    429: "Too many debug sessions on this FitNesse (debugTest.maxSessions). Try again later.",
+    429: "Too many debug sessions on this FitNesse (debugTest.maxSessions). Try again later.",  # forks before mod #159
     500: "If the session crashed, read the log via fitnesse_debug_status and start a new session.",
     504: "The document did not finish within debugTest.timeoutMinutes; the process keeps working on it. Poll fitnesse_debug_status (shows the log) until busy is false, or call fitnesse_debug_end with abort=true.",
+}
+
+
+_DEBUG_CODE_HINTS = {
+    "notLoaded": "The call runs no defined action in this session: check its keywords and number of "
+                 "arguments with fitnesse_debug_inspect(kind='definedActions'), or load its page with "
+                 "|define actions at|.",
+    "unknownPlace": "It was defined by a |define action| table, not on a page of defined actions: "
+                    "edit that table where it is (fitnesse_table_source of its page).",
+    "sessionRequired": "Several debug sessions of this account are running and this server knows none of "
+                       "them: fitnesse_debug_status lists them in 'sessions'; continue one with "
+                       "fitnesse_debug_status(adopt=true, session=...) or start one with fitnesse_debug_start.",
+    "tooManySessions": "Too many debug sessions (debugTest.maxSessionsPerUser per account, debugTest.maxSessions "
+                       "on the server). End the ones no longer needed: fitnesse_debug_status lists this "
+                       "account's in 'sessions'.",
 }
 
 
@@ -2107,9 +2169,8 @@ def _debug_post(
     Raises ToolError for transport errors, non-JSON answers (login problems)
     and HTTP errors; 409 noSession/replaced also forget the session.
     """
-    base_url = os.getenv("FITNESSE_BASE_URL", "http://localhost:8080")
-    username = os.getenv("FITNESSE_USERNAME")
-    password = os.getenv("FITNESSE_PASSWORD")
+    base_url = _base_url()
+    username, password = _credentials()
     url = _build_url(base_url, page_path, {"responder": responder})
     fields: dict[str, str] = {"action": action}
     for key, value in (form or {}).items():
@@ -2161,7 +2222,7 @@ def _debug_post(
         raise ToolError(
             f"FitNesse answered '{action}' with HTTP {status} and {content_type or 'no content type'} "
             "instead of JSON. Most likely the login is missing, expired or wrong (set "
-            "FITNESSE_USERNAME/FITNESSE_PASSWORD; Basic Auth bypasses the SSO), or this FitNesse "
+            "FITNESSE_USERNAME/FITNESSE_PASSWORD or the X-FitNesse-* headers; Basic Auth bypasses the SSO), or this FitNesse "
             f"has no {responder} responder."
         )
     if status >= 400:
@@ -2171,11 +2232,21 @@ def _debug_post(
         if status == 409 and code in {"noSession", "replaced"} and state is not None:
             state.reset()
             hint = (
-                "The debug session was replaced, e.g. from a browser with the same account. "
-                "This MCP server forgot it; start a new one with fitnesse_debug_start."
+                "The debug session was replaced by a new one (on the same page; on older forks anywhere), "
+                "e.g. from a browser with the same account. This MCP server forgot it; start a new one "
+                "with fitnesse_debug_start."
                 if code == "replaced"
                 else "No debug session is running; start one with fitnesse_debug_start."
             )
+        elif code == "changed" and action == "definedAction":
+            page = str(data.get("page") or "").lstrip(".") or "<page>"
+            hint = (
+                f"The session loaded an older version of .{page}: run fitnesse_debug_run_wiki("
+                f"'|define actions at|.{page}|') (or repeat the edit of .{page} with "
+                "reload_defined_actions=true), then call fitnesse_debug_defined_action_source again."
+            )
+        elif code in _DEBUG_CODE_HINTS:
+            hint = _DEBUG_CODE_HINTS[code]
         elif status == 409 and responder == "debugTable":
             hint = "The page changed since 'original' was read. Read fitnesse_table_source again and retry."
         detail = f" ({code})" if code else ""
@@ -2188,11 +2259,19 @@ def _debug_post(
 _CELL_STATES = ("pass", "fail", "error", "ignore")
 
 
+_FOLDING_CLASSES = {"collapsible", "included"}  # FitNesse's collapsible sections, FitLibrary's included/"show after"
+_FOLDING_TITLE = {("p", "title"), ("span", "meta")}
+_DATA_IMAGE = re.compile(r"data:image/([\w.+-]+);base64,(.*)", re.S)
+DEBUG_MAX_IMAGES = 4  # inline screenshots attached per tool result
+
+
 class _TableParser(HTMLParser):
     """Collect the top-level <table> elements of an HTML document.
 
-    Per table: its source span [start, end) and its rows of cells, each cell
-    with its text (nested tables flattened into it) and FitLibrary status.
+    Per table: its source span [start, end), its rows of cells, each cell with its text (nested
+    tables flattened into it) and FitLibrary status, the images and links inside it, and the
+    folding areas that follow it outside any table (e.g. FitLibrary's "show after", logs).
+    Images become "[image N]" in the text; N counts the document's images from 1.
     """
 
     def __init__(self, source: str):
@@ -2203,9 +2282,15 @@ class _TableParser(HTMLParser):
             if ch == "\n":
                 self._line_starts.append(i + 1)
         self.tables: list[dict] = []
+        self.leading: dict = {"media": [], "after": []}  # before the first table
+        self.images: list[dict] = []
         self._depth = 0
         self._cell: dict | None = None
         self._skip = 0  # inside <script>/<style>
+        self._fold: dict | None = None  # open folding area outside tables
+        self._link: dict | None = None
+        self._divs: list[dict] = []  # open <div>s outside tables; includes carry their page
+        self._title = False  # inside a collapsible's <p class="title">
         self.feed(source)
         self.close()
 
@@ -2213,17 +2298,58 @@ class _TableParser(HTMLParser):
         line, col = self.getpos()
         return self._line_starts[line - 1] + col
 
+    def _owner(self) -> dict:
+        return self.tables[-1] if self.tables else self.leading
+
     def _text(self, text: str) -> None:
+        if self._link is not None:
+            self._link["parts"].append(text)
         if self._cell is not None:
             self._cell["parts"].append(text)
+        elif self._fold is not None and self._depth == 0:
+            self._fold["title" if self._fold["title_tag"] else "parts"].append(text)
+
+    def _where(self) -> dict:
+        """Row and column (1-based) of the cell being read, if any."""
+        if self._cell is None:
+            return {}
+        row = self.tables[-1]["rows"][-1]
+        return {"row": len(self.tables[-1]["rows"]), "column": len(row)}
+
+    def _media(self, tag: str, attrs: dict) -> None:
+        if tag == "img":
+            src = attrs.get("src") or ""
+            if not src or "/files/images/collapsable" in src or "/files/fitnesse/images/" in src:
+                return
+            image = {"n": len(self.images) + 1, "src": src, "alt": attrs.get("alt") or "", **self._where()}
+            self.images.append(image)
+            self._owner()["media"].append(image)
+            self._text(f" [image {image['n']}] ")
+        elif tag == "a":
+            href = attrs.get("href") or ""
+            if href and not href.startswith(("javascript:", "#")):
+                self._link = {"href": href, "parts": [], **self._where()}
+                self._owner()["media"].append(self._link)
 
     def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        classes = set((attrs.get("class") or "").split())
         if tag in {"script", "style"}:
             self._skip += 1
+        elif tag in {"img", "a"}:
+            if tag == "a" and self._title and "edit" in classes and self._divs and self._divs[-1]["collapsible"]:
+                # an included page's title links to its edit page: /Path?edit...
+                self._divs[-1]["include"] = (attrs.get("href") or "").split("?")[0].strip("/") or None
+            self._media(tag, attrs)
         elif tag == "table":
             self._depth += 1
             if self._depth == 1:
-                self.tables.append({"start": self._offset(), "end": None, "rows": []})
+                include = next((d["include"] for d in reversed(self._divs) if d["include"]), None)
+                outer = next((d["include"] for d in self._divs if d["include"]), None)
+                self.tables.append({"start": self._offset(), "end": None, "rows": [], "media": [], "after": [],
+                                    "include": include, "outer_include": outer})
+                if self._fold is not None:
+                    self._fold["tables"] = True  # an included page, not a folding area after a table
             else:
                 self._text("\n")
         elif tag == "tr":
@@ -2233,22 +2359,37 @@ class _TableParser(HTMLParser):
                 self._text("\n")
         elif tag in {"td", "th"}:
             if self._depth == 1 and self.tables and self.tables[-1]["rows"]:
-                classes = (dict(attrs).get("class") or "").split()
                 status = next((c for c in classes if c in _CELL_STATES), None)
                 self._cell = {"parts": [], "status": status}
                 self.tables[-1]["rows"][-1].append(self._cell)
             else:
                 self._text(" | ")
+        elif tag == "div" and self._depth == 0:
+            self._divs.append({"collapsible": "collapsible" in classes, "include": None})
+            if self._fold is not None:
+                self._fold["divs"] += 1
+                self._text("\n")
+            elif classes & _FOLDING_CLASSES:
+                self._fold = {"divs": 1, "title": [], "parts": [], "title_tag": None, "owner": self._owner()}
         elif tag in {"br", "p", "div", "li", "pre"}:
             self._text("\n")
+        if tag == "p" and self._depth == 0 and "title" in classes:
+            self._title = True
+        if self._fold is not None and self._depth == 0 and any((tag, c) in _FOLDING_TITLE for c in classes):
+            self._fold["title_tag"] = tag
 
     def handle_startendtag(self, tag, attrs):
-        if tag == "br":
+        if tag in {"img", "a"}:
+            self._media(tag, dict(attrs))
+            self._link = None
+        elif tag == "br":
             self._text("\n")
 
     def handle_endtag(self, tag):
         if tag in {"script", "style"}:
             self._skip = max(0, self._skip - 1)
+        elif tag == "a":
+            self._link = None
         elif tag == "table" and self._depth:
             self._depth -= 1
             if self._depth == 0:
@@ -2259,6 +2400,21 @@ class _TableParser(HTMLParser):
                 self._text("\n")
         elif tag in {"td", "th"} and self._depth == 1:
             self._cell = None
+        if tag == "p" and self._depth == 0:
+            self._title = False
+        if tag == "div" and self._depth == 0 and self._divs:
+            self._divs.pop()
+        if tag in {"script", "style", "a", "table", "td", "th"}:
+            pass
+        elif self._fold is not None and self._depth == 0:
+            if tag == self._fold["title_tag"]:
+                self._fold["title_tag"] = None
+            elif tag == "div":
+                self._fold["divs"] -= 1
+                if self._fold["divs"] == 0:
+                    fold, self._fold = self._fold, None
+                    if not fold.get("tables"):
+                        fold["owner"]["after"].append({"title": "".join(fold["title"]), "text": "".join(fold["parts"])})
 
     def handle_data(self, data):
         if not self._skip:
@@ -2266,15 +2422,24 @@ class _TableParser(HTMLParser):
 
 
 def _parse_tables(html: str) -> list[dict]:
-    tables = _TableParser(html or "").tables
-    for table in tables:
+    return _parse_document(html)["tables"]
+
+
+def _parse_document(html: str) -> dict:
+    """Tables (see _TableParser), what comes before the first one, and all images in order."""
+    parser = _TableParser(html or "")
+    for table in parser.tables:
         if table["end"] is None:  # unclosed
             table["end"] = len(html)
         table["rows"] = [
             [{"text": "".join(c["parts"]), "status": c["status"]} for c in row]
             for row in table["rows"]
         ]
-    return tables
+    for owner in (parser.leading, *parser.tables):
+        for item in owner["media"]:
+            if "parts" in item:  # link
+                item["text"] = " ".join("".join(item.pop("parts")).split())
+    return {"tables": parser.tables, "leading": parser.leading, "images": parser.images}
 
 
 def _squash(text: str, limit: int | None = None) -> str:
@@ -2286,13 +2451,44 @@ def _squash(text: str, limit: int | None = None) -> str:
     return text
 
 
-def _tables_text(html: str) -> str:
+def _extras_lines(owner: dict, label: str) -> list[str]:
+    """Folding areas, links and non-inline images of a table (or of the text before the first)."""
+    lines = []
+    for fold in owner["after"]:
+        text = _squash(fold["text"])
+        if text:
+            title = _squash(fold["title"], 200)
+            lines.append(f"{label} – after{': ' + title if title else ''}:")
+            lines.extend(f"  {line}" for line in text.splitlines())
+    for item in owner["media"]:
+        where = f" in row {item['row']}, column {item['column']}" if "row" in item else ""
+        if "href" in item:
+            lines.append(f"{label} – link{where}: {item['text'] or item['href']} -> {item['href']}")
+        elif not _DATA_IMAGE.match(item["src"]):
+            alt = f" ({item['alt']})" if item["alt"] else ""
+            lines.append(f"{label} – image {item['n']}{where}: {item['src']}{alt}")
+    return lines
+
+
+def _failed(table: dict) -> bool:
+    return any(cell["status"] in ("fail", "error") for row in table["rows"] for cell in row)
+
+
+def _tables_text(html: str, document: dict | None = None, only_failures: bool = False) -> str:
     """Condense annotated FitLibrary HTML into one text block per table.
 
-    Cells carry their status as a prefix: [pass], [fail], [error], [ignore].
+    Cells carry their status as a prefix: [pass], [fail], [error], [ignore]. Folding areas,
+    links and images follow the table they belong to. only_failures keeps just the tables with
+    a [fail] or [error] cell, under their usual numbers.
     """
+    document = document or _parse_document(html)
     blocks = []
-    for i, table in enumerate(_parse_tables(html)):
+    leading = [] if only_failures else _extras_lines(document["leading"], "Before the first table")
+    if leading:
+        blocks.append("\n".join(leading))
+    for i, table in enumerate(document["tables"]):
+        if only_failures and not _failed(table):
+            continue
         lines = [f"Table {i}:"]
         for row in table["rows"]:
             cells = []
@@ -2300,8 +2496,53 @@ def _tables_text(html: str) -> str:
                 text = _squash(cell["text"]).replace("\n", " ⏎ ")
                 cells.append(f"[{cell['status']}] {text}" if cell["status"] else text)
             lines.append("| " + " | ".join(cells) + " |")
+        lines.extend(_extras_lines(table, f"Table {i}"))
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
+
+
+def _inline_images(document: dict) -> list[dict]:
+    """The document's data: images, decoded: n, format, data (None if not decodable)."""
+    images = []
+    for image in document["images"]:
+        match = _DATA_IMAGE.match(image["src"])
+        if not match:
+            continue
+        try:
+            data = b64decode("".join(match.group(2).split()), validate=True) or None
+        except (binascii.Error, ValueError):
+            data = None
+        images.append({"n": image["n"], "format": match.group(1), "data": data})
+    return images
+
+
+def _with_images(result: dict) -> dict | ToolResult:
+    """Attach the inline images of result (and its tear-down parts) as MCP image content.
+
+    Each document part lists its images in "images" with the content index they got, or why not.
+    """
+    attached: list[Image] = []
+    for part in (result.get("previous_page_teardown"), result.get("teardown"), result):
+        if not isinstance(part, dict):
+            continue
+        listed = []
+        for image in part.pop("_images", []):
+            entry = {"image": image["n"], "format": image["format"]}
+            if image["data"] is None:
+                entry["omitted"] = "invalid base64"
+            elif len(attached) >= DEBUG_MAX_IMAGES:
+                entry["omitted"] = f"more than {DEBUG_MAX_IMAGES} images in this result; use include_html"
+            else:
+                attached.append(Image(data=image["data"], format=image["format"]))
+                entry["content"] = len(attached)  # 1-based, after the text block
+            listed.append(entry)
+        if listed:
+            part["images"] = listed
+    if not attached:
+        return result
+    content = [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+    content.extend(image.to_image_content() for image in attached)
+    return ToolResult(content=content, structured_content=result)
 
 
 def _query_rows(html: str) -> list[list[str]]:
@@ -2376,14 +2617,24 @@ def _add_counts(state: _DebugState, page: str | None, counts: Mapping | None) ->
     return dict(totals)
 
 
-def _document_result(state: _DebugState, data: dict, page: str | None, include_html: bool) -> dict:
+def _document_result(
+    state: _DebugState, data: dict, page: str | None, include_html: bool, only_failures: bool = False
+) -> dict:
     html = data.get("html") or ""
+    document = _parse_document(html)
     result = {
         "page": page,
         "counts": data.get("counts"),
         "page_totals": _add_counts(state, page, data.get("counts")),
-        "tables": _tables_text(html),
+        "tables": _tables_text(html, document, only_failures),
     }
+    if only_failures:
+        passed = sum(1 for t in document["tables"] if not _failed(t))
+        if passed:
+            result["tables_without_failures"] = passed
+    images = _inline_images(document)
+    if images:
+        result["_images"] = images  # attached by _with_images
     if include_html:
         result["html"] = html
     return result
@@ -2396,7 +2647,70 @@ def _next_page(state: _DebugState, page: str | None, timeout_seconds: float | No
     teardown["teardown_of"] = teardown.pop("page")
     state.current_page = data.get("page") or page or previous
     state.page_counts.pop(state.current_page, None)
+    state.setup_ran = None  # a new test begins: its SetUp has not run
     return teardown
+
+
+def _sessions(status: dict) -> list[dict] | None:
+    """The account's running sessions from status (mod #159), pages without leading dot; None on
+    older forks, which allow one session per account."""
+    sessions = status.get("sessions")
+    if not isinstance(sessions, list):
+        return None
+    return [{**s, "session": str(s.get("session")), "page": str(s.get("page") or "").lstrip(".")}
+            for s in sessions if isinstance(s, dict)]
+
+
+def _session_list(sessions: list[dict]) -> str:
+    return ", ".join(f"{s['session']} on {s['page']}" for s in sessions)
+
+
+def _check_start(page_path: str, sessions: list[dict], state: _DebugState, replace: bool) -> None:
+    """Refuse a start that would replace a session on this page, or leave this server's own running."""
+    page = page_path.strip().lstrip(".")
+    here = next((s for s in sessions if s["page"] == page), None)
+    own = next((s for s in sessions if state.session and s["session"] == state.session), None)
+    if own is not None and own is not here:
+        raise ToolError(
+            f"This MCP server's debug session {own['session']} is still running on {own['page']}. "
+            "End it with fitnesse_debug_end first (this server works with one session at a time), "
+            "or continue it."
+        )
+    if here is not None and here is own and not replace:
+        raise ToolError(
+            f"This MCP server's debug session is already running on {page}: keep using it "
+            "(fitnesse_debug_run_page / _run_wiki, restart=true for a fresh test), or end it with "
+            "fitnesse_debug_end."
+        )
+    if here is not None and not replace:
+        raise ToolError(
+            f"A debug session started by someone using the same account (maybe in a browser) is "
+            f"already running on {page} (session "
+            f"{here['session']}, started {here.get('startedAt')}). Continue it with "
+            f"fitnesse_debug_status(adopt=true, session='{here['session']}'), end it, or pass "
+            "replace=true to kill it without tear down (its browser tab then shows 'replaced'). Sessions "
+            "on other pages are not affected."
+        )
+
+
+def _session_to_adopt(status: dict, sessions: list[dict] | None, wanted: str | None) -> dict | None:
+    """The session status(adopt=true) takes over: the one named, else the one status describes."""
+    if wanted:
+        if str(status.get("session")) == wanted and status.get("running"):
+            return status
+        found = next((s for s in sessions or [] if s["session"] == wanted), None)
+        if found is None:
+            running = _session_list(sessions) if sessions else "none"
+            raise ToolError(f"No running debug session {wanted} of this account (running: {running}).")
+        return found
+    if status.get("running"):
+        return status
+    if sessions:
+        raise ToolError(
+            f"Several debug sessions of this account are running, none on this page: "
+            f"{_session_list(sessions)}. Pass session=<id> (or page_path) to choose one."
+        )
+    return None
 
 
 def _status(
@@ -2408,6 +2722,18 @@ def _status(
 
 def _split_tables(html: str) -> list[str]:
     return [html[t["start"]:t["end"]] for t in _parse_tables(html)]
+
+
+_SETUP_PAGES = {"SetUp", "SuiteSetUp"}  # the only pages FitNesse includes as set up
+
+
+def _setup_indices(tables: list[dict]) -> list[int]:
+    """The SetUp's tables: those whose outermost include is a SetUp/SuiteSetUp page, including the
+    pages that SetUp includes itself. A plain !include at the top of a page is not part of it."""
+    return [
+        i for i, table in enumerate(tables)
+        if (table.get("outer_include") or "").rsplit(".", 1)[-1] in _SETUP_PAGES
+    ]
 
 
 def _page_html(state: _DebugState, page: str, timeout_seconds: float | None) -> str:
@@ -2445,11 +2771,273 @@ def _keywords(html: str, filter: str | None, limit: int) -> dict:
         needle = filter.lower()
         hits = [e for e in found if needle in json.dumps(e, ensure_ascii=False).lower()]
         return {"matches": len(hits), "keywords": hits[:limit]}
-    categories: dict[str, list[str]] = {}
+    categories: dict[str, int] = {}
     for entry in found:
         label = entry["category"] + (" (special)" if entry["special"] else "")
-        categories.setdefault(label, []).append(entry.get("syntax"))
-    return {"count": len(found), "categories": categories}
+        categories[label] = categories.get(label, 0) + 1
+    return {
+        "count": len(found),
+        "categories": categories,
+        "hint": "Number of keywords per category. Pass filter (a word such as 'click' or a category "
+                "such as 'Web / Browser') to get the matching keywords with syntax and parameters.",
+    }
+
+
+# ---- Defined actions --------------------------------------------------------
+# The session's keywords answer (action=keywords, not keywordsJson) lists the plain-text defined
+# actions that |define actions at| loaded into FitLibrary's repository, one row each:
+# defined | wiki | tooltip | author | defining page | overridden pages.
+
+_NO_DEFINED_ACTIONS = (
+    "No defined actions loaded in this session. They are loaded by |define actions at|.Page| "
+    "tables, usually in SetUp: find them with fitnesse_debug_page_tables and run them with "
+    "fitnesse_debug_run_page(tables=[...])."
+)
+_MARKUP = re.compile(r"</?\w+>|'{2,3}")
+_SEPARATOR = re.compile(r"(?m)^\s*-{4,}\s*$")
+
+
+def _plain(text: str) -> str:
+    return " ".join(_MARKUP.sub("", text).split())
+
+
+def _wiki_cells(wiki: str) -> list[str]:
+    """Cells of the first row of a wiki table, markup kept."""
+    row = next((line.strip() for line in wiki.splitlines() if line.strip().startswith("|")), "")
+    return [c.strip() for c in row.strip().strip("|").split("|")] if row else []
+
+
+def _defined_actions(html: str) -> list[dict]:
+    actions = []
+    for row in _query_rows(html):
+        if not row or row[0] != "defined":
+            continue
+        wiki, note, author, page, overrides = (row[1:] + [""] * 5)[:5]
+        cells = _wiki_cells(wiki)
+        actions.append({
+            "action": "|" + "|".join(_plain(c) for c in cells) + "|",
+            "keywords": [_plain(c) for c in cells if "''" in c],
+            "parameters": [_plain(c) for c in cells if "''" not in c],
+            "note": note,
+            "deprecated": "deprecated" in note.lower(),
+            "author": author,
+            "page": page.lstrip("."),
+            "overrides": [p.strip().lstrip(".") for p in overrides.split(",") if p.strip()],
+        })
+    return actions
+
+
+def _json_defined_action(entry: dict) -> dict:
+    """An entry of debugTest action=definedActions: action is runnable wiki (|greet|name|), so
+    keywords and parameters alternate as FitLibrary reads a row."""
+    action = _call_row(str(entry.get("action") or ""))
+    cells = _wiki_cells(action)
+    return {
+        "action": action,
+        "keywords": cells[::2],
+        "parameters": cells[1::2],
+        "note": str(entry.get("note") or ""),
+        "deprecated": bool(entry.get("deprecated")),
+        "author": str(entry.get("author") or ""),
+        "page": str(entry.get("page") or "").lstrip("."),
+        "overrides": [str(p).strip().lstrip(".") for p in entry.get("overrides") or [] if str(p).strip()],
+    }
+
+
+def _session_defined_actions(state: _DebugState, timeout_seconds: float | None) -> list[dict]:
+    """The session's defined actions: debugTest action=definedActions where the fork has it, else
+    parsed from the keywords HTML."""
+    with _document(state):
+        try:
+            data = _session_action(state, "definedActions", timeout_seconds=timeout_seconds)
+        except ToolError as exc:
+            if not _unknown_action(exc):
+                raise
+        else:
+            return [_json_defined_action(a) for a in data.get("definedActions") or [] if isinstance(a, dict)]
+        data = _session_action(state, "keywords", timeout_seconds=timeout_seconds)
+    return _defined_actions(data.get("html") or "")
+
+
+def _short_action(action: dict) -> dict:
+    """What a reload reports per defined action: the call, plus note/author/deprecated if set."""
+    return {"action": action["action"], **{k: action[k] for k in ("note", "author", "deprecated") if action.get(k)}}
+
+
+def _matches_action(text: str, needle: str | None) -> bool:
+    return not needle or needle.lower() in text.lower()
+
+
+def _definition_block(source: Mapping, action: dict) -> dict:
+    """The block of a page that defines action, found as FitLibrary reads the page.
+
+    The header is a table whose first row's keyword cells (every other cell, starting with the
+    first) match the action's keywords, and that is the page's first table or comes right after
+    a ---- line. The block runs to the table before the next ----, with the text in between.
+    """
+    tables = list(source.get("tables") or [])
+    texts = list(source.get("texts") or [])
+    wanted = [k.lower() for k in action["keywords"]]
+    starts = [
+        i for i, table in enumerate(tables)
+        if (i == 0 or _SEPARATOR.search(texts[i] if i < len(texts) else ""))
+        and [_plain(c).lower() for c in _wiki_cells(table)[::2]] == wanted
+    ]
+    if not starts:
+        raise ToolError(
+            f"No definition of {action['action']} found on {action['page']}: the page may have "
+            "changed since the session loaded it. Check it with fitnesse_table_source."
+        )
+    if len(starts) > 1:
+        raise ToolError(
+            f"{action['action']} is defined {len(starts)} times on {action['page']} (tables "
+            f"{starts}): refusing to pick one. Edit the page with fitnesse_table_source / fitnesse_table_save."
+        )
+    first = last = starts[0]
+    while last + 1 < len(tables) and not _SEPARATOR.search(texts[last + 1] if last + 1 < len(texts) else ""):
+        last += 1
+    original = tables[first]
+    for i in range(first + 1, last + 1):
+        original += (texts[i] if i < len(texts) else "") + tables[i]
+    return {"index": first, "last": last if last > first else None, "original": original}
+
+
+def _unknown_action(exc: ToolError) -> bool:
+    """The fork can't do it: 400 unknownAction (older mods: 400 Unknown action without a code), or
+    501 unsupported from a test process with an older FitLibrary."""
+    text = str(exc).lower()
+    return ("(unknownaction)" in text or "unknown action" in text or "(unsupported)" in text
+            or text.startswith("http 501"))
+
+
+def _server_defined_action(call: str, state: _DebugState) -> dict | None:
+    """debugTable action=definedAction: the fork picks the definition as a run would (keywords,
+    number of arguments, loaded last wins) and cuts its block. None if this fork can't."""
+    try:
+        found = _debug_post(
+            "debugTable", state.page or "", "definedAction", {"name": call, "session": state.session},
+            timeout_seconds=30.0, state=state,
+        )
+    except ToolError as exc:
+        if _unknown_action(exc):
+            return None
+        raise
+    found = {k: found[k] for k in ("action", "page", "index", "last", "original") if k in found}
+    if isinstance(found.get("page"), str):
+        found["page"] = found["page"].lstrip(".")
+    if "action" in found:
+        found["action"] = _call_row(found["action"])
+    return found
+
+
+def _call_row(wiki: str) -> str:
+    """|''<i>greet</i>''|name| -> |greet|name|"""
+    return "|" + "|".join(_plain(c) for c in _wiki_cells("|" + wiki.strip().strip("|") + "|")) + "|"
+
+
+def _session_defined_action(state: _DebugState, action: str, timeout_seconds: float | None) -> dict:
+    actions = _session_defined_actions(state, timeout_seconds)
+    if not actions:
+        raise ToolError(_NO_DEFINED_ACTIONS)
+    if action.strip().startswith("|"):  # a call row: keywords and number of arguments, as FitLibrary matches
+        cells = [_plain(c).lower() for c in _wiki_cells(action)]
+        keywords, arguments = cells[::2], len(cells[1::2])
+        found = [
+            a for a in actions
+            if [k.lower() for k in a["keywords"]] == keywords and len(a["parameters"]) == arguments
+        ]
+    else:  # bare keywords
+        wanted = " ".join(_plain(action).lower().split())
+        found = [a for a in actions if " ".join(a["keywords"]).lower() == wanted]
+    if not found:
+        raise ToolError(
+            f"{action!r} is not among the {len(actions)} defined actions of this session; see "
+            "fitnesse_debug_inspect(kind='definedActions', filter=...)."
+        )
+    if len(found) > 1:
+        raise ToolError(f"{action!r} is ambiguous: {[a['action'] for a in found]}. Pass the full call.")
+    return found[0]
+
+
+def _save_and_reload(page_path: str, action: str, form: dict, timeout_seconds: float | None, reload: bool) -> dict:
+    """A debugTable save; with reload, the page's defined actions are loaded into the running
+    session afterwards: by the fork itself (reload=true) where it can, else here via runWiki."""
+    state = _debug_state()
+    session_state = None
+    if reload and state.session:
+        form = {**form, "reload": True, "session": state.session}
+        session_state = state  # the session cookie, without which the fork answers noSession
+    result = _with_source(page_path, _without_html(
+        _debug_post("debugTable", page_path, action, form, timeout_seconds=timeout_seconds, state=session_state)))
+    if not reload:
+        return result
+    if "reloaded" not in result:  # older fork: reload here
+        return {**result, "reload": _reload_defined_actions(page_path)}
+    page = page_path.strip().lstrip(".")
+    reload_result: dict = {"reloaded": bool(result.get("reloaded"))}
+    actions = result.get("definedActions")
+    if isinstance(actions, list):
+        reload_result["definedActions"] = [
+            _short_action(_json_defined_action(a)) for a in actions
+            if isinstance(a, dict) and str(a.get("page", "")).lstrip(".") == page
+        ]
+    for key in ("error", "code"):
+        if result.get(key):
+            reload_result[key] = result[key]
+    if not reload_result["reloaded"] and isinstance(result.get("reloadHtml"), str):
+        reload_result["tables"] = _tables_text(result["reloadHtml"])
+    if isinstance(result.get("reloadCounts"), dict) and not reload_result["reloaded"]:
+        reload_result["counts"] = result["reloadCounts"]
+    rest = {k: v for k, v in result.items()
+            if k not in {"reloaded", "definedActions", "error", "code", "reloadHtml", "reloadCounts", "keywords"}}
+    return {**rest, "reload": reload_result}
+
+
+def _with_source(page_path: str, result: dict) -> dict:
+    """The page after a debugTable edit as 'source' (as fitnesse_table_source), for the next edit:
+    from the answer where the fork sends it (mod #157), else read here. The page is already saved,
+    so a failed read only adds a hint."""
+    if isinstance(result.get("source"), dict):
+        return result
+    try:
+        source = _debug_post("debugTable", page_path, "source", timeout_seconds=30.0)
+    except ToolError as exc:
+        return {**result, "hint": f"Saved, but reading the page again failed: {exc}. Read fitnesse_table_source before the next edit."}
+    return {**result, "source": source}
+
+
+def _without_html(result: dict) -> dict:
+    """A debugTable answer with its rendered html condensed to tables text."""
+    if isinstance(result, dict) and isinstance(result.get("html"), str):
+        html = result["html"]
+        result = {k: v for k, v in result.items() if k != "html"}
+        result["tables"] = _tables_text(html)
+    return result
+
+
+def _reload_defined_actions(page: str) -> dict:
+    """Run |define actions at|.page| in the session; never fails: the page is already saved."""
+    page = page.strip().lstrip(".")
+    state = _debug_state()
+    if not state.session:
+        return {"reloaded": False, "reason": "No debug session: saved only. A new session loads the new version."}
+    try:
+        with _document(state):
+            data = _session_action(
+                state, "runWiki", {"wiki": f"|define actions at|.{page}|"},
+                timeout_seconds=DEBUG_TIMEOUT_SECONDS,
+            )
+            counts = data.get("counts") or {}
+        actions = _session_defined_actions(state, DEBUG_TIMEOUT_SECONDS)
+    except ToolError as exc:
+        return {"reloaded": False, "reason": f"Saved, but reloading failed: {exc}. Run |define actions at|.{page}| with fitnesse_debug_run_wiki later."}
+    result: dict = {
+        "reloaded": not (counts.get("wrong") or counts.get("exceptions")),
+        "definedActions": [_short_action(a) for a in actions if a["page"] == page],
+    }
+    if not result["reloaded"]:
+        result["tables"] = _tables_text(data.get("html") or "")
+    return result
 
 
 def _log_lines(lines) -> list[str]:
@@ -2492,12 +3080,16 @@ if DEBUG_TOOLSET:
             "run use fitnesse_run_test instead. Nothing is written to the test history.\n"
             "The page decides which fixtures and variables are available, so start on the test page "
             "(or, with suite=true, on the suite page) you want to work on.\n"
-            "Typical flow: fitnesse_debug_start -> fitnesse_debug_inspect(kind='keywords') -> "
-            "fitnesse_debug_run_wiki or fitnesse_debug_run_page, repeatedly -> fitnesse_debug_end.\n"
-            "Only one session per FitNesse account. If one is already running (possibly a person "
-            "working in the browser), this fails and says so: then continue it with "
-            "fitnesse_debug_status(adopt=true) or end it with fitnesse_debug_end. Use replace=true "
-            "only when told to: it kills the running session without tear down.\n"
+            "Typical flow: fitnesse_debug_start -> fitnesse_debug_run_page(setup_only=true) -> "
+            "fitnesse_debug_inspect(kind='keywords' or 'definedActions') -> fitnesse_debug_run_wiki or "
+            "fitnesse_debug_run_page, repeatedly -> fitnesse_debug_end. Run the SetUp first: defined "
+            "actions, the browser and often fixtures only exist once it has run.\n"
+            "One session per page and FitNesse account (forks before mod #159: one per account). If "
+            "one is already running on this page (possibly a person working in the browser), this "
+            "fails and says so: then continue it with fitnesse_debug_status(adopt=true, session=...) "
+            "or end it. Sessions on other pages are not affected. This server works with one session "
+            "at a time: end its own before starting another. Use replace=true only when told to: it "
+            "kills the running session without tear down, and a browser tab on it then shows 'replaced'.\n"
             "With suite=true the result contains 'pages': the suite's pages in run order, each with "
             "path, kind (test, suiteSetUp, suiteTearDown) and runnable (false = cannot run in this "
             "session; skip it).\n"
@@ -2510,7 +3102,7 @@ if DEBUG_TOOLSET:
     def fitnesse_debug_start(
         page_path: Annotated[str, Field(description="Dotted path of the test page, e.g. 'FrontPage.Project.MyTest'; with suite=true the suite page.")],
         suite: Annotated[bool, Field(description="Start on a suite page to run its test pages one after another; returns the list of pages.")] = False,
-        replace: Annotated[bool, Field(description="Only when told to: kill a running session of this account (maybe a person's) without tear down.")] = False,
+        replace: Annotated[bool, Field(description="Only when told to: kill a running session of this account on this page (older forks: anywhere; maybe a person's) without tear down.")] = False,
         suite_filter: Annotated[str | None, Field(description="suite=true: only tests matching any of these comma-separated tags.")] = None,
         run_tests_matching_all_tags: Annotated[str | None, Field(description="suite=true: only tests matching all of these comma-separated tags.")] = None,
         exclude_suite_filter: Annotated[str | None, Field(description="suite=true: leave out tests with any of these comma-separated tags.")] = None,
@@ -2522,13 +3114,17 @@ if DEBUG_TOOLSET:
         with _document(state):
             # without session: a stale id would answer 409 instead of describing the running session
             status = _status(page_path, state, 30.0, with_session=False)
-            if status.get("running") and not replace:
+            sessions = _sessions(status)
+            if sessions is not None:  # mod #159: one session per page and account
+                _check_start(page_path, sessions, state, replace)
+            elif status.get("running") and not replace:
                 owner = "this MCP server" if state.session and str(status.get("session")) == state.session else "someone using the same account"
                 raise ToolError(
                     f"A debug session started by {owner} is already running (page "
                     f"{status.get('page')}, current page {status.get('currentPage')}, started "
-                    f"{status.get('startedAt')}). Continue it with fitnesse_debug_status(adopt=true), "
-                    "end it with fitnesse_debug_end, or pass replace=true to kill it without tear down."
+                    f"{status.get('startedAt')}); this FitNesse allows one per account. Continue it with "
+                    "fitnesse_debug_status(adopt=true), end it with fitnesse_debug_end, or pass "
+                    "replace=true to kill it without tear down."
                 )
             state.reset()
             data = _debug_post(
@@ -2564,18 +3160,22 @@ if DEBUG_TOOLSET:
             "Result: running (false = no session), page (where the session was started), currentPage "
             "(whose test is running), suite, busy, idleSecondsLeft (the session ends itself after "
             "this idle time), known_to_this_server, and log.lines ('time [out|err|info] text'; 'info'"
-            " lines show the command, exit code and crashes).\n"
+            " lines show the command, exit code and crashes). These describe this server's session, "
+            "else the account's session on page_path, else its only one. sessions (mod #159) lists "
+            "all running sessions of the account: session, page, currentPage, suite, busy, startedAt.\n"
             "busy=true means the process is still working on a call that timed out: wait and call "
             "this again until busy is false, or abort with fitnesse_debug_end(abort=true).\n"
             "known_to_this_server=false with running=true means someone else's session (or one from "
             "before a restart): the other debug tools refuse to touch it until you call this with "
-            "adopt=true. Only adopt a session you are meant to continue."
+            "adopt=true (with several sessions: plus session=<id> from 'sessions'). Only adopt a "
+            "session you are meant to continue."
         ),
         tags={"fitnesse", "debug", "read"},
         annotations={"readOnlyHint": True},
     )
     def fitnesse_debug_status(
         adopt: Annotated[bool, Field(description="Continue the running session of this account with this server's debug tools.")] = False,
+        session: Annotated[str | None, Field(description="With adopt, when several sessions run: the id of the one to continue, from 'sessions'.")] = None,
         page_path: Annotated[str | None, Field(description="Rarely needed: page used for the permission check; defaults to the session's page, else FrontPage.")] = None,
         max_log_lines: Annotated[int, Field(description="Maximum number of new log lines to return; the rest follow on the next call. 0 for none.", ge=0)] = 50,
         timeout_seconds: float = _make_timeout(30.0),
@@ -2584,14 +3184,20 @@ if DEBUG_TOOLSET:
         state = _debug_state()
         status = _status(page_path or state.page or "FrontPage", state, timeout_seconds, with_session=False)
         running = bool(status.get("running"))
-        known = running and bool(state.session) and str(status.get("session")) == state.session
-        if adopt and running and not known:
-            state.reset()
-            state.session = str(status.get("session"))
-            state.page = status.get("page")
-            state.current_page = status.get("currentPage") or state.page
-            state.suite = bool(status.get("suite"))
-            known = True
+        sessions = _sessions(status)
+        if sessions is not None:  # mod #159: this server's session may run on another page than asked
+            known = bool(state.session) and any(s["session"] == state.session for s in sessions)
+        else:
+            known = running and bool(state.session) and str(status.get("session")) == state.session
+        if adopt and not known:
+            chosen = _session_to_adopt(status, sessions, session)
+            if chosen is not None:
+                state.reset()
+                state.session = str(chosen.get("session"))
+                state.page = chosen.get("page")
+                state.current_page = chosen.get("currentPage") or state.page
+                state.suite = bool(chosen.get("suite"))
+                known = True
         elif state.session and not known:
             state.reset()
         result = {**status, "known_to_this_server": known}
@@ -2604,8 +3210,9 @@ if DEBUG_TOOLSET:
         description=(
             "Runs FitNesse wiki tables in the debug session, e.g. '|with browser|'. Rows are "
             "'|cell|cell|' lines; separate tables with an empty line. Variables of the current page "
-            "like ${BASE_URL} are resolved. The page's SetUp and TearDown are NOT added: run them "
-            "yourself with fitnesse_debug_run_page if the steps need them.\n"
+            "like ${BASE_URL} are resolved. The page's SetUp and TearDown are NOT added: run the SetUp "
+            "first with fitnesse_debug_run_page(setup_only=true), otherwise the defined actions, the "
+            "browser and fixtures it provides are missing.\n"
             "State carries over between calls: a browser opened in one call is still open in the "
             "next. All tables of one call run before the result comes back; it can take minutes (up "
             "to ~10).\n"
@@ -2614,6 +3221,10 @@ if DEBUG_TOOLSET:
             " [error] exception (message and shortened stack trace), [ignore] not run. Cells without "
             "prefix are plain input. 'counts' are this call's right/wrong/ignores/exceptions; "
             "'page_totals' add up all calls since the current page's test began.\n"
+            "Below each table come what belongs to it: folding areas after it ('after: <title>', "
+            "e.g. FitLibrary's show after or logs), links ('link in row R, column C: text -> url') "
+            "and images. Inline screenshots ('[image N]' in a cell) are attached as image content "
+            f"(at most {DEBUG_MAX_IMAGES} per call); 'images' lists which one is where.\n"
             "Find the available keywords and their exact wording with "
             "fitnesse_debug_inspect(kind='keywords') before writing tables.\n"
             "restart=true first ends the running test (its tear down runs, result in "
@@ -2631,23 +3242,27 @@ if DEBUG_TOOLSET:
         """(nextPage +) runWiki via responder=debugTest."""
         state = _require_session()
         with _document(state):
-            return _run_document(
+            return _with_images(_run_document(
                 state, None, restart, timeout_seconds,
                 lambda: _document_result(
                     state,
                     _session_action(state, "runWiki", {"wiki": wiki}, timeout_seconds=timeout_seconds),
                     state.current_page, include_html,
                 ),
-            )
+            ))
 
     @mcp.tool(
         name="fitnesse_debug_page_tables",
         description=(
             "Lists the tables that running a page executes, in order, including those of its "
             "SetUp/TearDown and included pages: index, number of rows and the first row. Use the "
-            "indices to run only some of them with fitnesse_debug_run_page(tables=[...]). These indices "
-            "differ from fitnesse_table_source's, which counts only the page's own tables. Requires a "
-            "debug session; omit page_path for the page currently being tested."
+            "indices to run only some of them with fitnesse_debug_run_page(tables=[...]); setup_tables "
+            "are those of the SetUp (what run_page(setup_only=true) runs). These indices "
+            "differ from fitnesse_table_source's, which counts only the page's own tables: to edit a "
+            "table, use its source_page and source_index with the fitnesse_table_* tools. A table of an"
+            " included page (included=true, e.g. SetUp) is edited on that page, which changes it for "
+            "every page that includes it. Requires a debug session; omit page_path for the page "
+            "currently being tested."
         ),
         tags={"fitnesse", "debug", "read"},
         annotations={"readOnlyHint": True},
@@ -2660,10 +3275,18 @@ if DEBUG_TOOLSET:
         state = _require_session()
         page = page_path or state.current_page or state.page
         tables = []
-        for i, table in enumerate(_parse_tables(_page_html(state, page, timeout_seconds))):
+        own: dict[str, int] = {}
+        parsed = _parse_tables(_page_html(state, page, timeout_seconds))
+        for i, table in enumerate(parsed):
             first = " | ".join(_squash(c["text"], 80) for c in (table["rows"][0] if table["rows"] else []))
-            tables.append({"index": i, "rows": len(table["rows"]), "first_row": first})
-        return {"page": page, "tables": tables}
+            source_page = table["include"] or page
+            source_index = own[source_page] = own.get(source_page, -1) + 1
+            entry = {"index": i, "rows": len(table["rows"]), "first_row": first,
+                     "source_page": source_page, "source_index": source_index}
+            if table["include"]:
+                entry["included"] = True
+            tables.append(entry)
+        return {"page": page, "setup_tables": _setup_indices(parsed), "tables": tables}
 
     @mcp.tool(
         name="fitnesse_debug_run_page",
@@ -2676,6 +3299,12 @@ if DEBUG_TOOLSET:
             "first (its tear-down result comes back as previous_page_teardown) and the new page's "
             "test begins. Calling it again for the same page continues that page's test, so you can "
             "run its tables in several steps; restart=true begins it afresh.\n"
+            "setup_only=true runs just the SetUp (the tables of the included SetUp page): do this "
+            "right after fitnesse_debug_start, before fitnesse_debug_run_wiki or inspect. A later call "
+            "without tables then leaves the SetUp out (skipped_setup lists its indices) instead of "
+            "running it twice; restart=true or another page runs it again.\n"
+            "only_failures=true returns only the tables with a [fail] or [error] cell, for long "
+            "pages.\n"
             "In a suite session, call it for each page with runnable=true from fitnesse_debug_start's"
             " 'pages', in that order."
         ),
@@ -2686,37 +3315,64 @@ if DEBUG_TOOLSET:
         page_path: DebugPath = None,
         tables: Annotated[list[int] | None, Field(description="Indices from fitnesse_debug_page_tables to run, in this order; omit to run the whole page.")] = None,
         restart: Annotated[bool, Field(description="Begin the page's test afresh even if it is already the current page.")] = False,
+        setup_only: Annotated[bool, Field(description="Run only the SetUp tables (setup_tables of fitnesse_debug_page_tables). Not together with tables.")] = False,
+        only_failures: Annotated[bool, Field(description="Return only the tables with a [fail] or [error] cell (counts as usual; tables_without_failures says how many were left out). For long pages where you look for what went wrong.")] = False,
         include_html: Annotated[bool, Field(description="Also return the raw result HTML (large; normally not needed).")] = False,
         timeout_seconds: float | None = Depends(lambda: DEBUG_TIMEOUT_SECONDS),
     ) -> dict:
         """(nextPage +) pageHtml + runTable via responder=debugTest."""
+        if setup_only and tables is not None:
+            raise ToolError("Pass either setup_only=true or tables, not both.")
         state = _require_session()
         page = page_path or state.current_page or state.page
 
         def run() -> dict:
             html = _page_html(state, page, timeout_seconds)
-            if tables is not None:
+            chosen = tables
+            skipped: list[int] = []
+            if setup_only:
+                chosen = _setup_indices(_parse_tables(html))
+                if not chosen:
+                    return {"page": page, "setup_tables": [], "hint": "The page has no SetUp tables; nothing was run."}
+            elif tables is None and state.setup_ran == page:  # SetUp already ran in this test
+                parsed = _parse_tables(html)
+                skipped = _setup_indices(parsed)
+                chosen = [i for i in range(len(parsed)) if i not in skipped]
+                if not chosen:
+                    return {"page": page, "skipped_setup": skipped, "hint": "Only SetUp tables, which already ran; nothing was run."}
+            if chosen is not None:
                 parts = _split_tables(html)
-                bad = [i for i in tables if not 0 <= i < len(parts)]
+                bad = [i for i in chosen if not 0 <= i < len(parts)]
                 if bad:
                     raise ToolError(f"Table indices {bad} out of range: the page has {len(parts)} tables.")
-                html = "\n".join(parts[i] for i in tables)
+                html = "\n".join(parts[i] for i in chosen)
             data = _session_action(state, "runTable", {"html": html}, timeout_seconds=timeout_seconds)
-            return _document_result(state, data, page, include_html)
+            if setup_only:
+                state.setup_ran = page
+            result = _document_result(state, data, page, include_html, only_failures)
+            if skipped:
+                result["skipped_setup"] = skipped
+            return result
 
         with _document(state):
-            return _run_document(state, page, restart, timeout_seconds, run)
+            return _with_images(_run_document(state, page, restart, timeout_seconds, run))
 
     @mcp.tool(
         name="fitnesse_debug_inspect",
         description=(
             "Looks into the debug session. kind:\n"
-            "- 'keywords': the keywords you can use in tables right now. Without filter: per category"
-            " the keyword syntax, where %1, %2 are the cells for parameters (e.g. 'click %1' -> "
-            "'|click|//button|'). With filter (e.g. 'browser', 'click'): matching entries in full, "
-            "with parameters (label, allowed options), returnType, tableItems (the rows a keyword "
+            "- 'keywords': the keywords you can use in tables right now. Without filter: only the "
+            "categories with their number of keywords (the full list is large). With filter (a word "
+            "such as 'click', or a category such as 'Web / Browser'): matching entries in full: "
+            "syntax, where %1, %2 are the cells for parameters (e.g. 'click %1' -> "
+            "'|click|//button|'), parameters (label, allowed options), returnType, tableItems (the rows a keyword "
             "expects in the rest of its table; 'This statement is mandatory' in helpText marks "
-            "required rows) and helpText.\n"
+            "required rows) and helpText. Defined actions are not in it: see 'definedActions'.\n"
+            "- 'definedActions': the defined actions loaded in this session by |define actions at| "
+            "(usually from SetUp): action (call syntax, parameters as cells), parameters, note, "
+            "deprecated, author, page (where it is defined; edit it with "
+            "fitnesse_debug_defined_action_source) and overrides. filter searches all fields. Empty "
+            "until the page's 'define actions at' tables have run in the session.\n"
             "- 'dynamicVariables': variables set during the test (name, value); include_system adds "
             "the many unchanged Java system properties.\n"
             "- 'scope': the objects whose keywords are available, innermost first (level, name, "
@@ -2728,15 +3384,21 @@ if DEBUG_TOOLSET:
         annotations={"destructiveHint": False},
     )
     def fitnesse_debug_inspect(
-        kind: Annotated[Literal["keywords", "dynamicVariables", "scope", "liveView"], Field(description="What to look at; see the tool description.")],
-        filter: Annotated[str | None, Field(description="Only for kind='keywords': text to search for (case-insensitive), e.g. 'browser'.")] = None,
+        kind: Annotated[Literal["keywords", "definedActions", "dynamicVariables", "scope", "liveView"], Field(description="What to look at; see the tool description.")],
+        filter: Annotated[str | None, Field(description="Only for kind='keywords' or 'definedActions': text to search for (case-insensitive), e.g. 'browser'.")] = None,
         limit: Annotated[int, Field(description="Only for kind='keywords' with filter: maximum number of entries.", ge=1)] = 30,
         include_system: Annotated[bool, Field(description="Only for kind='dynamicVariables': also list the unchanged Java system properties (many).")] = False,
         timeout_seconds: float | None = Depends(lambda: DEBUG_TIMEOUT_SECONDS),
     ) -> dict:
-        """keywordsJson/dynamicVariables/scope/liveView via responder=debugTest."""
+        """keywordsJson/keywords/dynamicVariables/scope/liveView via responder=debugTest."""
         state = _require_session()
-        action = "keywordsJson" if kind == "keywords" else kind
+        if kind == "definedActions":
+            actions = _session_defined_actions(state, timeout_seconds)
+            if not actions:
+                return {"definedActions": [], "hint": _NO_DEFINED_ACTIONS}
+            hits = [a for a in actions if _matches_action(json.dumps(a, ensure_ascii=False), filter)]
+            return {"count": len(actions), "matches": len(hits), "definedActions": hits[:limit]}
+        action = {"keywords": "keywordsJson"}.get(kind, kind)
         with _document(state):
             data = _session_action(state, action, timeout_seconds=timeout_seconds)
         html = data.get("html") or ""
@@ -2795,7 +3457,51 @@ if DEBUG_TOOLSET:
             result["log"] = _log_lines(log.get("lines"))
         result["page_totals"] = state.page_counts
         state.reset()
-        return result
+        return _with_images(result)
+
+    @mcp.tool(
+        name="fitnesse_debug_defined_action_source",
+        description=(
+            "Reads the current wiki of a defined action for editing: finds the page that defines it"
+            " via the session's defined actions, reads that page fresh (not what the session loaded)"
+            " and cuts out the definition block as FitLibrary reads it: the header table (the page's"
+            " first table or the first after a ---- line) and every table up to the next ----, with"
+            " the text in between. Forks with definedAction pick the definition as a run would "
+            "(keywords, number of arguments, loaded last wins). Result: page, index, last, original, "
+            "ready for "
+            "fitnesse_table_save(page_path=page, index=index, last=last, original=original, wiki=<new>,"
+            " reload_defined_actions=true). On older forks it fails if the header is on the page "
+            "more than once. "
+            "Needs a debug session in which the action is loaded, or page_path, the defining page."
+        ),
+        tags={"fitnesse", "debug", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_debug_defined_action_source(
+        action: Annotated[str, Field(description="The defined action: its call as in fitnesse_debug_inspect(kind='definedActions'), e.g. '|click by js|locator|', or just its keywords, e.g. 'click by js'.")],
+        page_path: Annotated[str | None, Field(description="Only without a debug session: the page that defines it (action then has to be the call row).")] = None,
+        timeout_seconds: float | None = Depends(lambda: DEBUG_TIMEOUT_SECONDS),
+    ) -> dict:
+        """definedAction via responder=debugTable; on older forks keywords + source, cut here."""
+        state = _debug_state()
+        if state.session:
+            defined = None
+            call = action.strip()
+            if not call.startswith("|"):  # bare keywords: the fork wants a call row
+                defined = _session_defined_action(state, call, timeout_seconds)
+                call = defined["action"]
+            found = _server_defined_action(_call_row(call), state)
+            if found is not None:
+                return found
+            defined = defined or _session_defined_action(state, call, timeout_seconds)
+        elif page_path:
+            call = _call_row(action)
+            keywords = [_plain(c) for c in _wiki_cells(call)[::2]]
+            defined = {"action": call, "keywords": keywords, "page": page_path.strip().lstrip(".")}
+        else:
+            _require_session()  # raises with the hint
+        source = _debug_post("debugTable", defined["page"], "source", timeout_seconds=30.0)
+        return {"action": defined["action"], "page": defined["page"], **_definition_block(source, defined)}
 
     @mcp.tool(
         name="fitnesse_table_source",
@@ -2821,16 +3527,28 @@ if DEBUG_TOOLSET:
     # debugTable saves wiki pages for real: tagged write, so they need FITNESSE_TOOLSETS=write.
     _TABLE_EDIT = (
         " This saves the wiki page for real (it shows up in recent changes): change only pages you "
-        "are asked to change. Read fitnesse_table_source first and pass its texts unchanged; if the "
-        "page has changed since, the call fails: read it again and redo the change. Indices refer "
-        "to the source as read, so after a change read it again before the next one. A running "
-        "debug session sees the change when the page's tables are run again."
+        "are asked to change. Read fitnesse_table_source first and pass the current wiki of exactly "
+        "the table or text you change as original (tables[index] or texts[index], not the whole "
+        "list); if the page has changed since, the call fails: read fitnesse_table_source again and "
+        "redo the change. The result's source (tables, texts, page; as fitnesse_table_source) is "
+        "the page after the change: take the next edit's original and indices from it, as indices "
+        "shift. A running debug session sees the change when the page's tables are run again."
     )
     type TableIndex = Annotated[int, Field(description="Index among the page's own tables, as in fitnesse_table_source.", ge=0)]
 
     @mcp.tool(
         name="fitnesse_table_save",
-        description="Replaces table index of a page with new wiki markup; with last, replaces tables index..last together with the text between them (e.g. a defined action spread over several tables)." + _TABLE_EDIT,
+        description=(
+            "Replaces table index of a page with new wiki markup; with last, replaces tables index..last "
+            "together with the text between them (e.g. a defined action spread over several tables).\n"
+            "Editing a defined action: take page, index, last and original from "
+            "fitnesse_debug_defined_action_source and pass reload_defined_actions=true. The running "
+            "session then loads the page's defined actions again and runs the new version at once. "
+            "The result has 'reload': reloaded (true = loaded), definedActions (the page's actions "
+            "as now loaded), and if reloaded is false the reason, or error/code and the tables of the "
+            "failed load. The page is saved either way: fix the definition and save again, or run "
+            "fitnesse_debug_run_wiki('|define actions at|.<page>|') once the page is right."
+        ) + _TABLE_EDIT,
         tags={"fitnesse", "debug", "write"},
         annotations={"destructiveHint": True},
     )
@@ -2840,35 +3558,91 @@ if DEBUG_TOOLSET:
         original: Annotated[str, Field(description="Current wiki of table index (with last: of tables index..last and the text between), as from fitnesse_table_source.")],
         wiki: Annotated[str, Field(description="New wiki markup.")],
         last: Annotated[int | None, Field(description="Last table of a block to replace.", ge=0)] = None,
+        reload_defined_actions: Annotated[bool, Field(description="After saving, reload the page's defined actions into the running debug session (|define actions at|.page|), so the session runs the new version.")] = False,
         timeout_seconds: float = _make_timeout(60.0),
     ) -> dict:
-        """save/saveBlock via responder=debugTable."""
+        """save/saveBlock via responder=debugTable (+ runWiki |define actions at| via responder=debugTest)."""
         action = "save" if last is None else "saveBlock"
-        return _debug_post(
-            "debugTable", page_path, action,
-            {"index": index, "last": last, "original": original, "wiki": wiki},
-            timeout_seconds=timeout_seconds,
+        return _save_and_reload(
+            page_path, action, {"index": index, "last": last, "original": original, "wiki": wiki},
+            timeout_seconds, reload_defined_actions,
         )
 
     @mcp.tool(
         name="fitnesse_table_insert",
-        description="Inserts new table(s) before table index; index = number of tables appends them at the end of the page." + _TABLE_EDIT,
+        description="Inserts new table(s) before table index, into the text in front of it: at the end of that text, or with start=true at its beginning; index = number of tables appends them at the end of the page." + _TABLE_EDIT,
         tags={"fitnesse", "debug", "write"},
         annotations={"destructiveHint": False},
     )
     def fitnesse_table_insert(
         page_path: WikiPath,
         index: TableIndex,
-        before: Annotated[str, Field(description="Current text preceding table index (texts[index] of fitnesse_table_source).")],
+        before: Annotated[str, Field(description="Current wiki of table index (tables[index] of fitnesse_table_source); empty when appending at the end.")],
         wiki: Annotated[str, Field(description="Wiki markup of the new table(s).")],
+        start: Annotated[bool, Field(description="Insert at the beginning of the text in front of table index instead of at its end.")] = False,
+        reload_defined_actions: Annotated[bool, Field(description="After saving, reload the page's defined actions into the running debug session, e.g. after adding a new defined action.")] = False,
         timeout_seconds: float = _make_timeout(60.0),
     ) -> dict:
         """insert via responder=debugTable."""
-        return _debug_post(
-            "debugTable", page_path, "insert",
-            {"index": index, "before": before, "wiki": wiki},
-            timeout_seconds=timeout_seconds,
+        return _save_and_reload(
+            page_path, "insert", {"index": index, "before": before, "start": start, "wiki": wiki},
+            timeout_seconds, reload_defined_actions,
         )
+
+    @mcp.tool(
+        name="fitnesse_table_move",
+        description="Moves table index to position to (counted before the move) in one save: into the text in front of table to, at its end, or with start=true at its beginning; to = number of tables moves it to the end." + _TABLE_EDIT,
+        tags={"fitnesse", "debug", "write"},
+        annotations={"destructiveHint": False},
+    )
+    def fitnesse_table_move(
+        page_path: WikiPath,
+        index: TableIndex,
+        original: Annotated[str, Field(description="Current wiki of table index, as from fitnesse_table_source.")],
+        to: Annotated[int, Field(description="Target position, counted before the move.", ge=0)],
+        start: Annotated[bool, Field(description="Go to the beginning of the text in front of table to instead of its end.")] = False,
+        reload_defined_actions: Annotated[bool, Field(description="After saving, reload the page's defined actions into the running debug session.")] = False,
+        timeout_seconds: float = _make_timeout(60.0),
+    ) -> dict:
+        """move via responder=debugTable."""
+        return _save_and_reload(page_path, "move", {"index": index, "original": original, "to": to, "start": start}, timeout_seconds, reload_defined_actions)
+
+    @mcp.tool(
+        name="fitnesse_table_save_text",
+        description="Replaces texts[index], the wiki text in front of table index (one more after the last table), e.g. headings, comments, collapsible sections. Refuses text that would remove or change a table; tables in the new text are added (result: added, their number)." + _TABLE_EDIT,
+        tags={"fitnesse", "debug", "write"},
+        annotations={"destructiveHint": True},
+    )
+    def fitnesse_table_save_text(
+        page_path: WikiPath,
+        index: Annotated[int, Field(description="Index into texts of fitnesse_table_source.", ge=0)],
+        original: Annotated[str, Field(description="Current texts[index], as from fitnesse_table_source.")],
+        wiki: Annotated[str, Field(description="New wiki text.")],
+        reload_defined_actions: Annotated[bool, Field(description="After saving, reload the page's defined actions into the running debug session.")] = False,
+        timeout_seconds: float = _make_timeout(60.0),
+    ) -> dict:
+        """saveText via responder=debugTable."""
+        return _save_and_reload(page_path, "saveText", {"index": index, "original": original, "wiki": wiki},
+                                timeout_seconds, reload_defined_actions)
+
+    @mcp.tool(
+        name="fitnesse_table_move_text",
+        description="Moves texts[index] next to texts[to] in one save: after it, or with start=true in front of it." + _TABLE_EDIT,
+        tags={"fitnesse", "debug", "write"},
+        annotations={"destructiveHint": False},
+    )
+    def fitnesse_table_move_text(
+        page_path: WikiPath,
+        index: Annotated[int, Field(description="Index into texts of the text to move.", ge=0)],
+        original: Annotated[str, Field(description="Current texts[index].")],
+        to: Annotated[int, Field(description="Index into texts of the target text.", ge=0)],
+        to_original: Annotated[str, Field(description="Current texts[to].")],
+        start: Annotated[bool, Field(description="Put it in front of texts[to] instead of after it.")] = False,
+        reload_defined_actions: Annotated[bool, Field(description="After saving, reload the page's defined actions into the running debug session.")] = False,
+        timeout_seconds: float = _make_timeout(60.0),
+    ) -> dict:
+        """moveText via responder=debugTable."""
+        return _save_and_reload(page_path, "moveText", {"index": index, "original": original, "to": to, "toOriginal": to_original, "start": start}, timeout_seconds, reload_defined_actions)
 
     @mcp.tool(
         name="fitnesse_table_delete",
@@ -2880,14 +3654,11 @@ if DEBUG_TOOLSET:
         page_path: WikiPath,
         index: TableIndex,
         original: Annotated[str, Field(description="Current wiki of table index, as from fitnesse_table_source.")],
+        reload_defined_actions: Annotated[bool, Field(description="After saving, reload the page's defined actions into the running debug session.")] = False,
         timeout_seconds: float = _make_timeout(60.0),
     ) -> dict:
         """delete via responder=debugTable."""
-        return _debug_post(
-            "debugTable", page_path, "delete",
-            {"index": index, "original": original},
-            timeout_seconds=timeout_seconds,
-        )
+        return _save_and_reload(page_path, "delete", {"index": index, "original": original}, timeout_seconds, reload_defined_actions)
 
 
 # The mode each tool needs: by tag, plus the few control tools by name.
@@ -2910,15 +3681,19 @@ for _mode in set(MODES) - FITNESSE_TOOLSETS:
 DEBUG_INSTRUCTIONS = """\
 KDTA debug tools - how they depend on each other:
 - Session first: fitnesse_debug_start (or fitnesse_debug_status(adopt=true) for a running \
-session) must succeed before fitnesse_debug_run_wiki, _run_page, _page_tables, _inspect and \
-_end work. fitnesse_debug_status without adopt and the fitnesse_table_* tools need no session.
-- Typical flow: start -> inspect(kind='keywords') -> run_wiki / run_page, repeatedly -> end. \
+session) must succeed before fitnesse_debug_run_wiki, _run_page, _page_tables, _inspect, \
+_defined_action_source and _end work. fitnesse_debug_status without adopt and the fitnesse_table_* tools need no session.
+- Typical flow: start -> run_page(setup_only=true) -> inspect(kind='keywords' / 'definedActions') \
+-> run_wiki / run_page, repeatedly -> end. Run the SetUp first: defined actions, the browser and \
+often fixtures come from it, so without it inspect shows no defined actions and run_wiki fails. \
 Always call fitnesse_debug_end when done; the session holds server resources.
-- Write run_wiki tables with the exact keyword wording from inspect(kind='keywords').
+- Write run_wiki tables with the exact keyword wording from inspect(kind='keywords'). Defined \
+actions are listed separately by inspect(kind='definedActions'), once the page's |define actions \
+at| tables (usually in SetUp) have run in the session.
 - State (open browser, scope, variables) carries over between run_wiki and run_page calls on \
 the same page. run_page on another page, or restart=true, first ends the current page's test \
 (tear down in previous_page_teardown).
-- run_wiki adds no SetUp/TearDown: if the steps need them, run those tables first with \
+- run_wiki adds no SetUp/TearDown: run_page(setup_only=true) runs the SetUp; other tables with \
 run_page(tables=[...]), indices from fitnesse_debug_page_tables.
 - Suite session (start with suite=true): call run_page for each page with runnable=true from \
 'pages', in that order.
@@ -2935,9 +3710,16 @@ an index from one to the other.
 
 # Only with write as well, where fitnesse_table_save/_insert/_delete are visible.
 DEBUG_TABLE_EDIT_INSTRUCTIONS = """\
-- Editing tables: read fitnesse_table_source, pass its texts unchanged to fitnesse_table_save / \
-_insert / _delete, then read the source again before the next edit (indices shift). A running \
-session sees the change when the tables are run again.
+- Editing tables: read fitnesse_table_source, pass the changed table or text (tables[index] / \
+texts[index]) unchanged as original to fitnesse_table_save / _insert / _delete / _move / \
+_save_text / _move_text. Each result's source is the page after the change: take the next \
+original and indices from it (indices shift). On "page changed" read fitnesse_table_source again \
+and redo the change. A running session sees the change when the tables are run again.
+- A table seen in a session: fitnesse_debug_page_tables gives its source_page and source_index; \
+tables of included pages (SetUp, includes) are edited on that page.
+- Editing a defined action: inspect(kind='definedActions') -> defined_action_source(action) -> \
+fitnesse_table_save(page, index, last, original, wiki=<new>, reload_defined_actions=true) -> run \
+it again. Check reload.reloaded in the result; false means the session still has the old version.
 """
 
 # Each part names only tools the toolsets make visible: the base part needs the session
@@ -2947,10 +3729,27 @@ if {"debug", "read", "test"} <= FITNESSE_TOOLSETS:
     if "write" in FITNESSE_TOOLSETS:
         mcp.instructions += DEBUG_TABLE_EDIT_INSTRUCTIONS
 
+# What debug loses without each mode; a debug area that can't open a session is likely a mistake.
+_DEBUG_WITHOUT = {
+    "test": "fitnesse_debug_start, _run_wiki, _run_page and _end are hidden, so no debug session can be started",
+    "read": "fitnesse_debug_status, _page_tables, _inspect, _defined_action_source and fitnesse_table_source are hidden",
+}
+if DEBUG_TOOLSET and not {"read", "test"} <= FITNESSE_TOOLSETS:
+    logger.warning(
+        "FITNESSE_TOOLSETS has debug without %s: %s; clients get no debug instructions. "
+        "Use read,test,debug (plus write to edit tables) for the full debug mode.",
+        " and ".join(m for m in ("read", "test") if m not in FITNESSE_TOOLSETS),
+        "; ".join(_DEBUG_WITHOUT[m] for m in ("read", "test") if m not in FITNESSE_TOOLSETS),
+    )
+
 
 
 def main() -> None:
     """Entry point of the fitnesse-mcp command: stdio unless FASTMCP_TRANSPORT says otherwise."""
+    import fastmcp
+
+    if FITNESSE_AUTH_MODE == "headers" and fastmcp.settings.transport == "stdio":
+        raise SystemExit("FITNESSE_AUTH_MODE=headers needs the HTTP transport (FASTMCP_TRANSPORT=http).")
     mcp.run()
 
 

@@ -487,13 +487,15 @@ def _modes_of(tool) -> set[str]:
 async def test_every_tool_needs_exactly_one_mode(toolsets_env):
     await toolsets_env("all,debug,complete")
     tools = await my_server.mcp.list_tools()
-    assert len(tools) == 62
+    assert len(tools) == 66
     assert {t.name: _modes_of(t) for t in tools if len(_modes_of(t)) != 1} == {}
     debug = {t.name: _modes_of(t).pop() for t in tools if "debug" in t.tags}
     assert debug == {
         "fitnesse_debug_status": "read", "fitnesse_debug_page_tables": "read",
         "fitnesse_debug_inspect": "read", "fitnesse_table_source": "read",
+        "fitnesse_debug_defined_action_source": "read",
         "fitnesse_table_save": "write", "fitnesse_table_insert": "write", "fitnesse_table_delete": "write",
+        "fitnesse_table_move": "write", "fitnesse_table_save_text": "write", "fitnesse_table_move_text": "write",
         "fitnesse_debug_start": "test", "fitnesse_debug_run_wiki": "test",
         "fitnesse_debug_run_page": "test", "fitnesse_debug_end": "test",
     }
@@ -544,13 +546,13 @@ async def test_toolsets_examples(toolsets_env):
 async def test_toolsets_default_all_and_spelling(toolsets_env):
     default = await toolsets_env("read,write,test,debug")
     assert default == await toolsets_env(" Read , WRITE,test,DEBUG ")
-    assert len(default) == 46  # 62 minus the 16 complete tools
+    assert len(default) == 50  # 66 minus the 16 complete tools
     assert await toolsets_env("all,debug") == default  # all leaves the areas out
     assert await toolsets_env("read,all,debug") == default
-    assert len(await toolsets_env("all")) == 35  # minus 16 complete and 11 debug tools
-    assert len(await toolsets_env("all,debug,complete")) == 62
-    assert len(await toolsets_env("read,write,test,debug,complete")) == 62
-    assert len(await toolsets_env("read,write,test,complete")) == 51  # minus 11 debug tools
+    assert len(await toolsets_env("all")) == 35  # minus 16 complete and 15 debug tools
+    assert len(await toolsets_env("all,debug,complete")) == 66
+    assert len(await toolsets_env("read,write,test,debug,complete")) == 66
+    assert len(await toolsets_env("read,write,test,complete")) == 51  # minus 15 debug tools
 
 
 @pytest.mark.parametrize("value", [None, "", "  "])
@@ -1077,3 +1079,145 @@ def test_fresh_import_with_every_gate_open():
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# FITNESSE_AUTH_MODE
+# ---------------------------------------------------------------------------
+
+def _basic(user: str, password: str) -> str:
+    return "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
+
+
+@pytest.fixture
+def auth_env(monkeypatch):
+    """Reload the server with the given FITNESSE_AUTH_MODE and a server account in the env."""
+    monkeypatch.setenv("FITNESSE_USERNAME", "server-account")
+    monkeypatch.setenv("FITNESSE_PASSWORD", "server-secret")
+
+    def load(mode: str | None):
+        if mode is None:
+            monkeypatch.delenv("FITNESSE_AUTH_MODE", raising=False)
+        else:
+            monkeypatch.setenv("FITNESSE_AUTH_MODE", mode)
+        importlib.reload(my_server)
+
+    yield load
+    monkeypatch.delenv("FITNESSE_AUTH_MODE", raising=False)
+    monkeypatch.undo()
+    importlib.reload(my_server)
+
+
+async def _call_over_http(headers: dict[str, str], urls: list[str] | None = None) -> list[str | None]:
+    """Call one tool through the real HTTP stack; return the Authorization headers sent to FitNesse
+    (and collect the URLs called into urls)."""
+    import asyncio
+    import socket
+
+    import uvicorn
+    from fastmcp.client.transports import StreamableHttpTransport
+
+    sent: list[str | None] = []
+
+    def spy(req, timeout=None):
+        sent.append(req.get_header("Authorization"))
+        if urls is not None:
+            urls.append(req.full_url)
+        return _FakeResponse()
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(my_server.mcp.http_app(), port=port, log_level="error"))
+    task = asyncio.create_task(server.serve())
+    while not server.started:
+        await asyncio.sleep(0.01)
+    try:
+        with patch("urllib.request.urlopen", side_effect=spy):
+            async with Client(StreamableHttpTransport(f"http://127.0.0.1:{port}/mcp", headers=headers)) as c:
+                await c.call_tool("fitnesse_get_properties", {"page_path": "FrontPage"})
+    finally:
+        server.should_exit = True
+        await task
+    return sent
+
+
+@pytest.mark.asyncio
+async def test_auth_env_mode_uses_server_account(auth_env):
+    auth_env(None)
+    sent = await _call_over_http({my_server.HEADER_USERNAME: "bob", my_server.HEADER_PASSWORD: "pw"})
+    assert sent == [_basic("server-account", "server-secret")]
+
+
+@pytest.mark.asyncio
+async def test_auth_headers_mode_uses_each_callers_login(auth_env):
+    auth_env("headers")
+    for user, password in (("alice", "a-pw"), ("bob", "b-pw")):
+        sent = await _call_over_http({my_server.HEADER_USERNAME: user, my_server.HEADER_PASSWORD: password})
+        assert sent == [_basic(user, password)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headers", [{}, {"X-FitNesse-Username": "bob"}])
+async def test_auth_headers_mode_never_falls_back_to_server_account(auth_env, headers):
+    auth_env("headers")
+    with pytest.raises(ToolError, match="X-FitNesse-Username and X-FitNesse-Password"):
+        await _call_over_http(headers)
+    with _patch_urlopen() as urlopen, pytest.raises(ToolError, match="FITNESSE_AUTH_MODE=headers"):
+        async with Client(my_server.mcp) as c:  # in-memory: no HTTP request, no headers
+            await c.call_tool("fitnesse_get_properties", {"page_path": "FrontPage"})
+    urlopen.assert_not_called()
+
+
+def test_auth_headers_mode_keeps_debug_sessions_apart(auth_env):
+    auth_env("headers")
+    with patch.object(my_server, "get_http_headers", return_value={"x-fitnesse-username": "alice", "x-fitnesse-password": "a"}):
+        alice = my_server._debug_state()
+    with patch.object(my_server, "get_http_headers", return_value={"x-fitnesse-username": "bob", "x-fitnesse-password": "b"}):
+        bob = my_server._debug_state()
+    assert alice is not bob
+
+
+@pytest.mark.asyncio
+async def test_url_header_picks_the_instance(auth_env, monkeypatch):
+    auth_env(None)
+    monkeypatch.setenv("FITNESSE_BASE_URL", "http://default:8080")
+    urls: list[str] = []
+    await _call_over_http({}, urls)
+    await _call_over_http({my_server.HEADER_BASE_URL: "https://other.example.com:8443/"}, urls)
+    assert urls[0].startswith("http://default:8080/FrontPage?")
+    assert urls[1].startswith("https://other.example.com:8443/FrontPage?")
+
+
+@pytest.mark.parametrize("url", ["file:///etc/passwd", "ftp://x", "other.example.com", "http://x/?a=1", "http://"])
+def test_url_header_must_be_http(url):
+    with patch.object(my_server, "get_http_headers", return_value={"x-fitnesse-url": url}):
+        with pytest.raises(ToolError, match="must be an http"):
+            my_server._base_url()
+
+
+def test_url_header_keeps_debug_sessions_apart(auth_env):
+    auth_env(None)
+    with patch.object(my_server, "get_http_headers", return_value={"x-fitnesse-url": "http://a:8080"}):
+        a = my_server._debug_state()
+    with patch.object(my_server, "get_http_headers", return_value={"x-fitnesse-url": "http://b:8080/"}):
+        b = my_server._debug_state()
+    with patch.object(my_server, "get_http_headers", return_value={}):
+        default = my_server._debug_state()
+    assert len({id(a), id(b), id(default)}) == 3
+
+
+def test_auth_mode_rejects_unknown_value(monkeypatch):
+    monkeypatch.setenv("FITNESSE_AUTH_MODE", "basic")
+    with pytest.raises(RuntimeError, match="FITNESSE_AUTH_MODE='basic'"):
+        my_server._auth_mode_from_env()
+
+
+def test_auth_headers_mode_refuses_stdio(auth_env, monkeypatch):
+    import fastmcp
+
+    auth_env("headers")
+    monkeypatch.setattr(fastmcp.settings, "transport", "stdio")
+    with patch.object(my_server.mcp, "run") as run, pytest.raises(SystemExit, match="HTTP transport"):
+        my_server.main()
+    run.assert_not_called()

@@ -20,6 +20,8 @@ GATES = ("FITNESSE_TOOLSETS",)
 
 
 def _reload(**env):
+    for name in [n for n in vars(my_server) if n.startswith("fitnesse_debug_")]:
+        delattr(my_server, name)  # reload keeps old attributes; registration is what's tested
     for key in GATES:
         os.environ.pop(key, None)
     os.environ.update({"FITNESSE_TOOLSETS": "read,write,test,debug", **env})
@@ -123,6 +125,66 @@ def test_tables_text_marks_status_and_cuts_long_cells():
     assert "chars cut]" in text and "Table 1:" in text
 
 
+PNG = b"\x89PNG\r\n\x1a\nfake"
+PNG_SRC = "data:image/png;base64," + __import__("base64").b64encode(PNG).decode()
+MEDIA_HTML = (
+    '<p>see <a href="/FrontPage.Help">help</a></p>'
+    '<table><tr><td>take screenshot</td><td class="pass">ok <img src="' + PNG_SRC + '" alt="shot"></td></tr>'
+    '<tr><td><a href="http://ci/report">report</a></td><td><a href="javascript:void(0)">x</a>'
+    '<img src="/files/images/collapsableOpen.gif"><img src="/files/shots/s.png"></td></tr></table>'
+    '<div class="collapsible closed"><p class="title">show after</p>'
+    '<div>log line 1<br>line 2<div>nested</div></div></div>'
+    '<div class="other">not a folding area</div>'
+)
+
+
+def test_tables_text_lists_images_links_and_folding_areas():
+    text = my_server._tables_text(MEDIA_HTML)
+    assert text.startswith("Before the first table – link: help -> /FrontPage.Help")
+    assert "| take screenshot | [pass] ok [image 1] |" in text
+    assert "Table 0 – link in row 2, column 1: report -> http://ci/report" in text
+    assert "javascript" not in text and "collapsable" not in text
+    assert "Table 0 – image 2 in row 2, column 2: /files/shots/s.png" in text
+    assert "Table 0 – after: show after:\n  log line 1\n  line 2\n  nested" in text
+    assert "not a folding area" not in text
+    assert "data:image" not in text
+
+
+async def _call_content(tool, args, *answers):
+    fake = FakeFitNesse(*answers)
+    with patch("urllib.request.urlopen", side_effect=fake):
+        async with Client(my_server.mcp) as c:
+            return await c.call_tool(tool, args)
+
+
+@pytest.mark.asyncio
+async def test_run_wiki_attaches_inline_images(debug_env):
+    await _start()
+    result = await _call_content(
+        "fitnesse_debug_run_wiki", {"wiki": "|take screenshot|"}, (200, {"html": MEDIA_HTML, "counts": {}}),
+    )
+    assert [c.type for c in result.content] == ["text", "image"]
+    assert __import__("base64").b64decode(result.content[1].data) == PNG
+    assert result.content[1].mime_type == "image/png"
+    assert result.structured_content["images"] == [{"image": 1, "format": "png", "content": 1}]
+    assert json.loads(result.content[0].text) == result.structured_content
+    assert "_images" not in result.structured_content
+
+
+@pytest.mark.asyncio
+async def test_run_wiki_caps_images_and_keeps_plain_result_without_them(debug_env):
+    await _start()
+    html = "<table><tr>" + ('<td><img src="' + PNG_SRC + '"></td>') * 5 + '<td><img src="data:image/png;base64,!!"></td></tr></table>'
+    result = await _call_content("fitnesse_debug_run_wiki", {"wiki": "|x|"}, (200, {"html": html, "counts": {}}))
+    assert [c.type for c in result.content] == ["text"] + ["image"] * my_server.DEBUG_MAX_IMAGES
+    images = result.structured_content["images"]
+    assert [i.get("content") for i in images[:4]] == [1, 2, 3, 4]
+    assert "omitted" in images[4] and images[5]["omitted"] == "invalid base64"
+
+    result = await _call_content("fitnesse_debug_run_wiki", {"wiki": "|x|"}, (200, {"html": RESULT_HTML, "counts": {}}))
+    assert [c.type for c in result.content] == ["text"] and "images" not in result.structured_content
+
+
 @pytest.mark.asyncio
 async def test_debug_tools_hidden_by_default():
     previous = {k: os.environ.get(k) for k in GATES}
@@ -142,8 +204,9 @@ async def test_debug_tools_hidden_by_default():
             names = {t.name for t in await c.list_tools()}
         assert not any(n.startswith(("fitnesse_debug_", "fitnesse_table_")) for n in names)
         debug = {"read": {"fitnesse_debug_status", "fitnesse_debug_page_tables", "fitnesse_debug_inspect",
-                          "fitnesse_table_source"},
-                 "write": {"fitnesse_table_save", "fitnesse_table_insert", "fitnesse_table_delete"},
+                          "fitnesse_debug_defined_action_source", "fitnesse_table_source"},
+                 "write": {"fitnesse_table_save", "fitnesse_table_insert", "fitnesse_table_delete",
+                           "fitnesse_table_move", "fitnesse_table_save_text", "fitnesse_table_move_text"},
                  "test": {"fitnesse_debug_start", "fitnesse_debug_run_wiki", "fitnesse_debug_run_page",
                           "fitnesse_debug_end"}}
         for toolsets, modes in (("read,debug", {"read"}), ("write,debug", {"write"}),
@@ -196,6 +259,74 @@ async def test_start_replace_and_session_forwarded(debug_env):
     assert data["page_totals"]["wrong"] == 1 and "html" not in data
 
 
+def _entry(session, page, **extra):
+    return {"session": session, "page": page, "suite": False, "busy": False, "startedAt": 1, **extra}
+
+
+@pytest.mark.asyncio
+async def test_start_with_several_sessions_per_account(debug_env):
+    # mod #159: one session per page and account; others' sessions elsewhere don't matter
+    browser = _entry("b1", "Other.Page")
+    data, fake = await _call(
+        "fitnesse_debug_start", {"page_path": ".FrontPage.T"},
+        (200, {"running": True, "sessions": [browser], **browser}),  # the only one: status describes it
+        (200, {"started": True, "page": "FrontPage.T", "session": "s1"}),
+    )
+    assert fake.actions == ["status", "start"] and data["session"] == "s1"
+
+    # this server's own session: keep using it here, end it before going elsewhere
+    with pytest.raises(ToolError, match="already running on FrontPage.T: keep using it"):
+        await _call("fitnesse_debug_start", {"page_path": "FrontPage.T"},
+                    (200, {"running": True, "sessions": [browser, _entry("s1", "FrontPage.T")]}))
+    with pytest.raises(ToolError, match="still running on FrontPage.T"):
+        await _call("fitnesse_debug_start", {"page_path": "Third"},
+                    (200, {"running": False, "sessions": [browser, _entry("s1", "FrontPage.T")]}))
+    await _call("fitnesse_debug_end", {}, (200, {"ended": True, "html": "", "counts": {}}))
+
+    # someone's session on the same page: refused, with how to adopt it
+    with pytest.raises(ToolError, match=r"already running on Other.Page.*adopt=true, session='b1'"):
+        await _call("fitnesse_debug_start", {"page_path": "Other.Page"},
+                    (200, {"running": True, "sessions": [browser], **browser}))
+    _, fake = await _call(
+        "fitnesse_debug_start", {"page_path": "Other.Page", "replace": True},
+        (200, {"running": True, "sessions": [browser], **browser}),
+        (200, {"started": True, "page": "Other.Page", "session": "s2"}),
+    )
+    assert fake.actions == ["status", "start"]
+
+
+@pytest.mark.asyncio
+async def test_status_lists_and_adopts_one_of_several_sessions(debug_env):
+    sessions = [_entry("b1", "A"), _entry("b2", "B", suite=True)]
+    data, _ = await _call("fitnesse_debug_status", {"max_log_lines": 0}, (200, {"running": False, "sessions": sessions}))
+    assert data["known_to_this_server"] is False and [s["session"] for s in data["sessions"]] == ["b1", "b2"]
+    with pytest.raises(ToolError, match="Several debug sessions.*b1 on A, b2 on B"):
+        await _call("fitnesse_debug_status", {"adopt": True}, (200, {"running": False, "sessions": sessions}))
+    with pytest.raises(ToolError, match="No running debug session x"):
+        await _call("fitnesse_debug_status", {"adopt": True, "session": "x"}, (200, {"running": False, "sessions": sessions}))
+    data, _ = await _call("fitnesse_debug_status", {"adopt": True, "session": "b2", "max_log_lines": 0},
+                          (200, {"running": False, "sessions": sessions}))
+    assert data["known_to_this_server"] is True
+    _, fake = await _call("fitnesse_debug_run_wiki", {"wiki": "|x|"}, (200, {"html": "", "counts": {}}))
+    assert fake.requests[0]["form"]["session"] == "b2" and "/B?responder" in fake.requests[0]["url"]
+    # known by id even when status describes another page's session
+    data, _ = await _call("fitnesse_debug_status", {"page_path": "A", "max_log_lines": 0},
+                          (200, {"running": True, "sessions": sessions, **sessions[0]}))
+    assert data["known_to_this_server"] is True
+
+
+@pytest.mark.asyncio
+async def test_session_codes_of_mod_159_have_hints(debug_env):
+    await _start()
+    with pytest.raises(ToolError, match="sessionRequired.*fitnesse_debug_status lists them"):
+        await _call("fitnesse_debug_inspect", {"kind": "scope"},
+                    (409, {"code": "sessionRequired", "error": "Several debug sessions are running"}))
+    with pytest.raises(ToolError, match="tooManySessions.*maxSessionsPerUser"):
+        await _call("fitnesse_debug_start", {"page_path": "P", "replace": True},
+                    (200, {"running": False, "sessions": []}),
+                    (429, {"code": "tooManySessions", "error": "Too many debug sessions"}))
+
+
 @pytest.mark.asyncio
 async def test_replaced_session_is_forgotten(debug_env):
     await _start()
@@ -231,6 +362,33 @@ async def test_state_queries_parsed(debug_env):
     assert "secret" not in json.dumps(data)
 
 
+FAILING_HTML = (
+    "<table><tr><td class=\"pass\">ok</td></tr></table>"
+    "<table><tr><td>check</td><td class=\"fail\">1 expected 2</td></tr></table>"
+    "<table><tr><td class=\"pass\">ok too</td></tr></table>"
+    "<table><tr><td class=\"error\">boom</td></tr></table>"
+)
+
+
+@pytest.mark.asyncio
+async def test_run_page_only_failures(debug_env):
+    await _start()
+    data, _ = await _call(
+        "fitnesse_debug_run_page", {"only_failures": True},
+        (200, {"page": "FrontPage.T", "html": FAILING_HTML}),
+        (200, {"html": FAILING_HTML, "counts": {"right": 2, "wrong": 1, "exceptions": 1}}),
+    )
+    assert "Table 1:" in data["tables"] and "Table 3:" in data["tables"]  # usual numbers
+    assert "Table 0:" not in data["tables"] and "Table 2:" not in data["tables"]
+    assert data["tables_without_failures"] == 2 and data["counts"]["wrong"] == 1
+    data, _ = await _call(
+        "fitnesse_debug_run_page", {},
+        (200, {"page": "FrontPage.T", "html": FAILING_HTML}),
+        (200, {"html": FAILING_HTML, "counts": {}}),
+    )
+    assert "Table 0:" in data["tables"] and "tables_without_failures" not in data
+
+
 @pytest.mark.asyncio
 async def test_keywords_filter(debug_env):
     await _start()
@@ -240,7 +398,7 @@ async def test_keywords_filter(debug_env):
     ]}]
     html = "<table><tr><td>keywordsJson</td><td>" + json.dumps(kw).replace("&", "&amp;").replace("<", "&lt;") + "</td><td>[]</td></tr></table>"
     data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords"}, (200, {"html": html, "counts": {}}))
-    assert data == {"count": 2, "categories": {"Browser": ["with browser", "click %1"]}}
+    assert data["count"] == 2 and data["categories"] == {"Browser": 2} and "filter" in data["hint"]
     data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords", "filter": "LOCATOR"}, (200, {"html": html, "counts": {}}))
     assert data["matches"] == 1 and data["keywords"][0]["syntax"] == "click %1"
 
@@ -327,12 +485,34 @@ async def test_start_suite_lists_pages(debug_env):
     assert data["pages"][0]["path"] == "S.A"
 
 
+# As debugTable action=source answers, and since mod #157 every edit as 'source'.
+SOURCE = {"tables": ["|note|hello2|"], "texts": ["Scratch\n\n", "\n"], "page": "DebugScratch"}
+
+
+@pytest.mark.asyncio
+async def test_table_edits_return_the_page_after_the_change(debug_env):
+    args = {"page_path": "DebugScratch", "index": 0, "original": "|note|hello|", "wiki": "|note|hello2|"}
+    data, fake = await _call("fitnesse_table_save", args, (200, {"index": 0, "wiki": "|note|hello2|", "source": SOURCE}))
+    assert fake.actions == ["save"]  # mod #157: no second request
+    assert data["source"] == SOURCE
+
+    data, fake = await _call("fitnesse_table_save", args, (200, {"index": 0, "wiki": "|note|hello2|"}), (200, SOURCE))
+    assert fake.actions == ["save", "source"]  # older mod: read here
+    assert data["source"] == SOURCE and "hint" not in data
+
+    data, fake = await _call("fitnesse_table_delete", {"page_path": "P", "index": 0, "original": "o"},
+                             (200, {"index": 0}), (500, {"error": "boom"}))
+    assert fake.actions == ["delete", "source"]
+    assert "source" not in data and "Saved, but reading the page again failed" in data["hint"]
+
+
 @pytest.mark.asyncio
 async def test_table_save_block_and_conflict(debug_env):
     _, fake = await _call(
         "fitnesse_table_save", {"page_path": "P", "index": 1, "last": 2, "original": "o", "wiki": "w"},
-        (200, {"index": 1, "wiki": "w", "html": ""}),
+        (200, {"index": 1, "wiki": "w", "html": "", "source": SOURCE}),
     )
+    assert fake.actions == ["saveBlock"]
     assert fake.requests[0]["form"] == {"action": "saveBlock", "index": "1", "last": "2", "original": "o", "wiki": "w"}
     assert "responder=debugTable" in fake.requests[0]["url"]
     with pytest.raises(ToolError, match="page changed"):
@@ -340,6 +520,353 @@ async def test_table_save_block_and_conflict(debug_env):
             "fitnesse_table_delete", {"page_path": "P", "index": 0, "original": "o"},
             (409, {"error": "Page was modified"}),
         )
+
+
+def _defined_row(wiki, note, author, page, overrides=""):
+    wiki = wiki.replace("<", "&lt;").replace(">", "&gt;")
+    return f"<tr><td>defined</td><td>{wiki}</td><td>{note}</td><td>{author}</td><td>{page}</td><td>{overrides}</td></tr>"
+
+
+# As the keywords action answers (shape taken from a live session): header, scope keywords, defined actions.
+KEYWORDS_HTML = (
+    "<table><tr><td>keywords</td><td>wiki</td><td>tooltip</td></tr>"
+    "<tr><td>simple</td><td>|''&lt;i&gt;to&lt;/i&gt;''|string|</td><td>Returns the string</td></tr>"
+    + _defined_row("|''<i>click by js</i>''|locator|", "Clicks a web element by js", "Dominik", "Training.DS.Modules")
+    + _defined_row("|''<i>start with url</i>''|url|''<i>and login with</i>''|credentials|",
+                   "Deprecated. Opens login page", "Vojislav", ".Lib.Login", ".Old.Login")
+    + "</table>"
+)
+EMPTY_KEYWORDS_HTML = KEYWORDS_HTML.split("<tr><td>defined")[0] + "</table>"
+
+
+def test_defined_actions_parsed_from_keywords_answer():
+    click, login = my_server._defined_actions(KEYWORDS_HTML)
+    assert click == {
+        "action": "|click by js|locator|", "keywords": ["click by js"], "parameters": ["locator"],
+        "note": "Clicks a web element by js", "deprecated": False, "author": "Dominik",
+        "page": "Training.DS.Modules", "overrides": [],
+    }
+    assert login["action"] == "|start with url|url|and login with|credentials|"
+    assert login["keywords"] == ["start with url", "and login with"]
+    assert login["deprecated"] and login["page"] == "Lib.Login" and login["overrides"] == ["Old.Login"]
+
+
+@pytest.mark.asyncio
+async def test_inspect_defined_actions(debug_env):
+    await _start()
+    data, fake = await _call("fitnesse_debug_inspect", {"kind": "definedActions", "filter": "LOGIN"},
+                             OLD_MOD, (200, {"html": KEYWORDS_HTML, "counts": {}}))
+    assert fake.actions == ["definedActions", "keywords"]  # older mod: parsed from the keywords HTML
+    assert data["count"] == 2 and data["matches"] == 1
+    assert data["definedActions"][0]["page"] == "Lib.Login"
+    data, _ = await _call("fitnesse_debug_inspect", {"kind": "definedActions"},
+                          OLD_MOD, (200, {"html": EMPTY_KEYWORDS_HTML, "counts": {}}))
+    assert data["definedActions"] == [] and "define actions at" in data["hint"]
+
+
+UNKNOWN_ACTION = (400, {"error": "Unknown action 'definedAction'; expected source, delete, insert, move, moveText, save, saveBlock, saveText."})
+# a mod before #156: debugTest has no definedActions and answers 400 without a code
+OLD_MOD = (400, {"error": "Unknown action 'definedActions'"})
+
+
+@pytest.mark.asyncio
+async def test_inspect_defined_actions_from_the_json(debug_env):
+    await _start()
+    entry = {"action": "|greet|name|", "page": ".Lib.Js", "overrides": [".Old.Js"], "note": "says hi",
+             "author": "ds", "deprecated": True}
+    data, fake = await _call("fitnesse_debug_inspect", {"kind": "definedActions"}, (200, {"definedActions": [entry]}))
+    assert fake.actions == ["definedActions"] and fake.requests[0]["form"]["session"] == "s1"
+    assert data["definedActions"] == [{
+        "action": "|greet|name|", "keywords": ["greet"], "parameters": ["name"], "note": "says hi",
+        "deprecated": True, "author": "ds", "page": "Lib.Js", "overrides": ["Old.Js"],
+    }]
+    # unknownAction (mod #156 and later) also falls back to the keywords HTML
+    data, fake = await _call("fitnesse_debug_inspect", {"kind": "definedActions"},
+                             (400, {"error": "Unknown action", "code": "unknownAction"}),
+                             (200, {"html": KEYWORDS_HTML, "counts": {}}))
+    assert fake.actions == ["definedActions", "keywords"] and data["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_changed_definition_says_how_to_reload_it(debug_env):
+    await _start()
+    with pytest.raises(ToolError, match=r"older version of \.Lib\.Js: run fitnesse_debug_run_wiki\('\|define actions at\|\.Lib\.Js\|'\).*reload_defined_actions=true.*defined_action_source again"):
+        await _call("fitnesse_debug_defined_action_source", {"action": "|greet|bob|"},
+                    (409, {"error": "Lib.Js changed; run |define actions at|.Lib.Js|", "code": "changed", "page": "Lib.Js"}))
+    # a save conflict has no code: read the source again
+    with pytest.raises(ToolError, match="Read fitnesse_table_source again"):
+        await _call("fitnesse_table_save", {"page_path": "P", "index": 0, "original": "o", "wiki": "w"},
+                    (409, {"error": "The page has been changed in the meantime; reload it to edit the current version"}))
+
+
+# Two defined actions separated by ----; the second's body repeats the first's header (doesn't count).
+DEFINITIONS_SOURCE = {
+    "tables": ["|click by js|locator|\n", "|run script|...|\n", "|start with url|url|and login with|credentials|\n",
+               "|click by js|//login|\n", "|check|logged in|\n"],
+    "texts": ["", "\n", "\n----\n", "\n!3 body\n", "\n", "\n"],
+}
+
+
+def test_definition_block_follows_fitlibrary_rules():
+    click, login = my_server._defined_actions(KEYWORDS_HTML)
+    assert my_server._definition_block(DEFINITIONS_SOURCE, click) == {
+        "index": 0, "last": 1, "original": "|click by js|locator|\n\n|run script|...|\n",
+    }
+    block = my_server._definition_block(DEFINITIONS_SOURCE, login)
+    assert (block["index"], block["last"]) == (2, 4)
+    assert block["original"].startswith("|start with url|") and "!3 body" in block["original"]
+
+    single = {"tables": ["|click by js|locator|\n"], "texts": ["", ""]}
+    assert my_server._definition_block(single, click)["last"] is None
+    twice = {"tables": ["|click by js|locator|\n", "|click by js|x|\n"], "texts": ["", "\n----\n", ""]}
+    with pytest.raises(ToolError, match="2 times"):
+        my_server._definition_block(twice, click)
+    with pytest.raises(ToolError, match="No definition"):
+        my_server._definition_block({"tables": ["|other|\n"], "texts": ["", ""]}, click)
+
+
+@pytest.mark.asyncio
+async def test_defined_action_source_reads_defining_page_fresh(debug_env):
+    await _start()
+    data, fake = await _call(
+        "fitnesse_debug_defined_action_source", {"action": "start with url and login with"},
+        OLD_MOD,
+        (200, {"html": KEYWORDS_HTML, "counts": {}}),
+        UNKNOWN_ACTION,
+        (200, DEFINITIONS_SOURCE),
+    )
+    assert fake.actions == ["definedActions", "keywords", "definedAction", "source"]  # bare keywords -> call row first
+    assert fake.requests[2]["form"]["name"] == "|start with url|url|and login with|credentials|"
+    assert "/Lib.Login?responder=debugTable" in fake.requests[3]["url"]
+    assert (data["page"], data["index"], data["last"]) == ("Lib.Login", 2, 4)
+    with pytest.raises(ToolError, match="not among"):
+        await _call("fitnesse_debug_defined_action_source", {"action": "|nope|"},
+                    UNKNOWN_ACTION, OLD_MOD, (200, {"html": KEYWORDS_HTML, "counts": {}}))
+    with pytest.raises(ToolError, match="No defined actions loaded"):
+        await _call("fitnesse_debug_defined_action_source", {"action": "x"},
+                    OLD_MOD, (200, {"html": EMPTY_KEYWORDS_HTML, "counts": {}}))
+
+
+@pytest.mark.asyncio
+async def test_defined_action_source_from_the_fork(debug_env):
+    block = {"action": "|''<i>greet</i>''|name|", "page": ".Lib.Js", "index": 3, "last": 4, "original": "o"}
+    with pytest.raises(ToolError, match="no debug session"):
+        await _call("fitnesse_debug_defined_action_source", {"action": "|greet|bob|"})
+    await _start()
+    data, fake = await _call("fitnesse_debug_defined_action_source", {"action": "|greet|bob|"}, (200, block))
+    assert fake.requests[0]["form"] == {"action": "definedAction", "name": "|greet|bob|", "session": "s1"}
+    assert "/FrontPage.T?responder=debugTable" in fake.requests[0]["url"]
+    assert data == {"action": "|greet|name|", "page": "Lib.Js", "index": 3, "last": 4, "original": "o"}
+    with pytest.raises(ToolError, match="notLoaded.*number of\narguments|notLoaded"):
+        await _call("fitnesse_debug_defined_action_source", {"action": "|greet|}"},
+                    (404, {"error": "No defined action for |greet|", "code": "notLoaded"}))
+    with pytest.raises(ToolError, match="define action\\| table"):
+        await _call("fitnesse_debug_defined_action_source", {"action": "|inline|"},
+                    (404, {"error": "Defined in a table", "code": "unknownPlace"}))
+    # a test process with an older FitLibrary: the fork says unsupported, the MCP cuts the block itself
+    data, fake = await _call(
+        "fitnesse_debug_defined_action_source", {"action": "|click by js|x|"},
+        (501, {"error": "Test process too old", "code": "unsupported"}),
+        OLD_MOD,
+        (200, {"html": KEYWORDS_HTML, "counts": {}}),
+        (200, {"tables": ["|click by js|locator|\n"], "texts": ["", ""]}),
+    )
+    assert fake.actions == ["definedAction", "definedActions", "keywords", "source"]
+    assert (data["page"], data["index"], data["last"]) == ("Training.DS.Modules", 0, None)
+
+
+@pytest.mark.asyncio
+async def test_defined_action_source_by_page_without_session(debug_env):
+    data, fake = await _call(
+        "fitnesse_debug_defined_action_source",
+        {"action": "|start with url|url|and login with|credentials|", "page_path": "Lib.Login"},
+        (200, DEFINITIONS_SOURCE),
+    )
+    assert fake.actions == ["source"]  # the fork's definedAction needs a session
+    assert (data["index"], data["last"]) == (2, 4)
+
+
+@pytest.mark.asyncio
+async def test_table_save_reloads_defined_actions(debug_env):
+    args = {"page_path": "Lib.Login", "index": 2, "last": 4, "original": "o", "wiki": "w",
+            "reload_defined_actions": True}
+    data, fake = await _call("fitnesse_table_save", args, (200, {"index": 2, "wiki": "w"}), (200, SOURCE))
+    assert fake.actions == ["saveBlock", "source"]  # no session: saved only
+    assert data["reload"]["reloaded"] is False and "saved only" in data["reload"]["reason"]
+
+    await _start()
+    data, fake = await _call(
+        "fitnesse_table_save", args,
+        (200, {"index": 2, "wiki": "w"}),
+        (200, SOURCE),
+        (200, {"html": "<table><tr><td>define actions at</td></tr></table>", "counts": {"right": 0, "wrong": 0}}),
+        OLD_MOD,
+        (200, {"html": KEYWORDS_HTML, "counts": {}}),
+    )
+    assert fake.actions == ["saveBlock", "source", "runWiki", "definedActions", "keywords"]
+    assert fake.requests[2]["form"]["wiki"] == "|define actions at|.Lib.Login|"
+    assert data["reload"]["reloaded"] is True
+    assert [a["action"] for a in data["reload"]["definedActions"]] == ["|start with url|url|and login with|credentials|"]
+
+    data, _ = await _call(
+        "fitnesse_table_save", args,
+        (200, {"index": 2, "wiki": "w"}),
+        (200, SOURCE),
+        (500, {"error": "boom"}),
+    )
+    assert data["reload"]["reloaded"] is False and "Saved, but reloading failed" in data["reload"]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_table_save_and_insert_let_the_fork_reload(debug_env):
+    await _start()
+    data, fake = await _call(
+        "fitnesse_table_save",
+        {"page_path": "Lib.Login", "index": 2, "last": 4, "original": "o", "wiki": "w", "reload_defined_actions": True},
+        (200, {"index": 2, "wiki": "w", "reloaded": True, "reloadHtml": "<table></table>", "reloadCounts": {},
+               "keywords": "<table>big</table>",
+               "definedActions": [{"action": "|''<i>a</i>''|x|", "page": ".Lib.Login", "overrides": []},
+                                  {"action": "|c|", "page": "Lib.Login", "overrides": [], "note": "old",
+                                   "author": "ds", "deprecated": True},
+                                  {"action": "|b|", "page": "Other", "overrides": []}],
+               "source": SOURCE}),
+    )
+    assert fake.actions == ["saveBlock"]
+    assert fake.requests[0]["form"]["reload"] == "true" and fake.requests[0]["form"]["session"] == "s1"
+    assert data == {"index": 2, "wiki": "w", "source": SOURCE, "reload": {"reloaded": True, "definedActions": [
+        {"action": "|a|x|"}, {"action": "|c|", "note": "old", "author": "ds", "deprecated": True}]}}
+    data, fake = await _call(
+        "fitnesse_table_insert",
+        {"page_path": "Lib.Login", "index": 5, "before": "", "wiki": "|new action|\n", "reload_defined_actions": True},
+        (200, {"added": 1, "html": "<table><tr><td>new action</td></tr></table>", "reloaded": False,
+               "error": "busy", "code": "busy", "source": SOURCE}),
+    )
+    assert fake.actions == ["insert"]  # code/error in a 200 answer: saved, only the reload failed
+    assert fake.requests[0]["form"]["start"] == "false" and fake.requests[0]["form"]["before"] == ""
+    assert data["reload"] == {"reloaded": False, "error": "busy", "code": "busy"}
+    assert "new action" in data["tables"] and "html" not in data and data["source"] == SOURCE
+
+
+@pytest.mark.asyncio
+async def test_reload_by_the_fork_sends_the_session_cookie(debug_env):
+    # found live on 8091: without the cookie the fork answers reloaded=false, code=noSession
+    await _call(
+        "fitnesse_debug_start", {"page_path": "FrontPage.T"},
+        (200, {"running": False}),
+        (200, {"started": True, "page": "FrontPage.T", "session": "s1"}, "application/json",
+         ["debugTestSession=abc; Path=/; HttpOnly"]),
+    )
+    args = {"page_path": "Lib.Login", "index": 0, "original": "o", "wiki": "w"}
+    _, fake = await _call("fitnesse_table_save", {**args, "reload_defined_actions": True},
+                          (200, {"index": 0, "reloaded": True, "definedActions": [], "source": SOURCE}))
+    assert fake.requests[0]["headers"].get("Cookie") == "debugTestSession=abc"
+    _, fake = await _call("fitnesse_table_save", args, (200, {"index": 0, "source": SOURCE}))
+    assert "Cookie" not in fake.requests[0]["headers"]  # a plain edit stays outside the session
+
+
+@pytest.mark.asyncio
+async def test_move_save_text_and_move_text_forms(debug_env):
+    _, fake = await _call("fitnesse_table_move", {"page_path": "P", "index": 0, "original": "t", "to": 3, "start": True},
+                          (200, {"ok": True, "source": SOURCE}))
+    assert fake.requests[0]["form"] == {"action": "move", "index": "0", "original": "t", "to": "3", "start": "true"}
+    data, fake = await _call("fitnesse_table_save_text", {"page_path": "P", "index": 1, "original": "a", "wiki": "b\n|x|\n"},
+                             (200, {"added": 1, "html": "<table><tr><td>x</td></tr></table>", "source": SOURCE}))
+    assert fake.requests[0]["form"] == {"action": "saveText", "index": "1", "original": "a", "wiki": "b\n|x|\n"}
+    assert data["added"] == 1 and "| x |" in data["tables"]
+    _, fake = await _call("fitnesse_table_move_text",
+                          {"page_path": "P", "index": 1, "original": "a", "to": 3, "to_original": "c"},
+                          (200, {}), (200, SOURCE))
+    assert fake.requests[0]["form"] == {"action": "moveText", "index": "1", "original": "a", "to": "3",
+                                        "toOriginal": "c", "start": "false"}
+
+
+INCLUDE_PAGE_HTML = (
+    '<div class="collapsible closed"><p class="title">Set Up: <a href="/Lib.SetUp">.Lib.SetUp</a>'
+    ' <a href="/Lib.SetUp?edit&amp;redirectToReferer=true" class="edit">(edit)</a></p>'
+    '<div><table><tr><td>start browser</td></tr></table>'
+    '<div class="collapsible"><p class="title">Included page: <a class="edit" href="/Lib.Login?edit">edit</a></p>'
+    '<div><table><tr><td>login</td></tr></table></div></div>'
+    '<table><tr><td>after include</td></tr></table></div></div>'
+    '<table><tr><td>own 0</td></tr></table><table><tr><td>own 1</td></tr></table>'
+)
+
+
+@pytest.mark.asyncio
+async def test_page_tables_name_the_page_a_table_is_edited_on(debug_env):
+    await _start()
+    data, _ = await _call("fitnesse_debug_page_tables", {}, (200, {"html": INCLUDE_PAGE_HTML}))
+    assert [(t["first_row"], t["source_page"], t["source_index"], t.get("included", False)) for t in data["tables"]] == [
+        ("start browser", "Lib.SetUp", 0, True), ("login", "Lib.Login", 0, True),
+        ("after include", "Lib.SetUp", 1, True), ("own 0", "FrontPage.T", 0, False), ("own 1", "FrontPage.T", 1, False),
+    ]
+    assert my_server._tables_text(INCLUDE_PAGE_HTML).count("after:") == 0  # includes are no folding areas
+    assert data["setup_tables"] == [0, 1, 2]
+
+
+TEARDOWN_HTML = (
+    '<div class="collapsible"><p class="title"><a class="edit" href="/Lib.SetUp?edit">edit</a></p>'
+    '<div><table><tr><td>setup</td></tr></table></div></div>'
+    '<table><tr><td>own</td></tr></table>'
+    '<div class="collapsible"><p class="title"><a class="edit" href="/Lib.TearDown?edit">edit</a></p>'
+    '<div><table><tr><td>teardown</td></tr></table></div></div>'
+)
+
+
+def test_setup_indices_stop_at_the_page_and_skip_teardown():
+    assert my_server._setup_indices(my_server._parse_tables(TEARDOWN_HTML)) == [0]
+    assert my_server._setup_indices(my_server._parse_tables(INCLUDE_PAGE_HTML)) == [0, 1, 2]
+    only_teardown = TEARDOWN_HTML.split("<table><tr><td>own</td></tr></table>")[1]
+    assert my_server._setup_indices(my_server._parse_tables(only_teardown)) == []
+    assert my_server._setup_indices(my_server._parse_tables("<table><tr><td>own</td></tr></table>")) == []
+
+
+@pytest.mark.asyncio
+async def test_run_page_setup_only_runs_the_setup_tables(debug_env):
+    await _start()
+    data, fake = await _call(
+        "fitnesse_debug_run_page", {"setup_only": True},
+        (200, {"page": "FrontPage.T", "html": TEARDOWN_HTML}),
+        (200, {"html": "<table><tr><td class=\"pass\">setup</td></tr></table>", "counts": {"right": 1}}),
+    )
+    assert fake.actions == ["pageHtml", "runTable"]
+    assert fake.requests[1]["form"]["html"] == "<table><tr><td>setup</td></tr></table>"
+    assert "[pass] setup" in data["tables"]
+
+    data, fake = await _call(
+        "fitnesse_debug_run_page", {"setup_only": True},
+        (200, {"page": "FrontPage.T", "html": "<table><tr><td>own</td></tr></table>"}),
+    )
+    assert fake.actions == ["pageHtml"]
+    assert data["setup_tables"] == [] and "no SetUp" in data["hint"]
+
+
+@pytest.mark.asyncio
+async def test_run_page_setup_only_excludes_tables(debug_env):
+    await _start()
+    with pytest.raises(ToolError, match="either setup_only"):
+        await _call("fitnesse_debug_run_page", {"setup_only": True, "tables": [0]})
+
+
+def test_debug_without_read_or_test_warns_at_startup(caplog):
+    previous = {k: os.environ.get(k) for k in GATES}
+    try:
+        for toolsets, missing in (("read,debug", "test"), ("test,write,debug", "read"), ("write,debug", "read and test"),
+                                  ("read,test,debug", None), ("all", None)):
+            caplog.clear()
+            with caplog.at_level("WARNING", logger="fitnesse_mcp"):
+                _reload(FITNESSE_TOOLSETS=toolsets)
+            warned = [r.getMessage() for r in caplog.records if "debug without" in r.getMessage()]
+            if missing:
+                assert len(warned) == 1 and f"debug without {missing}:" in warned[0], toolsets
+            else:
+                assert not warned, toolsets
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        importlib.reload(my_server)
 
 
 @pytest.mark.asyncio
@@ -373,3 +900,47 @@ async def test_debug_instructions_sent_only_with_visible_debug_tools():
             else:
                 os.environ[key] = value
         importlib.reload(my_server)
+
+
+def _include(page, inner, cls="collapsible"):
+    return (f'<div class="{cls}"><p class="title">Included page: <a class="edit" href="/{page}?edit">edit</a></p>'
+            f'<div>{inner}</div></div>')
+
+
+def _t(text):
+    return f"<table><tr><td>{text}</td></tr></table>"
+
+
+SETUP_NESTED_HTML = (
+    _include("Lib.SetUp", _t("open browser") + _include("Lib.Defs", _t("define actions at")))
+    + _include("Shared.Login", _t("login"))
+    + _t("own")
+    + _include("Lib.TearDown", _t("close"), "collapsible teardown")
+)
+
+
+def test_setup_is_the_setup_page_with_what_it_includes_not_a_plain_include():
+    assert my_server._setup_indices(my_server._parse_tables(SETUP_NESTED_HTML)) == [0, 1]
+    only_include = _include("Shared.Login", _t("login"))
+    assert my_server._setup_indices(my_server._parse_tables(only_include)) == []
+    assert my_server._setup_indices(my_server._parse_tables(_include("S.SuiteSetUp", _t("x")))) == [0]
+
+
+@pytest.mark.asyncio
+async def test_run_page_after_setup_only_leaves_the_setup_out_until_restart(debug_env):
+    await _start()
+    page = (200, {"page": "FrontPage.T", "html": SETUP_NESTED_HTML})
+    ran = (200, {"html": "", "counts": {}})
+    _, fake = await _call("fitnesse_debug_run_page", {"setup_only": True}, page, ran)
+    assert fake.requests[1]["form"]["html"] == _t("open browser") + "\n" + _t("define actions at")
+
+    data, fake = await _call("fitnesse_debug_run_page", {}, page, ran)
+    assert fake.actions == ["pageHtml", "runTable"]
+    assert data["skipped_setup"] == [0, 1]
+    assert fake.requests[1]["form"]["html"] == "\n".join([_t("login"), _t("own"), _t("close")])
+
+    data, fake = await _call("fitnesse_debug_run_page", {"restart": True},
+                             (200, {"html": "", "counts": {}, "page": "FrontPage.T"}), page, ran)
+    assert fake.actions == ["nextPage", "pageHtml", "runTable"]
+    assert "skipped_setup" not in data
+    assert fake.requests[2]["form"]["html"] == SETUP_NESTED_HTML  # the whole page again, SetUp included

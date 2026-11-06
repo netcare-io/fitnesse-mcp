@@ -57,6 +57,13 @@ that, and both are opt-in:
   `FITNESSE_ALLOW_ACCOUNT_ADMIN` is set. It changes passwords and, as the
   FitNesse admin user, creates or deletes users.
 
+- **The optional `X-FitNesse-Url` header is not checked** beyond being an
+  `http(s)` URL: over the HTTP transport, whoever can reach the MCP endpoint
+  can make the server call any host it can reach, including internal ones.
+  In `FITNESSE_AUTH_MODE=env` the server also sends its own FitNesse login
+  there. Expose an HTTP deployment only to people you trust with that, or use
+  `FITNESSE_AUTH_MODE=headers` so the only credentials sent are the caller's.
+
 Three further notes:
 
 - `fitnesse_list_files`, `fitnesse_create_dir`, `fitnesse_upload_file`,
@@ -78,8 +85,10 @@ Three further notes:
   argument — plain text via `content`, or base64-encoded bytes via
   `content_base64` — instead of a local file path.
 - Credentials in `claude_desktop_config.json` are stored in **cleartext**. For
-  shared machines, prefer the HTTP pattern below with the credentials in the
-  server's own environment.
+  shared machines, prefer an HTTP server (see [Running](#running)), either with
+  the credentials in its own environment or with `FITNESSE_AUTH_MODE=headers`,
+  where every user sends their own FitNesse login and FitNesse's page rights
+  apply per user.
 
 ---
 
@@ -87,9 +96,10 @@ Three further notes:
 
 | Variable | Default | Description |
 |---|---|---|
-| `FITNESSE_BASE_URL` | `http://localhost:8080` | FitNesse server base URL |
-| `FITNESSE_USERNAME` | _(none)_ | Basic Auth username |
-| `FITNESSE_PASSWORD` | _(none)_ | Basic Auth password |
+| `FITNESSE_BASE_URL` | `http://localhost:8080` | FitNesse server base URL. Over HTTP a request can name another instance in the optional `X-FitNesse-Url` header (see [Security](#security)) |
+| `FITNESSE_AUTH_MODE` | `env` | `env`: every call uses `FITNESSE_USERNAME` / `FITNESSE_PASSWORD`. `headers`: every HTTP request brings its own FitNesse login in `X-FitNesse-Username` / `X-FitNesse-Password`; the env pair is ignored and a request without them fails. HTTP transport only |
+| `FITNESSE_USERNAME` | _(none)_ | Basic Auth username (`env` mode) |
+| `FITNESSE_PASSWORD` | _(none)_ | Basic Auth password (`env` mode) |
 | `FITNESSE_TOOLSETS` | **required** | Comma-separated toolsets. `all` = `read,write,test` (every mode, no area); `all,debug,complete` grants everything. **Modes** `read`, `write`, `test` (named after FitNesse's `secure-read`/`-write`/`-test`) filter every tool: `read` reads pages, history, and files; `write` changes pages and files (also `fitnesse_shutdown` / `fitnesse_save_account`, which still need their own flag); `test` runs and stops tests. **Areas** `debug` (KDTA debug tools, `fitnesse_debug_*` / `fitnesse_table_*`; needs netcare's FitNesse fork with the `debugTest`/`debugTable` responders) and `complete` (16 lower-traffic tools, marked below) add tools, which are still filtered by the modes: `read,debug` shows only the reading debug tools. A missing or empty value, an area without a mode, or an unknown value stops the server at startup |
 | `FITNESSE_ALLOW_SHUTDOWN` | `false` | `1`/`true`/`yes`/`on` exposes `fitnesse_shutdown` |
 | `FITNESSE_ALLOW_ACCOUNT_ADMIN` | `false` | `1`/`true`/`yes`/`on` exposes `fitnesse_save_account` |
@@ -212,20 +222,20 @@ resource root on your FitNesse instance to also expose `fitnesse_list_files`,
 `fitnesse_create_dir`, `fitnesse_upload_file`, `fitnesse_download_file`,
 `fitnesse_delete_file`, and `fitnesse_rename_file` (33 total), add `complete`
 to `FITNESSE_TOOLSETS` for 16 additional lower-traffic tools (49), `debug` for
-the 11 KDTA debug tools (60), `FITNESSE_ALLOW_SHUTDOWN=1` for
+the 15 KDTA debug tools (64), `FITNESSE_ALLOW_SHUTDOWN=1` for
 `fitnesse_shutdown`, and `FITNESSE_ALLOW_ACCOUNT_ADMIN=1` for
-`fitnesse_save_account` (62). The modes in `FITNESSE_TOOLSETS` filter all of
+`fitnesse_save_account` (66). The modes in `FITNESSE_TOOLSETS` filter all of
 these. Visible tools:
 
 | `FITNESSE_TOOLSETS` | no flags | + `FITNESSE_FILES_ROOT` | + `FITNESSE_FILES_ROOT`, `,complete` | + `,complete`, all flags |
 |---|---|---|---|---|
 | `read` | 12 | 14 | 29 | 29 |
-| `read,debug` | 16 | 18 | 33 | 33 |
+| `read,debug` | 17 | 19 | 34 | 34 |
 | `read,test` | 15 | 17 | 32 | 32 |
-| `read,test,debug` | 23 | 25 | 40 | 40 |
+| `read,test,debug` | 24 | 26 | 41 | 41 |
 | `read,write` | 24 | 30 | 46 | 48 |
 | `all` (= `read,write,test`) | 27 | 33 | 49 | 51 |
-| `all,debug` | 38 | 44 | 60 | 62 |
+| `all,debug` | 42 | 48 | 64 | 66 |
 
 `write` or `test` without `read` work too, but leave the model blind to what
 it changes or runs.
@@ -370,15 +380,16 @@ All need `debug` in `FITNESSE_TOOLSETS`, plus the listed mode.
 
 | Tool | Action | Mode |
 |---|---|---|
-| `fitnesse_debug_start` | `status`, then `start`; refuses if a session of the account runs, unless `replace`. With `suite`: also `suitePages` | test |
-| `fitnesse_debug_status` | `status` plus new `log` lines; `adopt` continues a running session | read |
+| `fitnesse_debug_start` | `status`, then `start`; refuses if a session of the account runs on the same page (forks before mod #159: anywhere), unless `replace`, and while this server's own session still runs. With `suite`: also `suitePages` | test |
+| `fitnesse_debug_status` | `status` plus new `log` lines; `sessions` lists all of the account's (mod #159); `adopt` continues a running session, with several the one named by `session` | read |
 | `fitnesse_debug_run_wiki` | `runWiki` — wiki tables in the context of the current page, no SetUp/TearDown; `restart` runs `nextPage` first | test |
-| `fitnesse_debug_page_tables` | `pageHtml`, split into tables | read |
-| `fitnesse_debug_run_page` | `nextPage` (on page change or `restart`), `pageHtml`, `runTable` | test |
-| `fitnesse_debug_inspect` | `keywordsJson` (filterable), `dynamicVariables`, `scope`, `liveView` (VNC password removed) | read |
+| `fitnesse_debug_page_tables` | `pageHtml`, split into tables; each with `source_page`/`source_index` for editing (tables of included pages live on that page) | read |
+| `fitnesse_debug_run_page` | `nextPage` (on page change or `restart`), `pageHtml`, `runTable`. `setup_only` runs just the SetUp tables; a later call without `tables` skips them (`skipped_setup`). `only_failures` returns only tables with `[fail]`/`[error]` | test |
+| `fitnesse_debug_inspect` | `keywordsJson` (without filter only the categories with their number of keywords; with filter the matching keywords in full), `definedActions` (the defined actions loaded by `define actions at`: `debugTest definedActions` as JSON, on older forks parsed from `keywords`; filterable), `dynamicVariables`, `scope`, `liveView` (VNC password removed) | read |
+| `fitnesse_debug_defined_action_source` | `debugTable definedAction` (with the session, or `page=` without one). Forks without it: page of the defined action from `keywords`, then `debugTable source` of that page, cut to the definition block as FitLibrary reads it (header first or after `----`, up to the next `----`; refuses a header found twice) | read |
 | `fitnesse_debug_end` | `end` or `abort`, with the unread log | test |
 | `fitnesse_table_source` | `debugTable source` | read |
-| `fitnesse_table_save`, `fitnesse_table_insert`, `fitnesse_table_delete` | `debugTable save`/`saveBlock`, `insert`, `delete` — saves the wiki page | write |
+| `fitnesse_table_save`, `fitnesse_table_insert`, `fitnesse_table_delete`, `fitnesse_table_move`, `fitnesse_table_save_text`, `fitnesse_table_move_text` | `debugTable save`/`saveBlock`, `insert`, `delete`, `move`, `saveText`, `moveText` — saves the wiki page, refused with 409 if it changed since it was read. The result's `source` is the page after the change (from the answer since mod #157, else read again). With `reload_defined_actions=true` every `fitnesse_table_*` edit sends `reload=true` with the session, so the fork reloads the page's defined actions; forks that don't answer `reloaded` get `\|define actions at\|.<page>\|` via `runWiki` instead | write |
 
 Dependencies between the tools (the same rules go to MCP clients as server
 `instructions` when a session can be used, i.e. with `read,test,debug` in
@@ -388,50 +399,107 @@ with `write` as well):
 ```
 fitnesse_debug_start ──or── fitnesse_debug_status(adopt=true)      opens / takes over the session
         │
-        ├─ fitnesse_debug_inspect(kind='keywords')                    exact keyword wording for run_wiki
+        ├─ fitnesse_debug_run_page(setup_only=true)                   SetUp first: browser, defined actions
+        ├─ fitnesse_debug_inspect(kind='keywords')                    categories; with filter: exact wording
+        ├─ fitnesse_debug_inspect(kind='definedActions')              defined actions loaded in the session
+        │     └─ fitnesse_debug_defined_action_source ──> fitnesse_table_save(…, reload_defined_actions=true)
         ├─ fitnesse_debug_run_wiki                                    ad-hoc tables, no SetUp/TearDown
         ├─ fitnesse_debug_page_tables ──> fitnesse_debug_run_page(tables=[…])
         ├─ fitnesse_debug_status                                      progress, log, busy
         │
 fitnesse_debug_end                                                    tear down, frees the session
 
-fitnesse_table_source ──> fitnesse_table_save / _insert / _delete     no session needed
+fitnesse_table_source ──> fitnesse_table_save / _insert / _delete / _move / _save_text / _move_text   no session needed
+                              └─ result.source ──> next edit
 ```
 
-- **Session required:** `run_wiki`, `run_page`, `page_tables`, `inspect` and
-  `end` fail until `fitnesse_debug_start` or `fitnesse_debug_status(adopt=true)`
+- **Session required:** `run_wiki`, `run_page`, `page_tables`, `inspect`,
+  `defined_action_source` (unless given `page_path`) and `end` fail until `fitnesse_debug_start` or `fitnesse_debug_status(adopt=true)`
   has run on this MCP server. `fitnesse_debug_status` (without `adopt`) and the
   `fitnesse_table_*` tools work without a session.
 - **State carries over** between `run_wiki` and `run_page` calls of the same
   page (open browser, scope, variables). `run_page` with a different page, or
   `restart=true` on either tool, first ends the current page's test (its tear
   down comes back as `previous_page_teardown`).
-- **`run_wiki` does not run SetUp/TearDown.** If the steps need them, run
-  them first with `fitnesse_debug_run_page(tables=[…])`.
+- **SetUp first.** `run_wiki` does not run SetUp/TearDown. Right after
+  `fitnesse_debug_start`, run `fitnesse_debug_run_page(setup_only=true)`: the
+  SetUp opens the browser and loads the defined actions, so `inspect` and
+  `run_wiki` have them. SetUp tables are those whose outermost include is a
+  page named `SetUp` or `SuiteSetUp`. A later `run_page` without `tables`
+  leaves them out (`skipped_setup`) instead of running them twice;
+  `restart=true` or another page runs them again.
 - **Suite sessions:** `fitnesse_debug_start(suite=true)` returns `pages`;
   call `fitnesse_debug_run_page` for each page with `runnable=true` in that
   order.
-- **Table edits:** `save`/`insert`/`delete` need the unchanged texts from a
-  fresh `fitnesse_table_source`, and after each change its indices are stale:
-  read the source again before the next edit. A running session picks up the
-  change the next time the tables are run.
+- **Results:** `run_wiki`, `run_page` and `end` return every table as text,
+  one row per line, cells prefixed with `[pass]`, `[fail]`, `[error]` or
+  `[ignore]`. Below each table follow what belongs to it: folding areas after
+  it (`after: <title>`, e.g. FitLibrary's *show after* or logs), links
+  (`link in row R, column C: text -> url`) and images. Inline screenshots
+  (`[image N]` in a cell) come back as MCP image content, at most 4 per call;
+  `images` says which one is where or why one was left out.
+  `run_page(only_failures=true)` returns only the tables with a `[fail]` or
+  `[error]` cell, under their usual numbers (`tables_without_failures` counts
+  the others).
+- **Keywords:** `inspect(kind='keywords')` without filter lists only the
+  categories with their number of keywords (the full list runs to tens of
+  kilobytes); pass a word or a category such as `Web / Browser` as `filter`
+  for syntax and parameters.
+- **Table edits:** `save`/`insert`/`delete`/`move`/`save_text`/`move_text`
+  take as `original` the unchanged wiki of exactly the table or text they
+  change (`tables[index]` / `texts[index]` of `fitnesse_table_source`). Each
+  result carries `source`, the page after the change: take the next edit's
+  `original` and indices from it, as indices shift. On 409 without a code
+  (page changed) read `fitnesse_table_source` again and redo the change. A
+  running session picks up the change the next time the tables are run.
+- **Defined actions:** `inspect(kind='definedActions')` lists what
+  `|define actions at|` has loaded into the session (empty before). To edit
+  one, `fitnesse_debug_defined_action_source` gives `page`, `index`, `last`
+  and `original` for `fitnesse_table_save(..., reload_defined_actions=true)`,
+  which makes the session run the new version at once. Forks with
+  `debugTable definedAction` (mod #156 + lib #84) pick the definition as a
+  run would; on older ones (400, or 501 `unsupported`) the MCP finds the block
+  itself and refuses a header that is on the page twice. Check
+  `reload.reloaded` in the save result: `false` (with `error`/`code` in a 200
+  answer) means the page is saved but the session still runs the old
+  version. 409 `changed` means the definition moved on its page since the
+  session loaded it: run `|define actions at|.<page>|` with `run_wiki` (or
+  repeat the edit with `reload_defined_actions=true`), then call
+  `defined_action_source` again.
 - **Two different table indices:** `fitnesse_debug_page_tables` counts every
   table a run executes (SetUp, TearDown, included pages);
   `fitnesse_table_source` counts only the page's own tables. Never pass an
-  index from one to the other.
+  index from one to the other: `page_tables` gives each table its
+  `source_page` and `source_index` for editing. Tables of included pages are
+  edited on that page, which changes every page that includes it.
 - **`busy=true`** from `fitnesse_debug_status`: wait until it is false, or
   call `fitnesse_debug_end(abort=true)`; a `run_wiki`/`run_page` call fails
   at once meanwhile instead of queueing.
 
 Notes:
 
-- **One debug session per FitNesse account.** Starting one kills a running
-  session of the same account without tear down, so `fitnesse_debug_start`
-  refuses unless told otherwise. Prefer a technical user for the MCP server.
-  Every later action sends the session id; if someone replaced the session,
-  the server answers 409 and the MCP server forgets it.
+- **One debug session per page and FitNesse account** (mod #159; up to
+  `debugTest.maxSessionsPerUser`, default 5, and `debugTest.maxSessions`,
+  default 20, on the server; 429 `tooManySessions` beyond). Starting one on
+  a page kills the account's running session on that page without tear
+  down, so `fitnesse_debug_start` refuses unless told otherwise; sessions on
+  other pages, e.g. a person's in the browser, keep running. The MCP server
+  itself works with one session at a time. Every later action sends the
+  session id; if someone replaced the session, the server answers 409
+  `replaced` and the MCP server forgets it. Older forks allow **one session
+  per account**: there a person in the browser and the MCP server with the
+  same account replace each other, so give the MCP server its own FitNesse
+  account.
 - Use Basic Auth (`FITNESSE_USERNAME`/`FITNESSE_PASSWORD`): it bypasses the
-  SSO proxy. A non-JSON answer is reported as a login problem.
+  SSO proxy. A non-JSON answer is reported as a login problem. Without a
+  login (a FitNesse without authenticator) the session belongs to the
+  `debugTestSession` cookie that `start` sets; the MCP server sends it with
+  every session call. It keeps the cookie only in memory: after a restart of
+  the MCP server its old session cannot be adopted and ends after the idle
+  timeout (30 min). With an account adopt works after a restart.
+- `debug` without `read` or `test` in `FITNESSE_TOOLSETS` leaves the debug
+  mode half usable (no session, or no inspecting); the server logs a warning
+  at startup naming the hidden tools.
 - Documents of a session run one after the other; a second one fails at once
   instead of queueing. `fitnesse_debug_status` (with the log) and
   `fitnesse_debug_end(abort=true)` work while a document runs.
@@ -467,16 +535,25 @@ claude mcp add fitnesse \
   -- fitnesse-mcp
 ```
 
-Or connect to a shared HTTP deployment:
+Or connect to a shared HTTP deployment running with
+`FITNESSE_AUTH_MODE=headers`, using your own FitNesse login:
 
 ```bash
-claude mcp add --transport http fitnesse http://fitnesse-mcp.example:8000/mcp
+claude mcp add --transport http fitnesse https://fitnesse-mcp.example/mcp \
+  --header "X-FitNesse-Username: ..." --header "X-FitNesse-Password: ..."
 ```
 
-A shared HTTP server calls FitNesse with the one account from its own
-environment, so every client acts as that user, and the MCP endpoint itself has
-no authentication: run it only where everyone who can reach the port may use
-that account (or put an authenticating reverse proxy in front).
+Add `--header "X-FitNesse-Url: https://other-fitnesse.example"` to work on
+another FitNesse instance than the server's `FITNESSE_BASE_URL`; debug
+sessions are kept apart per instance and user.
+
+With `headers`, FitNesse sees each user's own account: its page rights apply,
+and changes and debug sessions are recorded under that user. The headers carry
+the password, so serve the endpoint over HTTPS only (e.g. behind a
+TLS-terminating reverse proxy). In the default `env` mode a shared server calls
+FitNesse with the one account from its own environment, so every client acts
+as that user, and the MCP endpoint itself has no authentication: run it only
+where everyone who can reach the port may use that account.
 
 Other clients take the same settings as JSON, e.g. for stdio:
 
@@ -506,8 +583,9 @@ Every release is published to `ghcr.io/netcare-io/fitnesse-mcp` as `<version>`,
 `<major>.<minor>` and `latest` (from 1.0.0 on):
 
 ```bash
-# HTTP
-docker run --rm -p 8000:8000 --env-file .env \
+# HTTP, every user brings their own FitNesse login
+docker run --rm -p 8000:8000 -e FITNESSE_BASE_URL=http://your-fitnesse-host:8080 \
+  -e FITNESSE_TOOLSETS=all -e FITNESSE_AUTH_MODE=headers \
   -e FASTMCP_TRANSPORT=http -e FASTMCP_HOST=0.0.0.0 ghcr.io/netcare-io/fitnesse-mcp:latest
 
 # stdio, e.g. as the command of a local MCP client
@@ -528,10 +606,11 @@ port 8000 inside the container (uncomment `ports` in
 
 ## Interactive testing
 
-Create fastmcp.json file.
+Create a `fastmcp.json` (see [fastmcp.example.json](fastmcp.example.json)),
+then start the MCP Inspector from the project directory in the devcontainer:
 
 ```bash
-./scripts/run-inspector.sh
+fastmcp-inspector
 ```
 
 Open the exact URL printed in the terminal — it carries a
@@ -561,6 +640,17 @@ also need the mode of what they do, e.g. `fitnesse_debug_start` needs `test`.
 **`FITNESSE_TOOLSETS=...: ... need at least one of read, write, test` at
 startup** — `debug` and `complete` only add tools within the modes; add a
 mode, e.g. `read,debug`.
+
+**A defined action runs its old version after editing** — FitLibrary used to
+prefer a `<page>.wiki` file next to the page's `content.txt` when loading
+defined actions, while FitNesse (and `fitnesse_table_source`/`_save`) use
+`content.txt`. The session then runs the old file although the page shows the
+new text. Fixed in netcare's FitLibrary (lib PR #83); until that is deployed,
+remove the stale `.wiki` file.
+
+**`fitnesse_debug_inspect(kind='definedActions')` is empty** — the session
+lists only what `|define actions at|` has loaded; run those tables (usually
+in SetUp) with `fitnesse_debug_run_page(tables=[...])` first.
 
 **`"truncated": true` in a response** — the body exceeded
 `FITNESSE_MAX_RESPONSE_BYTES` and was cut. Common on suite runs with

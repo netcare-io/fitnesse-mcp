@@ -93,7 +93,12 @@ fitnesse_debug_run_wiki('|action|arg|')         try the new version at once
 
 HTTP 409 `changed` from `defined_action_source` means the page has moved since the session
 loaded it (tables inserted or removed before the definition, `----` changed): run
-`fitnesse_debug_run_wiki('|define actions at|.<page>|')`, then ask again.
+`fitnesse_debug_run_wiki('|define actions at|.<page>|')`, then ask again. If the page no longer
+has the definition (e.g. its `----` became `-----`), the session keeps running the old one until
+it ends; the error says so.
+
+Definitions on a page are separated by lines that start with exactly `----` (text may follow);
+`-----` and dashes inside `!-…-!`, `{{{…}}}` or `#` comment lines don't separate.
 
 ## 5. Go through a suite
 
@@ -117,7 +122,8 @@ Moving to the next page ends the previous page's test; its tear down comes back 
 | `replaced` or `noSession` | the session is gone (someone started one on the same page, idle timeout, restart): start again and run the SetUp |
 | `tooManySessions` (429) | end sessions of the account listed in `sessions`, or try later |
 | Saving fails with "page changed" | `fitnesse_table_source` again, redo the change |
-| `run_wiki` fails right after the start | the SetUp has not run: `run_page(setup_only=true)` |
+| `run_wiki` fails right after the start, with a `hint` about the SetUp | the SetUp has not run: `run_page(setup_only=true)`, then the tables again |
+| A table shows `[fail]` without a message | `fitnesse_debug_status`: the log of the test process often has the cause (e.g. `command not found`); long lines are cut at 500 characters |
 
 Without a FitNesse login the session belongs to a cookie that this server keeps in memory: after a
 restart of the MCP server its old session cannot be adopted and ends after the idle timeout.

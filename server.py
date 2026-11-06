@@ -2146,8 +2146,8 @@ _DEBUG_CODE_HINTS = {
     "notLoaded": "The call runs no defined action in this session: check its keywords and number of "
                  "arguments with fitnesse_debug_inspect(kind='definedActions'), or load its page with "
                  "|define actions at|.",
-    "unknownPlace": "It was defined by a |define action| table, not on a page of defined actions: "
-                    "edit that table where it is (fitnesse_table_source of its page).",
+    "unknownPlace": "The fork can't place this definition (a |define action| table, or |define actions "
+                    "at| with |from| another root): edit it where it is (fitnesse_table_source of its page).",
     "sessionRequired": "Several debug sessions of this account are running and this server knows none of "
                        "them: fitnesse_debug_status lists them in 'sessions'; continue one with "
                        "fitnesse_debug_status(adopt=true, session=...) or start one with fitnesse_debug_start.",
@@ -2815,7 +2815,14 @@ _NO_DEFINED_ACTIONS = (
     "fitnesse_debug_run_page(tables=[...])."
 )
 _MARKUP = re.compile(r"</?\w+>|'{2,3}")
-_SEPARATOR = re.compile(r"(?m)^\s*-{4,}\s*$")
+# FitLibrary splits a page of defined actions at lines that start with exactly four dashes (text
+# may follow), not inside !-...-!, {{{...}}} or # comment lines.
+_SEPARATOR = re.compile(r"(?m)^----(?!-)")
+_NOT_WIKI = re.compile(r"!-.*?-!|\{\{\{.*?\}\}\}|^#[^\n]*", re.S | re.M)
+
+
+def _separates(text: str) -> bool:
+    return bool(_SEPARATOR.search(_NOT_WIKI.sub("", text)))
 
 
 def _plain(text: str) -> str:
@@ -2901,7 +2908,7 @@ def _definition_block(source: Mapping, action: dict) -> dict:
     wanted = [k.lower() for k in action["keywords"]]
     starts = [
         i for i, table in enumerate(tables)
-        if (i == 0 or _SEPARATOR.search(texts[i] if i < len(texts) else ""))
+        if (i == 0 or _separates(texts[i] if i < len(texts) else ""))
         and [_plain(c).lower() for c in _wiki_cells(table)[::2]] == wanted
     ]
     if not starts:
@@ -2915,7 +2922,7 @@ def _definition_block(source: Mapping, action: dict) -> dict:
             f"{starts}): refusing to pick one. Edit the page with fitnesse_table_source / fitnesse_table_save."
         )
     first = last = starts[0]
-    while last + 1 < len(tables) and not _SEPARATOR.search(texts[last + 1] if last + 1 < len(texts) else ""):
+    while last + 1 < len(tables) and not _separates(texts[last + 1] if last + 1 < len(texts) else ""):
         last += 1
     original = tables[first]
     for i in range(first + 1, last + 1):
@@ -2931,6 +2938,11 @@ def _unknown_action(exc: ToolError) -> bool:
             or text.startswith("http 501"))
 
 
+class _UnknownPlace(ToolError):
+    """definedAction can't place the definition (e.g. |define actions at|...|from|...| with another
+    root): look it up as on older forks."""
+
+
 def _server_defined_action(call: str, state: _DebugState) -> dict | None:
     """debugTable action=definedAction: the fork picks the definition as a run would (keywords,
     number of arguments, loaded last wins) and cuts its block. None if this fork can't."""
@@ -2942,6 +2954,8 @@ def _server_defined_action(call: str, state: _DebugState) -> dict | None:
     except ToolError as exc:
         if _unknown_action(exc):
             return None
+        if "(unknownplace)" in str(exc).lower():
+            raise _UnknownPlace(str(exc)) from exc
         raise
     found = {k: found[k] for k in ("action", "page", "index", "last", "original") if k in found}
     if isinstance(found.get("page"), str):
@@ -3523,10 +3537,27 @@ if DEBUG_TOOLSET:
             if not call.startswith("|"):  # bare keywords: the fork wants a call row
                 defined = _session_defined_action(state, call, timeout_seconds)
                 call = defined["action"]
-            found = _server_defined_action(_call_row(call), state)
+            unknown_place = None
+            try:
+                found = _server_defined_action(_call_row(call), state)
+            except _UnknownPlace as exc:
+                found, unknown_place = None, exc
             if found is not None:
                 return found
-            defined = defined or _session_defined_action(state, call, timeout_seconds)
+            try:
+                defined = defined or _session_defined_action(state, call, timeout_seconds)
+                source = _debug_post("debugTable", defined["page"], "source", timeout_seconds=30.0)
+                return {"action": defined["action"], "page": defined["page"], **_definition_block(source, defined)}
+            except ToolError as exc:
+                if unknown_place is None:
+                    raise
+                if str(exc).startswith("No definition of"):
+                    raise ToolError(
+                        f"{defined['page'] if defined else 'Its page'} no longer has {call}; the session "
+                        "keeps the old definition until it ends. Edit the page (fitnesse_table_source), "
+                        "or end the session and start again to drop it."
+                    ) from exc
+                raise ToolError(f"{unknown_place} Looking it up on the page failed as well: {exc}") from exc
         elif page_path:
             call = _call_row(action)
             keywords = [_plain(c) for c in _wiki_cells(call)[::2]]

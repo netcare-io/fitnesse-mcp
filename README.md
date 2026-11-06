@@ -385,12 +385,12 @@ All need `debug` in `FITNESSE_TOOLSETS`, plus the listed mode.
 | Tool | Action | Mode |
 |---|---|---|
 | `fitnesse_debug_start` | `status`, then `start`; refuses if a session of the account runs on the same page (forks before mod #159: anywhere), unless `replace`, and while this server's own session still runs. With `suite`: also `suitePages` | test |
-| `fitnesse_debug_status` | `status` plus new `log` lines; `sessions` lists all of the account's (mod #159); `adopt` continues a running session, with several the one named by `session` | read |
-| `fitnesse_debug_run_wiki` | `runWiki` — wiki tables in the context of the current page, no SetUp/TearDown; `restart` runs `nextPage` first | test |
+| `fitnesse_debug_status` | `status` plus new `log` lines (each cut at 500 characters); `sessions` lists all of the account's (mod #159); `adopt` continues a running session, with several the one named by `session` | read |
+| `fitnesse_debug_run_wiki` | `runWiki` — wiki tables in the context of the current page, no SetUp/TearDown; `restart` runs `nextPage` first. Failing before the SetUp ran in this test, on a page that has one, the result gets a `hint` to run `setup_only` (one `pageHtml` per test to check) | test |
 | `fitnesse_debug_page_tables` | `pageHtml`, split into tables; each with `source_page`/`source_index` for editing (tables of included pages live on that page) | read |
 | `fitnesse_debug_run_page` | `nextPage` (on page change or `restart`), `pageHtml`, `runTable`. `setup_only` runs just the SetUp tables; a later call without `tables` skips them (`skipped_setup`). `only_failures` returns only tables with `[fail]`/`[error]` | test |
 | `fitnesse_debug_inspect` | `keywordsJson` (without filter only the categories with their number of keywords; with filter the matching keywords in full), `definedActions` (the defined actions loaded by `define actions at`: `debugTest definedActions` as JSON, on older forks parsed from `keywords`; filterable), `dynamicVariables`, `scope`, `liveView` (VNC password removed) | read |
-| `fitnesse_debug_defined_action_source` | `debugTable definedAction` (with the session, or `page=` without one). Forks without it: page of the defined action from `keywords`, then `debugTable source` of that page, cut to the definition block as FitLibrary reads it (header first or after `----`, up to the next `----`; refuses a header found twice) | read |
+| `fitnesse_debug_defined_action_source` | `debugTable definedAction` (with the session, or `page=` without one). Forks without it: page of the defined action from `keywords`, then `debugTable source` of that page, cut to the definition block as FitLibrary reads it (header first or after a line starting with exactly `----`, up to the next one; `-----` and dashes inside `!-…-!`, `{{{…}}}` or `#` comments don't separate; refuses a header found twice) | read |
 | `fitnesse_debug_end` | `end` or `abort`, with the unread log | test |
 | `fitnesse_table_source` | `debugTable source` | read |
 | `fitnesse_table_save`, `fitnesse_table_insert`, `fitnesse_table_delete`, `fitnesse_table_move`, `fitnesse_table_save_text`, `fitnesse_table_move_text` | `debugTable save`/`saveBlock`, `insert`, `delete`, `move`, `saveText`, `moveText` — saves the wiki page, refused with 409 if it changed since it was read. The result's `source` is the page after the change (from the answer since mod #157, else read again). With `reload_defined_actions=true` every `fitnesse_table_*` edit sends `reload=true` with the session, so the fork reloads the page's defined actions; forks that don't answer `reloaded` get `\|define actions at\|.<page>\|` via `runWiki` instead | write |
@@ -431,7 +431,9 @@ fitnesse_table_source ──> fitnesse_table_save / _insert / _delete / _move / 
   `run_wiki` have them. SetUp tables are those whose outermost include is a
   page named `SetUp` or `SuiteSetUp`. A later `run_page` without `tables`
   leaves them out (`skipped_setup`) instead of running them twice;
-  `restart=true` or another page runs them again.
+  `restart=true` or another page runs them again. If `run_wiki` fails
+  before the SetUp ran, its result has a `hint` saying so (only on pages
+  that have a SetUp).
 - **Suite sessions:** `fitnesse_debug_start(suite=true)` returns `pages`;
   call `fitnesse_debug_run_page` for each page with `runnable=true` in that
   order.
@@ -469,7 +471,12 @@ fitnesse_table_source ──> fitnesse_table_save / _insert / _delete / _move / 
   version. 409 `changed` means the definition moved on its page since the
   session loaded it: run `|define actions at|.<page>|` with `run_wiki` (or
   repeat the edit with `reload_defined_actions=true`), then call
-  `defined_action_source` again.
+  `defined_action_source` again. 404 `notLoaded` (the session runs no such
+  action) leaves the session running. On 404 `unknownPlace` (the fork can't
+  place the definition: a `|define action|` table, `|define actions at|`
+  with `|from|` another root, or a definition the page no longer has) the
+  MCP looks it up as on older forks; a definition the page no longer has
+  stays defined until the session ends.
 - **Two different table indices:** `fitnesse_debug_page_tables` counts every
   table a run executes (SetUp, TearDown, included pages);
   `fitnesse_table_source` counts only the page's own tables. Never pass an

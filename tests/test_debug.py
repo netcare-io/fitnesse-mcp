@@ -629,6 +629,13 @@ def test_definition_block_follows_fitlibrary_rules():
         my_server._definition_block({"tables": ["|other|\n"], "texts": ["", ""]}, click)
 
 
+def test_separators_are_exactly_four_dashes_outside_literals_and_comments():
+    for text, splits in (("\n----\n", True), ("\n---- next\n", True), ("\n-----\n", False),
+                         ("  ----\n", False), ("!-\n----\n-!", False), ("{{{\n----\n}}}", False),
+                         ("#----\n", False), ("#c\n----\n", True), ("text\n", False)):
+        assert my_server._separates(text) is splits, text
+
+
 @pytest.mark.asyncio
 async def test_defined_action_source_reads_defining_page_fresh(debug_env):
     await _start()
@@ -664,9 +671,28 @@ async def test_defined_action_source_from_the_fork(debug_env):
     with pytest.raises(ToolError, match="notLoaded.*number of\narguments|notLoaded"):
         await _call("fitnesse_debug_defined_action_source", {"action": "|greet|}"},
                     (404, {"error": "No defined action for |greet|", "code": "notLoaded"}))
-    with pytest.raises(ToolError, match="define action\\| table"):
+    # unknownPlace (e.g. define actions at ... from another root): looked up as on older forks
+    data, fake = await _call(
+        "fitnesse_debug_defined_action_source", {"action": "|other|x|"},
+        (404, {"error": "Not on a page of defined actions", "code": "unknownPlace"}),
+        (200, {"definedActions": [{"action": "|''other''|x|", "page": ".Other.Defs"}]}),
+        (200, {"tables": ["|''other''|x|", "|log message|@{x}|", "|''next''|"], "texts": ["", "\n\n", "\n---- next\n", "\n"]}),
+    )
+    assert fake.actions == ["definedAction", "definedActions", "source"]
+    assert data == {"action": "|other|x|", "page": "Other.Defs", "index": 0, "last": 1,
+                    "original": "|''other''|x|\n\n|log message|@{x}|"}
+    # unknownPlace for a definition the page no longer has (lib #83): the session keeps it until it ends
+    with pytest.raises(ToolError, match="(?s)Other.Defs no longer has \\|other\\|x\\|.*until it ends"):
+        await _call(
+            "fitnesse_debug_defined_action_source", {"action": "|other|x|"},
+            (404, {"error": "Not on the page any more", "code": "unknownPlace"}),
+            (200, {"definedActions": [{"action": "|''other''|x|", "page": ".Other.Defs"}]}),
+            (200, {"tables": ["|''greet''|", "|log message|hi|", "|''other''|x|"], "texts": ["", "\n\n", "\n-----\n", "\n"]}),
+        )
+    with pytest.raises(ToolError, match="(?s)unknownPlace.*define action\\| table.*failed as well"):
         await _call("fitnesse_debug_defined_action_source", {"action": "|inline|"},
-                    (404, {"error": "Defined in a table", "code": "unknownPlace"}))
+                    (404, {"error": "Defined in a table", "code": "unknownPlace"}),
+                    (200, {"definedActions": []}))
     # a test process with an older FitLibrary: the fork says unsupported, the MCP cuts the block itself
     data, fake = await _call(
         "fitnesse_debug_defined_action_source", {"action": "|click by js|x|"},

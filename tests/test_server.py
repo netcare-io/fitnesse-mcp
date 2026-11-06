@@ -54,7 +54,7 @@ def _patch_urlopen(body: bytes = b'{"ok":true}', content_type: str = "applicatio
 @pytest.fixture
 def clean_env():
     """Reload the server with every opt-in gate closed, whatever the ambient env."""
-    gates = ("FITNESSE_FILES_ROOT", "FITNESSE_COMPLETE_TOOLSET", "FITNESSE_ALLOW_SHUTDOWN", "FITNESSE_READONLY")
+    gates = ("FITNESSE_FILES_ROOT", "FITNESSE_COMPLETE_TOOLSET", "FITNESSE_ALLOW_SHUTDOWN", "FITNESSE_READONLY", "FITNESSE_KDTA_DEBUG")
     previous = {k: os.environ.pop(k, None) for k in gates}
     try:
         importlib.reload(my_server)
@@ -204,7 +204,7 @@ def files_env():
     FITNESSE_FILES_ROOT names the resource root on the *remote* FitNesse
     instance ("files"); neither download nor upload touches local disk.
     """
-    gates = ("FITNESSE_FILES_ROOT", "FITNESSE_COMPLETE_TOOLSET", "FITNESSE_ALLOW_SHUTDOWN", "FITNESSE_READONLY")
+    gates = ("FITNESSE_FILES_ROOT", "FITNESSE_COMPLETE_TOOLSET", "FITNESSE_ALLOW_SHUTDOWN", "FITNESSE_READONLY", "FITNESSE_KDTA_DEBUG")
     previous = {k: os.environ.pop(k, None) for k in gates}
     os.environ["FITNESSE_FILES_ROOT"] = "files"
     os.environ["FITNESSE_COMPLETE_TOOLSET"] = "1"

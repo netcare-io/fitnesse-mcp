@@ -6,10 +6,13 @@ import json
 import logging
 import mimetypes
 import os
+import threading
 import uuid
 import xml.etree.ElementTree as ET
 from base64 import b64decode, b64encode
 from collections.abc import Mapping
+from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from typing import Annotated, Literal
 from urllib import parse, request
 from urllib.error import HTTPError, URLError
@@ -1519,6 +1522,878 @@ if FITNESSE_COMPLETE_TOOLSET:
             "GET",
             page_path,
             params={"responder": "edit", "format": "json"},
+            timeout_seconds=timeout_seconds,
+        )
+
+
+# ---------------------------------------------------------------------------
+# KDTA debug mode: responder=debugTest and responder=debugTable.
+# These responders exist only in netcare's FitNesse fork (fitnesse-netcare-mod),
+# so the tools are registered only with FITNESSE_KDTA_DEBUG set.
+# ---------------------------------------------------------------------------
+
+FITNESSE_KDTA_DEBUG = _env_flag("FITNESSE_KDTA_DEBUG")
+# Must exceed the server's debugTest.timeoutMinutes (default 10 min), which answers 504 itself.
+_debug_timeout_env = float(os.getenv("FITNESSE_DEBUG_TIMEOUT_SECONDS", "660"))
+DEBUG_TIMEOUT_SECONDS = _debug_timeout_env if _debug_timeout_env > 0 else None
+# Raw debug responses are condensed before they reach the model, so allow more than MAX_BYTES.
+DEBUG_MAX_BYTES = int(os.getenv("FITNESSE_DEBUG_MAX_RESPONSE_BYTES", str(16 * 1024 * 1024)))
+DEBUG_MAX_CELL_CHARS = int(os.getenv("FITNESSE_DEBUG_MAX_CELL_CHARS", "1500"))
+_DEBUG_COOKIE = "debugTestSession"
+
+type DebugPath = Annotated[
+    str | None,
+    Field(
+        description="Dotted wiki page path. Omit to use the current page of the debug session."
+    ),
+]
+
+
+@dataclass
+class _DebugState:
+    """What this MCP server knows about its debug session on one FitNesse account."""
+
+    session: str | None = None
+    page: str | None = None  # the page start was called on (classpath, rights check)
+    current_page: str | None = None  # page whose storytest is running
+    suite: bool = False
+    log_next: int = 0
+    cookie: str | None = None  # only used without Basic Auth
+    page_counts: dict[str, dict[str, int]] = field(default_factory=dict)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def reset(self) -> None:
+        self.session = self.page = self.current_page = None
+        self.suite = False
+        self.log_next = 0
+        self.page_counts = {}
+
+
+_DEBUG_STATES: dict[tuple[str, str], _DebugState] = {}
+_DEBUG_STATES_LOCK = threading.Lock()
+
+
+def _debug_state() -> _DebugState:
+    key = (
+        os.getenv("FITNESSE_BASE_URL", "http://localhost:8080").rstrip("/"),
+        os.getenv("FITNESSE_USERNAME") or "",
+    )
+    with _DEBUG_STATES_LOCK:
+        return _DEBUG_STATES.setdefault(key, _DebugState())
+
+
+def _without_secrets(value):
+    """Drop every *password* key (e.g. liveViewPassword, the grid's VNC password)."""
+    if isinstance(value, dict):
+        return {
+            k: _without_secrets(v)
+            for k, v in value.items()
+            if "password" not in str(k).lower()
+        }
+    if isinstance(value, list):
+        return [_without_secrets(v) for v in value]
+    return value
+
+
+_DEBUG_HINTS = {
+    403: "No permission for this page.",
+    404: "The page does not exist.",
+    423: "The test process is still working on a document that timed out. Poll fitnesse_debug_status until busy is false, or call fitnesse_debug_end with abort=true.",
+    429: "Too many debug sessions on this FitNesse (debugTest.maxSessions). Try again later.",
+    500: "If the session crashed, read the log via fitnesse_debug_status and start a new session.",
+    504: "The document did not finish within debugTest.timeoutMinutes; the process keeps working on it. Poll fitnesse_debug_status (shows the log) until busy is false, or call fitnesse_debug_end with abort=true.",
+}
+
+
+def _debug_post(
+    responder: str,
+    page_path: str,
+    action: str,
+    form: Mapping[str, str | int | bool | None] | None = None,
+    timeout_seconds: float | None = 30.0,
+    state: _DebugState | None = None,
+) -> dict:
+    """POST one action to debugTest/debugTable and return its JSON object.
+
+    Raises ToolError for transport errors, non-JSON answers (login problems)
+    and HTTP errors; 409 noSession/replaced also forget the session.
+    """
+    base_url = os.getenv("FITNESSE_BASE_URL", "http://localhost:8080")
+    username = os.getenv("FITNESSE_USERNAME")
+    password = os.getenv("FITNESSE_PASSWORD")
+    url = _build_url(base_url, page_path, {"responder": responder})
+    fields: dict[str, str] = {"action": action}
+    for key, value in (form or {}).items():
+        if value is None:
+            continue
+        fields[key] = ("true" if value else "false") if isinstance(value, bool) else str(value)
+    req = request.Request(url=url, data=parse.urlencode(fields).encode(), method="POST")
+    _apply_basic_auth(req=req, username=username, password=password)
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    req.add_header("Accept", "application/json")
+    # Without it an expired SSO login answers each request with a redirect plus state cookie.
+    req.add_header("X-Requested-With", "XMLHttpRequest")
+    if state is not None and state.cookie:
+        req.add_header("Cookie", state.cookie)
+
+    try:
+        try:
+            response = request.urlopen(req, timeout=timeout_seconds)
+        except HTTPError as exc:
+            response = exc
+        with response:
+            status = response.status if not isinstance(response, HTTPError) else response.code
+            headers = response.headers
+            raw_bytes = response.read(DEBUG_MAX_BYTES + 1)
+    except TimeoutError as exc:
+        raise ToolError(
+            f"No answer to '{action}' within {timeout_seconds}s. The test process may still be "
+            "running it: check fitnesse_debug_status, which also shows the log."
+        ) from exc
+    except URLError as exc:
+        raise ToolError(f"Connection error: {exc.reason}") from exc
+
+    if state is not None and headers is not None:
+        for header in headers.get_all("Set-Cookie") or []:
+            pair = header.split(";", 1)[0].strip()
+            if pair.startswith(f"{_DEBUG_COOKIE}="):
+                state.cookie = pair
+    if len(raw_bytes) > DEBUG_MAX_BYTES:
+        logger.warning("Response from %s exceeds FITNESSE_DEBUG_MAX_RESPONSE_BYTES=%d", url, DEBUG_MAX_BYTES)
+        raise ToolError(
+            f"Response to '{action}' exceeds FITNESSE_DEBUG_MAX_RESPONSE_BYTES={DEBUG_MAX_BYTES}."
+        )
+    content_type = (headers.get("Content-Type", "") if headers is not None else "") or ""
+    try:
+        data = json.loads(raw_bytes.decode("utf-8", errors="replace")) if "json" in content_type else None
+    except json.JSONDecodeError:
+        data = None
+    if not isinstance(data, dict):
+        raise ToolError(
+            f"FitNesse answered '{action}' with HTTP {status} and {content_type or 'no content type'} "
+            "instead of JSON. Most likely the login is missing, expired or wrong (set "
+            "FITNESSE_USERNAME/FITNESSE_PASSWORD; Basic Auth bypasses the SSO), or this FitNesse "
+            f"has no {responder} responder."
+        )
+    if status >= 400:
+        code = data.get("code")
+        message = data.get("error") or f"HTTP {status}"
+        hint = _DEBUG_HINTS.get(status, "")
+        if status == 409 and code in {"noSession", "replaced"} and state is not None:
+            state.reset()
+            hint = (
+                "The debug session was replaced, e.g. from a browser with the same account. "
+                "This MCP server forgot it; start a new one with fitnesse_debug_start."
+                if code == "replaced"
+                else "No debug session is running; start one with fitnesse_debug_start."
+            )
+        elif status == 409 and responder == "debugTable":
+            hint = "The page changed since 'original' was read. Read fitnesse_table_source again and retry."
+        detail = f" ({code})" if code else ""
+        raise ToolError(f"HTTP {status}{detail}: {message}. {hint}".strip())
+    return _without_secrets(data)
+
+
+# ---- HTML tables ----------------------------------------------------------
+
+_CELL_STATES = ("pass", "fail", "error", "ignore")
+
+
+class _TableParser(HTMLParser):
+    """Collect the top-level <table> elements of an HTML document.
+
+    Per table: its source span [start, end) and its rows of cells, each cell
+    with its text (nested tables flattened into it) and FitLibrary status.
+    """
+
+    def __init__(self, source: str):
+        super().__init__(convert_charrefs=True)
+        self._source = source
+        self._line_starts = [0]
+        for i, ch in enumerate(source):
+            if ch == "\n":
+                self._line_starts.append(i + 1)
+        self.tables: list[dict] = []
+        self._depth = 0
+        self._cell: dict | None = None
+        self._skip = 0  # inside <script>/<style>
+        self.feed(source)
+        self.close()
+
+    def _offset(self) -> int:
+        line, col = self.getpos()
+        return self._line_starts[line - 1] + col
+
+    def _text(self, text: str) -> None:
+        if self._cell is not None:
+            self._cell["parts"].append(text)
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"script", "style"}:
+            self._skip += 1
+        elif tag == "table":
+            self._depth += 1
+            if self._depth == 1:
+                self.tables.append({"start": self._offset(), "end": None, "rows": []})
+            else:
+                self._text("\n")
+        elif tag == "tr":
+            if self._depth == 1:
+                self.tables[-1]["rows"].append([])
+            else:
+                self._text("\n")
+        elif tag in {"td", "th"}:
+            if self._depth == 1 and self.tables and self.tables[-1]["rows"]:
+                classes = (dict(attrs).get("class") or "").split()
+                status = next((c for c in classes if c in _CELL_STATES), None)
+                self._cell = {"parts": [], "status": status}
+                self.tables[-1]["rows"][-1].append(self._cell)
+            else:
+                self._text(" | ")
+        elif tag in {"br", "p", "div", "li", "pre"}:
+            self._text("\n")
+
+    def handle_startendtag(self, tag, attrs):
+        if tag == "br":
+            self._text("\n")
+
+    def handle_endtag(self, tag):
+        if tag in {"script", "style"}:
+            self._skip = max(0, self._skip - 1)
+        elif tag == "table" and self._depth:
+            self._depth -= 1
+            if self._depth == 0:
+                close = self._source.find(">", self._offset())
+                self.tables[-1]["end"] = len(self._source) if close < 0 else close + 1
+                self._cell = None
+            else:
+                self._text("\n")
+        elif tag in {"td", "th"} and self._depth == 1:
+            self._cell = None
+
+    def handle_data(self, data):
+        if not self._skip:
+            self._text(data)
+
+
+def _parse_tables(html: str) -> list[dict]:
+    tables = _TableParser(html or "").tables
+    for table in tables:
+        if table["end"] is None:  # unclosed
+            table["end"] = len(html)
+        table["rows"] = [
+            [{"text": "".join(c["parts"]), "status": c["status"]} for c in row]
+            for row in table["rows"]
+        ]
+    return tables
+
+
+def _squash(text: str, limit: int | None = None) -> str:
+    lines = [" ".join(line.split()) for line in text.strip().splitlines()]
+    text = "\n".join(line for line in lines if line)
+    limit = DEBUG_MAX_CELL_CHARS if limit is None else limit
+    if limit > 0 and len(text) > limit:
+        text = f"{text[:limit]}… [{len(text) - limit} chars cut]"
+    return text
+
+
+def _tables_text(html: str) -> str:
+    """Condense annotated FitLibrary HTML into one text block per table.
+
+    Cells carry their status as a prefix: [pass], [fail], [error], [ignore].
+    """
+    blocks = []
+    for i, table in enumerate(_parse_tables(html)):
+        lines = [f"Table {i}:"]
+        for row in table["rows"]:
+            cells = []
+            for cell in row:
+                text = _squash(cell["text"]).replace("\n", " ⏎ ")
+                cells.append(f"[{cell['status']}] {text}" if cell["status"] else text)
+            lines.append("| " + " | ".join(cells) + " |")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def _query_rows(html: str) -> list[list[str]]:
+    """Text cells (unsquashed) of the first table of a query answer."""
+    tables = _parse_tables(html)
+    if not tables:
+        return []
+    return [[cell["text"].strip() for cell in row] for row in tables[0]["rows"]]
+
+
+def _query_records(html: str, kind: str) -> list[dict[str, str]]:
+    """Header row plus data rows to dicts; drops the empty marker column."""
+    rows = _query_rows(html)
+    if not rows:
+        raise ToolError(f"The '{kind}' answer contains no table.")
+    header, *data = rows
+    names = header[1:]
+    return [dict(zip(names, row[1:])) for row in data]
+
+
+# ---- Session handling -----------------------------------------------------
+
+
+def _require_session() -> _DebugState:
+    state = _debug_state()
+    if not state.session:
+        raise ToolError(
+            "This MCP server has no debug session on this FitNesse. Start one with "
+            "fitnesse_debug_start, or continue a running one with fitnesse_debug_status(adopt=true)."
+        )
+    return state
+
+
+def _session_action(
+    state: _DebugState,
+    action: str,
+    form: Mapping[str, str | int | bool | None] | None = None,
+    timeout_seconds: float | None = 30.0,
+) -> dict:
+    return _debug_post(
+        "debugTest",
+        state.page or "",
+        action,
+        {"session": state.session, **(form or {})},
+        timeout_seconds=timeout_seconds,
+        state=state,
+    )
+
+
+class _document:
+    """Documents of one session run one after the other: fail fast instead of queueing."""
+
+    def __init__(self, state: _DebugState):
+        self._lock = state.lock
+
+    def __enter__(self):
+        if not self._lock.acquire(blocking=False):
+            raise ToolError(
+                "Another document is still running in this debug session. Wait for it "
+                "(fitnesse_debug_status shows progress) or call fitnesse_debug_end with abort=true."
+            )
+
+    def __exit__(self, *_):
+        self._lock.release()
+
+
+def _add_counts(state: _DebugState, page: str | None, counts: Mapping | None) -> dict[str, int]:
+    totals = state.page_counts.setdefault(page or "", {k: 0 for k in ("right", "wrong", "ignores", "exceptions")})
+    for key, value in (counts or {}).items():
+        if isinstance(value, int):
+            totals[key] = totals.get(key, 0) + value
+    return dict(totals)
+
+
+def _document_result(state: _DebugState, data: dict, page: str | None, include_html: bool) -> dict:
+    html = data.get("html") or ""
+    result = {
+        "page": page,
+        "counts": data.get("counts"),
+        "page_totals": _add_counts(state, page, data.get("counts")),
+        "tables": _tables_text(html),
+    }
+    if include_html:
+        result["html"] = html
+    return result
+
+
+def _next_page(state: _DebugState, page: str | None, timeout_seconds: float | None) -> dict:
+    previous = state.current_page
+    data = _session_action(state, "nextPage", {"page": page}, timeout_seconds=timeout_seconds)
+    teardown = _document_result(state, data, previous, include_html=False)
+    teardown["teardown_of"] = teardown.pop("page")
+    state.current_page = data.get("page") or page or previous
+    state.page_counts.pop(state.current_page, None)
+    return teardown
+
+
+def _status(
+    page_path: str, state: _DebugState, timeout_seconds: float | None, with_session: bool = True
+) -> dict:
+    form = {"session": state.session} if state.session and with_session else None
+    return _debug_post("debugTest", page_path, "status", form, timeout_seconds=timeout_seconds, state=state)
+
+
+def _split_tables(html: str) -> list[str]:
+    return [html[t["start"]:t["end"]] for t in _parse_tables(html)]
+
+
+def _page_html(state: _DebugState, page: str, timeout_seconds: float | None) -> str:
+    return _session_action(state, "pageHtml", {"page": page}, timeout_seconds=timeout_seconds).get("html") or ""
+
+
+def _walk_keywords(node, path: tuple[str, ...] = ()):
+    if isinstance(node, list):
+        for item in node:
+            yield from _walk_keywords(item, path)
+    elif isinstance(node, dict):
+        if "syntax" in node:
+            yield path, node
+        children = node.get("children")
+        if children is not None:
+            name = node.get("name") or node.get("label") or node.get("title") or node.get("text")
+            sub = path + (str(name),) if name and "syntax" not in node else path
+            yield from _walk_keywords(children, sub)
+
+
+def _keywords(html: str, filter: str | None, limit: int) -> dict:
+    rows = _query_rows(html)
+    cells = rows[0] if rows else []
+    try:
+        keywords = json.loads(cells[1]) if len(cells) > 1 and cells[1] else []
+        special = json.loads(cells[2]) if len(cells) > 2 and cells[2] else []
+    except json.JSONDecodeError as exc:
+        raise ToolError(f"Unexpected keywordsJson answer: {exc}") from exc
+    found = [
+        {"category": " / ".join(path), "special": is_special, **entry}
+        for is_special, source in ((False, keywords), (True, special))
+        for path, entry in _walk_keywords(source)
+    ]
+    if filter:
+        needle = filter.lower()
+        hits = [e for e in found if needle in json.dumps(e, ensure_ascii=False).lower()]
+        return {"matches": len(hits), "keywords": hits[:limit]}
+    categories: dict[str, list[str]] = {}
+    for entry in found:
+        label = entry["category"] + (" (special)" if entry["special"] else "")
+        categories.setdefault(label, []).append(entry.get("syntax"))
+    return {"count": len(found), "categories": categories}
+
+
+def _log_lines(lines) -> list[str]:
+    return [f"{l.get('time', '')} [{l.get('stream', '')}] {l.get('text', '')}" for l in lines or []]
+
+
+def _read_log(state: _DebugState, max_lines: int, timeout_seconds: float | None) -> dict:
+    start = state.log_next
+    data = _session_action(state, "log", {"from": start}, timeout_seconds=timeout_seconds)
+    lines = data.get("lines") or []
+    dropped = data.get("dropped") or 0
+    more = len(lines) > max_lines
+    # the first returned line has number start + dropped
+    state.log_next = start + dropped + max_lines if more else data.get("next", start)
+    return {"lines": _log_lines(lines[:max_lines]), "dropped": dropped, "more": more}
+
+
+def _run_document(
+    state: _DebugState, page: str | None, restart: bool, timeout_seconds: float | None, run
+) -> dict:
+    """Begin page's storytest if needed (nextPage), then run(); report the previous tear down."""
+    teardown = None
+    if (page and page != state.current_page) or restart:
+        teardown = _next_page(state, page, timeout_seconds)
+    result = run()
+    if teardown is not None:
+        result["previous_page_teardown"] = teardown
+    return result
+
+
+if FITNESSE_KDTA_DEBUG:
+
+    @mcp.tool(
+        name="fitnesse_debug_start",
+        description=(
+            "Starts a debug session for stepwise testing on a KDTA FitNesse: a test process that "
+            "stays alive between calls, so you can run tables one call at a time and the state (open "
+            "browsers, objects in scope, variables) carries over from one call to the next. Use it to"
+            " try out steps, build a new test, or step through a failing one; for a plain complete "
+            "run use fitnesse_run_test instead. Nothing is written to the test history.\n"
+            "The page decides which fixtures and variables are available, so start on the test page "
+            "(or, with suite=true, on the suite page) you want to work on.\n"
+            "Typical flow: fitnesse_debug_start -> fitnesse_debug_inspect(kind='keywords') -> "
+            "fitnesse_debug_run_wiki or fitnesse_debug_run_page, repeatedly -> fitnesse_debug_end.\n"
+            "Only one session per FitNesse account. If one is already running (possibly a person "
+            "working in the browser), this fails and says so: then continue it with "
+            "fitnesse_debug_status(adopt=true) or end it with fitnesse_debug_end. Use replace=true "
+            "only when told to: it kills the running session without tear down.\n"
+            "With suite=true the result contains 'pages': the suite's pages in run order, each with "
+            "path, kind (test, suiteSetUp, suiteTearDown) and runnable (false = cannot run in this "
+            "session; skip it).\n"
+            "Always end the session with fitnesse_debug_end when done: it occupies a server slot and "
+            "browsers until then."
+        ),
+        tags={"fitnesse", "debug", "execute"},
+        annotations={"destructiveHint": False},
+    )
+    def fitnesse_debug_start(
+        page_path: Annotated[str, Field(description="Dotted path of the test page, e.g. 'FrontPage.Project.MyTest'; with suite=true the suite page.")],
+        suite: Annotated[bool, Field(description="Start on a suite page to run its test pages one after another; returns the list of pages.")] = False,
+        replace: Annotated[bool, Field(description="Only when told to: kill a running session of this account (maybe a person's) without tear down.")] = False,
+        suite_filter: Annotated[str | None, Field(description="suite=true: only tests matching any of these comma-separated tags.")] = None,
+        run_tests_matching_all_tags: Annotated[str | None, Field(description="suite=true: only tests matching all of these comma-separated tags.")] = None,
+        exclude_suite_filter: Annotated[str | None, Field(description="suite=true: leave out tests with any of these comma-separated tags.")] = None,
+        first_test: Annotated[str | None, Field(description="suite=true: start the list at this test page.")] = None,
+        timeout_seconds: float | None = Depends(lambda: DEBUG_TIMEOUT_SECONDS),
+    ) -> dict:
+        """status check, start and (suite) suitePages via responder=debugTest."""
+        state = _debug_state()
+        with _document(state):
+            # without session: a stale id would answer 409 instead of describing the running session
+            status = _status(page_path, state, 30.0, with_session=False)
+            if status.get("running") and not replace:
+                owner = "this MCP server" if state.session and str(status.get("session")) == state.session else "someone using the same account"
+                raise ToolError(
+                    f"A debug session started by {owner} is already running (page "
+                    f"{status.get('page')}, current page {status.get('currentPage')}, started "
+                    f"{status.get('startedAt')}). Continue it with fitnesse_debug_status(adopt=true), "
+                    "end it with fitnesse_debug_end, or pass replace=true to kill it without tear down."
+                )
+            state.reset()
+            data = _debug_post(
+                "debugTest", page_path, "start", {"suite": True if suite else None},
+                timeout_seconds=timeout_seconds, state=state,
+            )
+            state.session = str(data.get("session"))
+            state.page = data.get("page") or page_path
+            state.current_page = state.page
+            state.suite = suite
+        if suite:
+            try:
+                pages = _session_action(
+                    state, "suitePages",
+                    {
+                        "suiteFilter": suite_filter,
+                        "runTestsMatchingAllTags": run_tests_matching_all_tags,
+                        "excludeSuiteFilter": exclude_suite_filter,
+                        "firstTest": first_test,
+                    },
+                )
+                data["pages"] = pages.get("pages")
+            except ToolError as exc:
+                data["pages_error"] = str(exc)
+        return data
+
+    @mcp.tool(
+        name="fitnesse_debug_status",
+        description=(
+            "Shows the debug session of this FitNesse account and the new lines of the test process "
+            "log since the last call. Answers immediately, even while another call is still running a"
+            " long table, so use it to watch progress.\n"
+            "Result: running (false = no session), page (where the session was started), currentPage "
+            "(whose test is running), suite, busy, idleSecondsLeft (the session ends itself after "
+            "this idle time), known_to_this_server, and log.lines ('time [out|err|info] text'; 'info'"
+            " lines show the command, exit code and crashes).\n"
+            "busy=true means the process is still working on a call that timed out: wait and call "
+            "this again until busy is false, or abort with fitnesse_debug_end(abort=true).\n"
+            "known_to_this_server=false with running=true means someone else's session (or one from "
+            "before a restart): the other debug tools refuse to touch it until you call this with "
+            "adopt=true. Only adopt a session you are meant to continue."
+        ),
+        tags={"fitnesse", "debug", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_debug_status(
+        adopt: Annotated[bool, Field(description="Continue the running session of this account with this server's debug tools.")] = False,
+        page_path: Annotated[str | None, Field(description="Rarely needed: page used for the permission check; defaults to the session's page, else FrontPage.")] = None,
+        max_log_lines: Annotated[int, Field(description="Maximum number of new log lines to return; the rest follow on the next call. 0 for none.", ge=0)] = 50,
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """status (and log) via responder=debugTest."""
+        state = _debug_state()
+        status = _status(page_path or state.page or "FrontPage", state, timeout_seconds, with_session=False)
+        running = bool(status.get("running"))
+        known = running and bool(state.session) and str(status.get("session")) == state.session
+        if adopt and running and not known:
+            state.reset()
+            state.session = str(status.get("session"))
+            state.page = status.get("page")
+            state.current_page = status.get("currentPage") or state.page
+            state.suite = bool(status.get("suite"))
+            known = True
+        elif state.session and not known:
+            state.reset()
+        result = {**status, "known_to_this_server": known}
+        if known and max_log_lines:
+            result["log"] = _read_log(state, max_log_lines, timeout_seconds)
+        return result
+
+    @mcp.tool(
+        name="fitnesse_debug_run_wiki",
+        description=(
+            "Runs FitNesse wiki tables in the debug session, e.g. '|with browser|'. Rows are "
+            "'|cell|cell|' lines; separate tables with an empty line. Variables of the current page "
+            "like ${BASE_URL} are resolved. The page's SetUp and TearDown are NOT added: run them "
+            "yourself with fitnesse_debug_run_page if the steps need them.\n"
+            "State carries over between calls: a browser opened in one call is still open in the "
+            "next. All tables of one call run before the result comes back; it can take minutes (up "
+            "to ~10).\n"
+            "Result: 'tables' holds every table as text, one row per line; a cell's outcome is "
+            "prefixed: [pass] check passed, [fail] check failed (the cell shows expected and actual),"
+            " [error] exception (message and shortened stack trace), [ignore] not run. Cells without "
+            "prefix are plain input. 'counts' are this call's right/wrong/ignores/exceptions; "
+            "'page_totals' add up all calls since the current page's test began.\n"
+            "Find the available keywords and their exact wording with "
+            "fitnesse_debug_inspect(kind='keywords') before writing tables.\n"
+            "restart=true first ends the running test (its tear down runs, result in "
+            "previous_page_teardown) and begins it afresh: use it for a clean state."
+        ),
+        tags={"fitnesse", "debug", "execute"},
+        annotations={"destructiveHint": False},
+    )
+    def fitnesse_debug_run_wiki(
+        wiki: Annotated[str, Field(description="Wiki markup: one or more tables of '|cell|cell|' rows, tables separated by an empty line.")],
+        restart: Annotated[bool, Field(description="First end the running test (tear down) and begin it afresh, for a clean state.")] = False,
+        include_html: Annotated[bool, Field(description="Also return the raw result HTML (large; normally not needed).")] = False,
+        timeout_seconds: float | None = Depends(lambda: DEBUG_TIMEOUT_SECONDS),
+    ) -> dict:
+        """(nextPage +) runWiki via responder=debugTest."""
+        state = _require_session()
+        with _document(state):
+            return _run_document(
+                state, None, restart, timeout_seconds,
+                lambda: _document_result(
+                    state,
+                    _session_action(state, "runWiki", {"wiki": wiki}, timeout_seconds=timeout_seconds),
+                    state.current_page, include_html,
+                ),
+            )
+
+    @mcp.tool(
+        name="fitnesse_debug_page_tables",
+        description=(
+            "Lists the tables that running a page executes, in order, including those of its "
+            "SetUp/TearDown and included pages: index, number of rows and the first row. Use the "
+            "indices to run only some of them with fitnesse_debug_run_page(tables=[...]). Requires a "
+            "debug session; omit page_path for the page currently being tested."
+        ),
+        tags={"fitnesse", "debug", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_debug_page_tables(
+        page_path: DebugPath = None,
+        timeout_seconds: float = _make_timeout(60.0),
+    ) -> dict:
+        """pageHtml via responder=debugTest, split into top-level tables."""
+        state = _require_session()
+        page = page_path or state.current_page or state.page
+        tables = []
+        for i, table in enumerate(_parse_tables(_page_html(state, page, timeout_seconds))):
+            first = " | ".join(_squash(c["text"], 80) for c in (table["rows"][0] if table["rows"] else []))
+            tables.append({"index": i, "rows": len(table["rows"]), "first_row": first})
+        return {"page": page, "tables": tables}
+
+    @mcp.tool(
+        name="fitnesse_debug_run_page",
+        description=(
+            "Runs the tables of a test page in the debug session, exactly as a normal test run would "
+            "send them (SetUp, TearDown and included pages included): all of them, or only the "
+            "indices given in 'tables' (see fitnesse_debug_page_tables), in the order given. Result "
+            "as for fitnesse_debug_run_wiki.\n"
+            "If page_path is not the page currently being tested, the current page's test is ended "
+            "first (its tear-down result comes back as previous_page_teardown) and the new page's "
+            "test begins. Calling it again for the same page continues that page's test, so you can "
+            "run its tables in several steps; restart=true begins it afresh.\n"
+            "In a suite session, call it for each page with runnable=true from fitnesse_debug_start's"
+            " 'pages', in that order."
+        ),
+        tags={"fitnesse", "debug", "execute"},
+        annotations={"destructiveHint": False},
+    )
+    def fitnesse_debug_run_page(
+        page_path: DebugPath = None,
+        tables: Annotated[list[int] | None, Field(description="Indices from fitnesse_debug_page_tables to run, in this order; omit to run the whole page.")] = None,
+        restart: Annotated[bool, Field(description="Begin the page's test afresh even if it is already the current page.")] = False,
+        include_html: Annotated[bool, Field(description="Also return the raw result HTML (large; normally not needed).")] = False,
+        timeout_seconds: float | None = Depends(lambda: DEBUG_TIMEOUT_SECONDS),
+    ) -> dict:
+        """(nextPage +) pageHtml + runTable via responder=debugTest."""
+        state = _require_session()
+        page = page_path or state.current_page or state.page
+
+        def run() -> dict:
+            html = _page_html(state, page, timeout_seconds)
+            if tables is not None:
+                parts = _split_tables(html)
+                bad = [i for i in tables if not 0 <= i < len(parts)]
+                if bad:
+                    raise ToolError(f"Table indices {bad} out of range: the page has {len(parts)} tables.")
+                html = "\n".join(parts[i] for i in tables)
+            data = _session_action(state, "runTable", {"html": html}, timeout_seconds=timeout_seconds)
+            return _document_result(state, data, page, include_html)
+
+        with _document(state):
+            return _run_document(state, page, restart, timeout_seconds, run)
+
+    @mcp.tool(
+        name="fitnesse_debug_inspect",
+        description=(
+            "Looks into the debug session. kind:\n"
+            "- 'keywords': the keywords you can use in tables right now. Without filter: per category"
+            " the keyword syntax, where %1, %2 are the cells for parameters (e.g. 'click %1' -> "
+            "'|click|//button|'). With filter (e.g. 'browser', 'click'): matching entries in full, "
+            "with parameters (label, allowed options), returnType, tableItems (the rows a keyword "
+            "expects in the rest of its table; 'This statement is mandatory' in helpText marks "
+            "required rows) and helpText.\n"
+            "- 'dynamicVariables': variables set during the test (name, value); include_system adds "
+            "the many unchanged Java system properties.\n"
+            "- 'scope': the objects whose keywords are available, innermost first (level, name, "
+            "class, depth).\n"
+            "- 'liveView': the Selenium grid session of the open browser and live_view_url, a link "
+            "where a person can watch the browser (password not included)."
+        ),
+        tags={"fitnesse", "debug", "execute"},
+        annotations={"destructiveHint": False},
+    )
+    def fitnesse_debug_inspect(
+        kind: Annotated[Literal["keywords", "dynamicVariables", "scope", "liveView"], Field(description="What to look at; see the tool description.")],
+        filter: Annotated[str | None, Field(description="Only for kind='keywords': text to search for (case-insensitive), e.g. 'browser'.")] = None,
+        limit: Annotated[int, Field(description="Only for kind='keywords' with filter: maximum number of entries.", ge=1)] = 30,
+        include_system: Annotated[bool, Field(description="Only for kind='dynamicVariables': also list the unchanged Java system properties (many).")] = False,
+        timeout_seconds: float | None = Depends(lambda: DEBUG_TIMEOUT_SECONDS),
+    ) -> dict:
+        """keywordsJson/dynamicVariables/scope/liveView via responder=debugTest."""
+        state = _require_session()
+        action = "keywordsJson" if kind == "keywords" else kind
+        with _document(state):
+            data = _session_action(state, action, timeout_seconds=timeout_seconds)
+        html = data.get("html") or ""
+        if kind == "keywords":
+            return _keywords(html, filter, limit)
+        if kind == "liveView":
+            cells = (_query_rows(html) or [[]])[0]
+            try:
+                browsers = json.loads(cells[3]) if len(cells) > 3 and cells[3] else []
+            except json.JSONDecodeError:
+                browsers = cells[3]
+            return _without_secrets({
+                "hub": cells[1] if len(cells) > 1 else "",
+                "selenium_session": cells[2] if len(cells) > 2 else "",
+                "browsers": browsers,
+                "live_view_url": data.get("liveViewUrl"),
+                "live_view_only": data.get("liveViewOnly"),
+            })
+        records = _query_records(html, kind)
+        if kind == "dynamicVariables":
+            for record in records:
+                record["system"] = record.get("system", "").lower() == "true"
+            if not include_system:
+                records = [r for r in records if not r["system"]]
+        return {kind: records}
+
+    @mcp.tool(
+        name="fitnesse_debug_end",
+        description=(
+            "Ends the debug session: the running test's tear down (and, in a suite, the suite tear "
+            "down) run, then the test process stops. Returns the tear-down result, the remaining log "
+            "lines and page_totals (counts per page). Call it whenever you are done.\n"
+            "abort=true stops the process immediately without tear down; it works even while another "
+            "call is still running. Use it when the session hangs or busy stays true."
+        ),
+        tags={"fitnesse", "debug", "execute"},
+        annotations={"destructiveHint": False},
+    )
+    def fitnesse_debug_end(
+        abort: Annotated[bool, Field(description="Stop immediately without tear down, even while a call is running.")] = False,
+        timeout_seconds: float | None = Depends(lambda: DEBUG_TIMEOUT_SECONDS),
+    ) -> dict:
+        """end/abort via responder=debugTest."""
+        state = _require_session()
+        form = {"logFrom": state.log_next}
+        if abort:
+            data = _session_action(state, "abort", form, timeout_seconds=30.0)
+            result: dict = {"ended": data.get("ended", True), "aborted": True}
+        else:
+            with _document(state):
+                data = _session_action(state, "end", form, timeout_seconds=timeout_seconds)
+            result = {"ended": data.get("ended", True)}
+            result["teardown"] = _document_result(state, data, state.current_page, include_html=False)
+        log = data.get("log")
+        if isinstance(log, dict):
+            result["log"] = _log_lines(log.get("lines"))
+        result["page_totals"] = state.page_counts
+        state.reset()
+        return result
+
+    @mcp.tool(
+        name="fitnesse_table_source",
+        description=(
+            "Reads a wiki page as its tables and the text between them, for changing single tables "
+            "with fitnesse_table_save, fitnesse_table_insert and fitnesse_table_delete. Result: "
+            "tables (wiki markup of each of the page's own tables; tables from included pages and "
+            "tables nested in cells are not counted) and texts, where texts[i] is the text before "
+            "tables[i] and the last text follows the last table. Does not need a debug session."
+        ),
+        tags={"fitnesse", "debug", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_table_source(
+        page_path: WikiPath,
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """source via responder=debugTable."""
+        return _debug_post("debugTable", page_path, "source", timeout_seconds=timeout_seconds)
+
+    # debugTable saves wiki pages for real: tagged write, so FITNESSE_READONLY hides them.
+    _TABLE_EDIT = (
+        " This saves the wiki page for real (it shows up in recent changes): change only pages you "
+        "are asked to change. Read fitnesse_table_source first and pass its texts unchanged; if the "
+        "page has changed since, the call fails: read it again and redo the change. Indices refer "
+        "to the source as read, so after a change read it again before the next one. A running "
+        "debug session sees the change when the page's tables are run again."
+    )
+    type TableIndex = Annotated[int, Field(description="Index among the page's own tables, as in fitnesse_table_source.", ge=0)]
+
+    @mcp.tool(
+        name="fitnesse_table_save",
+        description="Replaces table index of a page with new wiki markup; with last, replaces tables index..last together with the text between them (e.g. a defined action spread over several tables)." + _TABLE_EDIT,
+        tags={"fitnesse", "debug", "write"},
+        annotations={"destructiveHint": True},
+    )
+    def fitnesse_table_save(
+        page_path: WikiPath,
+        index: TableIndex,
+        original: Annotated[str, Field(description="Current wiki of table index (with last: of tables index..last and the text between), as from fitnesse_table_source.")],
+        wiki: Annotated[str, Field(description="New wiki markup.")],
+        last: Annotated[int | None, Field(description="Last table of a block to replace.", ge=0)] = None,
+        timeout_seconds: float = _make_timeout(60.0),
+    ) -> dict:
+        """save/saveBlock via responder=debugTable."""
+        action = "save" if last is None else "saveBlock"
+        return _debug_post(
+            "debugTable", page_path, action,
+            {"index": index, "last": last, "original": original, "wiki": wiki},
+            timeout_seconds=timeout_seconds,
+        )
+
+    @mcp.tool(
+        name="fitnesse_table_insert",
+        description="Inserts new table(s) before table index; index = number of tables appends them at the end of the page." + _TABLE_EDIT,
+        tags={"fitnesse", "debug", "write"},
+        annotations={"destructiveHint": False},
+    )
+    def fitnesse_table_insert(
+        page_path: WikiPath,
+        index: TableIndex,
+        before: Annotated[str, Field(description="Current text preceding table index (texts[index] of fitnesse_table_source).")],
+        wiki: Annotated[str, Field(description="Wiki markup of the new table(s).")],
+        timeout_seconds: float = _make_timeout(60.0),
+    ) -> dict:
+        """insert via responder=debugTable."""
+        return _debug_post(
+            "debugTable", page_path, "insert",
+            {"index": index, "before": before, "wiki": wiki},
+            timeout_seconds=timeout_seconds,
+        )
+
+    @mcp.tool(
+        name="fitnesse_table_delete",
+        description="Removes table index from the page." + _TABLE_EDIT,
+        tags={"fitnesse", "debug", "write"},
+        annotations={"destructiveHint": True},
+    )
+    def fitnesse_table_delete(
+        page_path: WikiPath,
+        index: TableIndex,
+        original: Annotated[str, Field(description="Current wiki of table index, as from fitnesse_table_source.")],
+        timeout_seconds: float = _make_timeout(60.0),
+    ) -> dict:
+        """delete via responder=debugTable."""
+        return _debug_post(
+            "debugTable", page_path, "delete",
+            {"index": index, "original": original},
             timeout_seconds=timeout_seconds,
         )
 

@@ -116,6 +116,10 @@ Three further notes:
 | `FITNESSE_MAX_RESPONSE_BYTES` | `1048576` (1 MB) | Responses above this are truncated and flagged `"truncated": true` |
 | `FITNESSE_FILES_MAX_TRANSFER_BYTES` | `10485760` (10 MB) | Uploads above this are rejected; downloads above this are truncated and rejected |
 | `FITNESSE_RUN_TIMEOUT_SECONDS` | `120` | Read timeout for `fitnesse_run_test` and `fitnesse_run_suite`; `0` disables it. Applies per socket read, so it caps idle time, not total run time. The MCP client and any proxy have their own timeouts |
+| `FITNESSE_KDTA_DEBUG` | `false` | `1`/`true`/`yes`/`on` exposes the KDTA debug tools (`fitnesse_debug_*`, `fitnesse_table_*`); needs netcare's FitNesse fork with the `debugTest`/`debugTable` responders |
+| `FITNESSE_DEBUG_TIMEOUT_SECONDS` | `660` | Read timeout for debug documents; keep it above the server's `debugTest.timeoutMinutes` (default 10 min). `0` disables it |
+| `FITNESSE_DEBUG_MAX_RESPONSE_BYTES` | `16777216` (16 MB) | Limit for raw debug answers (condensed before they reach the model); larger answers fail |
+| `FITNESSE_DEBUG_MAX_CELL_CHARS` | `1500` | Table cells (e.g. stack traces) in debug results are cut to this length |
 
 ---
 
@@ -208,6 +212,39 @@ both set.
 | `fitnesse_upload_file` | `upload` (POST multipart, content passed inline) _(needs `FITNESSE_FILES_ROOT`)_ | write |
 | `fitnesse_rename_file` | `renameFile` _(needs `FITNESSE_FILES_ROOT`)_ | write |
 | `fitnesse_delete_file` | `deleteFile` _(needs `FITNESSE_FILES_ROOT`)_ | write |
+
+### KDTA debug mode _(needs `FITNESSE_KDTA_DEBUG`)_
+
+Run a test table by table in a long-lived test process (`responder=debugTest`)
+and edit single tables of a page (`responder=debugTable`). Results are not
+written to the test history.
+
+| Tool | Action | Mode |
+|---|---|---|
+| `fitnesse_debug_start` | `status`, then `start`; refuses if a session of the account runs, unless `replace`. With `suite`: also `suitePages` | execute |
+| `fitnesse_debug_status` | `status` plus new `log` lines; `adopt` continues a running session | read |
+| `fitnesse_debug_run_wiki` | `runWiki` — wiki tables in the context of the current page, no SetUp/TearDown; `restart` runs `nextPage` first | execute |
+| `fitnesse_debug_page_tables` | `pageHtml`, split into tables | read |
+| `fitnesse_debug_run_page` | `nextPage` (on page change or `restart`), `pageHtml`, `runTable` | execute |
+| `fitnesse_debug_inspect` | `keywordsJson` (filterable), `dynamicVariables`, `scope`, `liveView` (VNC password removed) | execute |
+| `fitnesse_debug_end` | `end` or `abort`, with the unread log | execute |
+| `fitnesse_table_source` | `debugTable source` | read |
+| `fitnesse_table_save`, `fitnesse_table_insert`, `fitnesse_table_delete` | `debugTable save`/`saveBlock`, `insert`, `delete` — saves the wiki page | write |
+
+Notes:
+
+- **One debug session per FitNesse account.** Starting one kills a running
+  session of the same account without tear down, so `fitnesse_debug_start`
+  refuses unless told otherwise. Prefer a technical user for the MCP server.
+  Every later action sends the session id; if someone replaced the session,
+  the server answers 409 and the MCP server forgets it.
+- Use Basic Auth (`FITNESSE_USERNAME`/`FITNESSE_PASSWORD`): it bypasses the
+  SSO proxy. A non-JSON answer is reported as a login problem.
+- Documents of a session run one after the other; a second one fails at once
+  instead of queueing. `fitnesse_debug_status` (with the log) and
+  `fitnesse_debug_end(abort=true)` work while a document runs.
+- End the session when done: it holds one of `debugTest.maxSessions` and
+  possibly grid browsers until `debugTest.idleMinutes` ends it.
 
 </details>
 

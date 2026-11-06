@@ -6,6 +6,7 @@ Behavioural tests for server.py.
 Run with:  pytest tests/test_server.py -v
 """
 import base64
+import json
 import importlib
 import os
 from unittest.mock import patch
@@ -25,9 +26,10 @@ class _FakeResponse:
     """Minimal urllib response stub."""
     status = 200
 
-    def __init__(self, body: bytes = b'{"ok":true}', content_type: str = "application/json"):
+    def __init__(self, body: bytes = b'{"ok":true}', content_type: str = "application/json", chunk: int | None = None):
         self._body = body
         self._ct = content_type
+        self._chunk = chunk  # at most this many bytes per read, as http.client may return
 
     @property
     def headers(self):
@@ -35,7 +37,9 @@ class _FakeResponse:
         return type("H", (), {"get": lambda self, k, d="": ct})()
 
     def read(self, n: int) -> bytes:
-        return self._body[:n]
+        n = min(n, self._chunk or n)
+        data, self._body = self._body[:n], self._body[n:]
+        return data
 
     def __enter__(self):
         return self
@@ -45,7 +49,8 @@ class _FakeResponse:
 
 
 def _patch_urlopen(body: bytes = b'{"ok":true}', content_type: str = "application/json"):
-    return patch("urllib.request.urlopen", return_value=_FakeResponse(body, content_type))
+    """Every request gets a fresh response with this body."""
+    return patch("urllib.request.urlopen", side_effect=lambda *a, **k: _FakeResponse(body, content_type))
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +113,48 @@ async def test_read_tool_returns_ok():
             result = await c.call_tool("fitnesse_get_page_data", {"page_path": "FrontPage"})
     assert result.data["ok"] is True
     assert "FrontPage" in result.data["url"]
+
+
+@pytest.mark.asyncio
+async def test_body_read_to_the_end_when_reads_come_short():
+    body = b'{"ok": true, "items": [' + b",".join(b'"%d"' % i for i in range(200)) + b"]}"
+    with patch("urllib.request.urlopen", side_effect=lambda *a, **k: _FakeResponse(body, chunk=7)):
+        async with Client(my_server.mcp) as c:
+            result = await c.call_tool("fitnesse_get_page_data", {"page_path": "FrontPage"})
+    body_out = result.data["body"]
+    assert (json.loads(body_out) if isinstance(body_out, str) else body_out)["items"][-1] == "199"
+    assert result.data["truncated"] is False
+
+
+class _CutResponse(_FakeResponse):
+    """Announces the whole body in Content-Length but ends after `cut` bytes."""
+
+    def __init__(self, body: bytes, cut: int):
+        super().__init__(body[:cut])
+        self._length = str(len(body))
+
+    @property
+    def headers(self):
+        length, ct = self._length, self._ct
+        return type("H", (), {"get": lambda self, k, d="": length if k == "Content-Length" else ct})()
+
+
+@pytest.mark.asyncio
+async def test_answer_that_ends_early_is_fetched_again_for_get_only():
+    body = b'{"ok": true, "pad": "' + b"x" * 300 + b'"}'
+    answers = iter([_CutResponse(body, 50), _FakeResponse(body)])
+    with patch("urllib.request.urlopen", side_effect=lambda *a, **k: next(answers)) as urlopen:
+        result = my_server._request("GET", "FrontPage")
+    assert result["ok"] is True and result["body"]["ok"] is True and urlopen.call_count == 2
+
+    with patch("urllib.request.urlopen", side_effect=lambda *a, **k: _CutResponse(body, 50)) as urlopen:
+        result = my_server._request("GET", "FrontPage")
+    assert result["ok"] is False and urlopen.call_count == 3
+    assert result["error"] == f"FitNesse closed the connection after 50 of {len(body)} bytes; tried 3 times"
+
+    with patch("urllib.request.urlopen", side_effect=lambda *a, **k: _CutResponse(body, 50)) as urlopen:
+        result = my_server._request("POST", "FrontPage", body="x")
+    assert result["ok"] is False and urlopen.call_count == 1 and "may have taken effect" in result["error"]
 
 
 @pytest.mark.asyncio
@@ -661,7 +708,7 @@ _HISTORY_XML = (
 async def test_page_history_strips_execution_log_by_default():
     with _patch_urlopen(body=_HISTORY_XML, content_type="text/xml"):
         async with Client(my_server.mcp) as c:
-            result = await c.call_tool("fitnesse_get_page_history", {"page_path": "SuiteA"})
+            result = await c.call_tool("fitnesse_get_page_history", {"page_path": "SuiteA", "raw": True})
     body = result.data["body"]
     assert "<testSystem>slim</testSystem>" in body
     assert "<exitCode>0</exitCode>" in body
@@ -676,7 +723,7 @@ async def test_page_history_include_flags_keep_elements():
         async with Client(my_server.mcp) as c:
             result = await c.call_tool(
                 "fitnesse_get_page_history",
-                {"page_path": "SuiteA", "include_stdout": True, "include_stderr": True},
+                {"page_path": "SuiteA", "include_stdout": True, "include_stderr": True, "raw": True},
             )
     body = result.data["body"]
     assert "<stdOut>lots of output</stdOut>" in body
@@ -699,9 +746,86 @@ async def test_page_history_logs_when_truncated(monkeypatch, caplog):
     monkeypatch.setattr(my_server, "MAX_BYTES", 20)
     with _patch_urlopen(body=_HISTORY_XML, content_type="text/xml"):
         async with Client(my_server.mcp) as c:
-            result = await c.call_tool("fitnesse_get_page_history", {"page_path": "SuiteA"})
+            result = await c.call_tool("fitnesse_get_page_history", {"page_path": "SuiteA", "raw": True})
     assert result.data["truncated"] is True
     assert "FITNESSE_MAX_RESPONSE_BYTES=20" in caplog.text
+
+
+_RUNS_XML = (
+    b"<?xml version='1.0'?><PageHistory><Page><Name>S.T</Name>"
+    b"<TestResult><Date>Fri Nov 06 22:59:35 GMT 2026</Date>"
+    b"<ResultLink>S.T?pageHistory&amp;resultDate=20261106225935&amp;format=xml</ResultLink>"
+    b"<Pass>3</Pass><Fail>1</Fail></TestResult></Page></PageHistory>"
+)
+_SUITE_RUN_XML = (
+    b"<?xml version='1.0'?><suiteResults><rootPath>S</rootPath><date>2026-11-06T22:59:35Z</date>"
+    b"<pageHistoryReference><name>S.A</name><pageHistoryLink>S.A?pageHistory&amp;resultDate=20261106225946</pageHistoryLink>"
+    b"<counts><right>9</right><wrong>3</wrong><ignores>0</ignores><exceptions>2</exceptions></counts>"
+    b"<runTimeInMillis>16011</runTimeInMillis></pageHistoryReference>"
+    b"<pageHistoryReference><name>S.B</name><pageHistoryLink>S.B?pageHistory&amp;resultDate=20261106230022</pageHistoryLink>"
+    b"<counts><right>11</right><wrong>0</wrong><ignores>0</ignores><exceptions>0</exceptions></counts>"
+    b"<runTimeInMillis>4061</runTimeInMillis></pageHistoryReference>"
+    b"<executionLog><command>java</command><exitCode>1</exitCode><stdOut>out</stdOut><stdErr></stdErr></executionLog>"
+    b"<finalCounts><right>1</right><wrong>1</wrong><ignores>0</ignores><exceptions>0</exceptions></finalCounts></suiteResults>"
+)
+_TEST_RUN_XML = (
+    b"<?xml version='1.0'?><testResults><rootPath>S.A</rootPath><result>"
+    b"<counts><right>1</right><wrong>1</wrong><ignores>0</ignores><exceptions>0</exceptions></counts>"
+    b"<date>2026-11-06T23:00:26Z</date><runTimeInMillis>22914</runTimeInMillis><content>"
+    b"&lt;table&gt;&lt;tr&gt;&lt;td class=\"pass\"&gt;open&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;"
+    b"&lt;table&gt;&lt;tr&gt;&lt;td&gt;url&lt;/td&gt;&lt;td class=\"fail\"&gt;x expected&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;"
+    b"</content><relativePageName>A</relativePageName></result>"
+    b"<executionLog><exitCode>0</exitCode></executionLog></testResults>"
+)
+
+
+async def _history(body, **args):
+    with _patch_urlopen(body=body, content_type="text/xml"):
+        async with Client(my_server.mcp) as c:
+            return (await c.call_tool("fitnesse_get_page_history", {"page_path": "S", **args})).data
+
+
+@pytest.mark.asyncio
+async def test_page_history_condensed_by_default():
+    data = await _history(_RUNS_XML)
+    assert "body" not in data
+    assert data["runs"] == [{"page": "S.T", "date": "Fri Nov 06 22:59:35 GMT 2026",
+                             "result_date": "20261106225935", "pass": 3, "fail": 1}]
+
+    data = await _history(_SUITE_RUN_XML, result_date="latest")
+    assert data["failed_pages"] == ["S.A"] and data["exit_code"] == 1
+    assert data["pages"][0] == {"page": "S.A", "outcome": "error", "result_date": "20261106225946",
+                                "counts": {"right": 9, "wrong": 3, "ignores": 0, "exceptions": 2}, "run_time_ms": 16011}
+    assert data["pages"][1]["outcome"] == "pass" and data["final_counts"]["wrong"] == 1
+    assert "stdout" not in data and "command" not in data  # dropped unless asked for
+    assert (await _history(_SUITE_RUN_XML, include_stdout=True))["stdout"] == "out"
+
+    data = await _history(_TEST_RUN_XML, result_date="20261106230026")
+    assert data["page"] == "S.A" and data["outcome"] == "fail" and data["run_time_ms"] == 22914
+    assert data["tables"] == "Table 1:\n| url | [fail] x expected |"  # only failing tables, page numbers
+    assert data["tables_without_failures"] == 1 and "exit_code" not in data
+
+
+_OVERVIEW_HTML = (
+    '<body class="suiteOverview"><table><tr><td class="passed_tests"/><td>1 </td><td>(50%)</td>'
+    "<td> Test(s) Passed </td></tr><tr><td class=\"unrun_tests\"/><td>0</td><td>(0%)</td><td> Test(s) Not Run </td></tr>"
+    '<tr><td class="failed_tests"/><td>  1 </td><td> (50%)</td><td>Test(s) Failed </td></tr></table><ul>'
+    '<li class="completion_test"><a href="S.A?pageHistory&resultDate=20261106225946" class="fail">A</a></li>'
+    '<li class="completion_test"><a href="S.B?pageHistory&amp;resultDate=20261106230022" class="done">B</a></li>'
+    "</ul></body>"
+).encode()
+
+
+@pytest.mark.asyncio
+async def test_suite_overview_condensed_by_default():
+    with _patch_urlopen(body=_OVERVIEW_HTML, content_type="text/html"):
+        async with Client(my_server.mcp) as c:
+            data = (await c.call_tool("fitnesse_get_suite_overview", {"page_path": "S"})).data
+            raw = (await c.call_tool("fitnesse_get_suite_overview", {"page_path": "S", "raw": True})).data
+    assert data["summary"] == {"passed": 1, "not_run": 0, "failed": 1} and "body" not in data
+    assert data["failed_pages"] == ["S.A"]
+    assert data["pages"][1] == {"page": "S.B", "outcome": "pass", "result_date": "20261106230022"}
+    assert "suiteOverview" in raw["body"]
 
 
 @pytest.mark.asyncio

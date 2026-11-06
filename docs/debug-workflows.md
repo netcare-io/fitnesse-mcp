@@ -14,7 +14,7 @@ pages. Every tool and its full description: [tools.md](tools.md).
 | Look | `fitnesse_debug_inspect` (`keywords`, `definedActions`, `dynamicVariables`, `scope`, `liveView`), `fitnesse_debug_page_tables` | read |
 | Source | `fitnesse_table_source`, `fitnesse_debug_defined_action_source` | read |
 | Edit | `fitnesse_table_save`, `_insert`, `_delete`, `_move`, `_save_text`, `_move_text` | write |
-| Find the failure | `fitnesse_run_test`, `fitnesse_get_page_history` (not debug tools) | test / read |
+| Find the failure | `fitnesse_get_suite_overview`, `fitnesse_get_page_history`, `fitnesse_run_test` (not debug tools) | read / test |
 
 What to keep in mind:
 
@@ -29,7 +29,10 @@ What to keep in mind:
   (SetUp, TearDown, included pages); `fitnesse_table_source` counts only a page's own tables.
   `page_tables` gives each table's `source_page` and `source_index` for editing.
 - **Results.** Cells are prefixed `[pass]`, `[fail]`, `[error]`, `[ignore]`; `counts` are the
-  call's, `page_totals` the page's so far. Inline screenshots come back as images.
+  call's, `page_totals` the page's so far. Tables keep their `page_tables` index, also when
+  only some ran. Inline screenshots come back as images.
+- **The SetUp counts as run** after `run_page(setup_only=true)`, a whole-page run, or `tables`
+  that include all `setup_tables`.
 - **One session per page and account** (mod #159; older forks: per account). This server works
   with one session at a time. Always end it: it holds a server slot and browsers.
 
@@ -38,7 +41,8 @@ What to keep in mind:
 The most common case: a test fails and the cause is unclear.
 
 ```
-fitnesse_run_test / fitnesse_get_page_history   which page and table fail
+fitnesse_get_suite_overview(suite)              failed_pages with result_date
+fitnesse_get_page_history(page, result_date)    the failing tables of that run
 fitnesse_debug_start(page)
 fitnesse_debug_run_page(setup_only=true)        browser, defined actions, fixtures
 fitnesse_debug_page_tables                      indices; the failing table is k

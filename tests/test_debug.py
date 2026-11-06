@@ -45,16 +45,22 @@ def debug_env():
 
 
 class _Resp:
-    def __init__(self, status, body, content_type="application/json", cookies=()):
+    def __init__(self, status, body, content_type="application/json", cookies=(), chunk=None, cut=None):
         self.status = status
+        self._chunk = chunk  # at most this many bytes per read, as http.client may return
         self._body = body if isinstance(body, bytes) else json.dumps(body).encode()
         self.headers = Message()
         self.headers["Content-Type"] = content_type
+        if cut is not None:  # the connection ends after cut bytes of the announced body
+            self.headers["Content-Length"] = str(len(self._body))
+            self._body = self._body[:cut]
         for cookie in cookies:
             self.headers["Set-Cookie"] = cookie
 
     def read(self, n):
-        return self._body[:n]
+        n = min(n, self._chunk or n)
+        data, self._body = self._body[:n], self._body[n:]
+        return data
 
     def __enter__(self):
         return self
@@ -342,6 +348,27 @@ async def test_replaced_session_is_forgotten(debug_env):
 async def test_non_json_answer_reported_as_login_problem(debug_env):
     with pytest.raises(ToolError, match="login"):
         await _call("fitnesse_debug_status", {}, (200, b"<html>SSO</html>", "text/html"))
+
+
+@pytest.mark.asyncio
+async def test_debug_answer_read_to_the_end_when_reads_come_short(debug_env):
+    # http.client's read(n) may stop early; a large keywordsJson answer was cut off that way
+    data, _ = await _call("fitnesse_debug_status", {}, (200, {"running": False, "pad": "x" * 5000}, "application/json", (), 7))
+    assert data["running"] is False
+
+
+@pytest.mark.asyncio
+async def test_debug_answer_that_ends_early_is_fetched_again_only_for_reading_actions(debug_env):
+    full = {"running": False, "pad": "x" * 500}
+    data, fake = await _call("fitnesse_debug_status", {}, (200, full, "application/json", (), None, 100), (200, full))
+    assert data["running"] is False and fake.actions == ["status", "status"]
+    with pytest.raises(ToolError, match="after 100 of .* bytes .* Tried 3 times"):
+        await _call("fitnesse_debug_status", {}, *[(200, full, "application/json", (), None, 100)] * 3)
+
+    await _start()
+    with pytest.raises(ToolError, match="(?s)after 10 of .*'runWiki'.*may have taken effect.*fitnesse_debug_status") as err:
+        await _call("fitnesse_debug_run_wiki", {"wiki": "|x|"}, (200, {"html": "", "counts": {}}, "application/json", (), None, 10))
+    assert "Tried" not in str(err.value)  # runWiki changes the session: not repeated
 
 
 @pytest.mark.asyncio
@@ -903,6 +930,32 @@ async def test_run_wiki_failing_before_the_setup_hints_at_setup_only(debug_env):
     )
     data, _ = await _call("fitnesse_debug_run_wiki", {"wiki": "|greet|"}, wrong)
     assert "hint" not in data  # SetUp ran: a real failure
+
+
+@pytest.mark.asyncio
+async def test_run_page_with_tables_that_include_the_setup_counts_as_setup(debug_env):
+    await _start()
+    page = (200, {"page": "FrontPage.T", "html": TEARDOWN_HTML})
+    ran = (200, {"html": "<table><tr><td class=\"pass\">setup</td></tr></table>"
+                         "<table><tr><td class=\"fail\">own</td></tr></table>", "counts": {"right": 1, "wrong": 1}})
+    data, _ = await _call("fitnesse_debug_run_page", {"tables": [0, 1]}, page, ran)
+    wrong = (200, {"html": "<table><tr><td class=\"error\">greet</td></tr></table>", "counts": {"exceptions": 1}})
+    data, fake = await _call("fitnesse_debug_run_wiki", {"wiki": "|greet|"}, wrong)
+    assert fake.actions == ["runWiki"] and "hint" not in data  # SetUp ran with tables=[0, 1]
+    data, fake = await _call("fitnesse_debug_run_page", {}, page, (200, {"html": "", "counts": {}}))
+    assert data["skipped_setup"] == [0]  # and a whole-page run leaves it out
+
+
+@pytest.mark.asyncio
+async def test_run_page_with_tables_numbers_them_as_on_the_page(debug_env):
+    await _start()
+    page = (200, {"page": "FrontPage.T", "html": TEARDOWN_HTML})
+    ran = (200, {"html": "<table><tr><td class=\"fail\">teardown</td></tr></table>"
+                         "<table><tr><td class=\"pass\">own</td></tr></table>", "counts": {"right": 1, "wrong": 1}})
+    data, _ = await _call("fitnesse_debug_run_page", {"tables": [2, 1]}, page, ran)
+    assert data["tables"].startswith("Table 2:\n| [fail] teardown |") and "Table 1:\n| [pass] own |" in data["tables"]
+    data, _ = await _call("fitnesse_debug_run_page", {"tables": [2, 1], "only_failures": True}, page, ran)
+    assert data["tables"].startswith("Table 2:") and "Table 1" not in data["tables"]
 
 
 @pytest.mark.asyncio

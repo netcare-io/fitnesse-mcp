@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 import binascii
+from html import unescape as _unescape_html
 import json
 import logging
 import mimetypes
@@ -269,6 +270,52 @@ def _build_url(
     return f"{base}{normalized_path}?{query}"
 
 
+def _read_body(response, limit: int) -> bytes:
+    """Up to limit bytes of the body. http.client's read(n) may return fewer bytes than asked for
+    before the end of the body, so read until EOF or the limit."""
+    chunks, size = [], 0
+    while size < limit:
+        chunk = response.read(limit - size)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    return b"".join(chunks)
+
+
+def _missing_bytes(headers, body: bytes, limit: int) -> str | None:
+    """'closed after N of M bytes' if the connection ended before Content-Length (and the limit).
+    Seen with FitNesse behind Docker's host.docker.internal: a few large answers end early."""
+    try:
+        length = int(headers.get("Content-Length") or "") if headers is not None else None
+    except ValueError:
+        length = None
+    if length is None or len(body) >= min(length, limit):
+        return None
+    return f"FitNesse closed the connection after {len(body)} of {length} bytes"
+
+
+_READ_ATTEMPTS = 3  # for answers that end early; only requests that change nothing are repeated
+
+
+def _retrying(once):
+    """Repeat a GET whose answer ended early (result '_incomplete'); report it after the last try."""
+    def call(method: str, path: str, *args, **kwargs) -> dict:
+        attempts = _READ_ATTEMPTS if method.upper() in ("GET", "HEAD") else 1
+        for attempt in range(1, attempts + 1):
+            result = once(method, path, *args, **kwargs)
+            if not result.pop("_incomplete", False):
+                return result
+            logger.warning("%s (%s, attempt %d of %d)", result["error"], result["url"], attempt, attempts)
+        result["error"] += (
+            f"; tried {attempts} times" if attempts > 1 else "; the request may have taken effect anyway"
+        )
+        return result
+    call.__wrapped__ = once
+    return call
+
+
+@_retrying
 def _request(
     method: str,
     path: str,
@@ -294,7 +341,10 @@ def _request(
 
     try:
         with request.urlopen(req, timeout=timeout_seconds) as response:
-            raw_bytes = response.read(MAX_BYTES + 1)
+            raw_bytes = _read_body(response, MAX_BYTES + 1)
+            missing = _missing_bytes(response.headers, raw_bytes, MAX_BYTES + 1)
+            if missing:
+                return {"ok": False, "status": response.status, "url": url, "error": missing, "_incomplete": True}
             truncated = len(raw_bytes) > MAX_BYTES
             if truncated:
                 logger.warning(
@@ -320,7 +370,7 @@ def _request(
                 "body": payload,
             }
     except HTTPError as exc:
-        error_body = exc.read(MAX_BYTES).decode("utf-8", errors="replace")
+        error_body = _read_body(exc, MAX_BYTES).decode("utf-8", errors="replace")
         return {
             "ok": False,
             "status": exc.code,
@@ -346,6 +396,7 @@ def _request(
         }
 
 
+@_retrying
 def _request_bytes(
     method: str,
     path: str,
@@ -366,7 +417,10 @@ def _request_bytes(
 
     try:
         with request.urlopen(req, timeout=timeout_seconds) as response:
-            raw_bytes = response.read(MAX_TRANSFER_BYTES + 1)
+            raw_bytes = _read_body(response, MAX_TRANSFER_BYTES + 1)
+            missing = _missing_bytes(response.headers, raw_bytes, MAX_TRANSFER_BYTES + 1)
+            if missing:
+                return {"ok": False, "status": response.status, "url": url, "error": missing, "_incomplete": True}
             truncated = len(raw_bytes) > MAX_TRANSFER_BYTES
             if truncated:
                 logger.warning(
@@ -388,7 +442,7 @@ def _request_bytes(
             "status": exc.code,
             "url": url,
             "error": f"HTTP error: {exc.reason}",
-            "body": exc.read(MAX_BYTES).decode("utf-8", errors="replace"),
+            "body": _read_body(exc, MAX_BYTES).decode("utf-8", errors="replace"),
         }
     except TimeoutError:
         return {
@@ -978,7 +1032,14 @@ def fitnesse_get_page_data(
 
 @mcp.tool(
     name="fitnesse_get_page_history",
-    description="Displays test history for a page with optional resultDate selector. Returns XML.",
+    description=(
+        "Test history of a page, condensed. Without result_date: the page's runs (runs: date, "
+        "result_date, pass, fail). With result_date (yyyyMMddHHmmss from runs, or 'latest'): that "
+        "run. For a suite: final_counts and pages (page, outcome, counts, result_date; failed_pages "
+        "lists the red ones): call again with a failing page and its result_date. For a test page: "
+        "outcome, counts and tables, only the tables with a [fail] or [error] cell, cells prefixed "
+        "[pass]/[fail]/[error]/[ignore]. raw=true returns FitNesse's XML instead."
+    ),
     tags={"fitnesse", "rest", "history", "read"},
     annotations={"readOnlyHint": True},
 )
@@ -988,6 +1049,7 @@ def fitnesse_get_page_history(
     include_command: bool = False,
     include_stdout: bool = False,
     include_stderr: bool = False,
+    raw: Annotated[bool, Field(description="Return FitNesse's XML (body) instead of the condensed result.")] = False,
     timeout_seconds: float = _make_timeout(30.0),
 ) -> dict:
     """Get page history via responder=pageHistory.
@@ -1001,12 +1063,12 @@ def fitnesse_get_page_history(
     result = _request_bytes("GET", page_path, params=params, timeout_seconds=timeout_seconds)
     if not result["ok"]:
         return result
-    raw: bytes = result["body"]
+    xml_bytes: bytes = result["body"]
     if result["truncated"]:
         logger.warning("Page history from %s not filtered: response was truncated", result["url"])
     else:
-        raw = _strip_execution_log(
-            raw,
+        xml_bytes = _strip_execution_log(
+            xml_bytes,
             {
                 tag
                 for tag, keep in (
@@ -1017,17 +1079,104 @@ def fitnesse_get_page_history(
                 if not keep
             },
         )
-    if len(raw) > MAX_BYTES:
+        summary = None if raw else _history_summary(xml_bytes)
+        if summary is not None:
+            del result["body"]
+            result.update(summary)
+            return result
+    if len(xml_bytes) > MAX_BYTES:
         logger.warning(
             "Page history from %s is %d bytes after filtering, truncated to "
             "FITNESSE_MAX_RESPONSE_BYTES=%d",
             result["url"],
-            len(raw),
+            len(xml_bytes),
             MAX_BYTES,
         )
         result["truncated"] = True
-    result["body"] = raw[:MAX_BYTES].decode("utf-8", errors="replace")
+    result["body"] = xml_bytes[:MAX_BYTES].decode("utf-8", errors="replace")
     return result
+
+
+_RESULT_DATE = re.compile(r"resultDate=(\d+)")
+
+
+def _int_counts(element) -> dict[str, int]:
+    counts = element.find("counts") if element is not None else None
+    if counts is None:
+        return {}
+    return {c.tag: int(c.text or 0) for c in counts if (c.text or "").strip().isdigit()}
+
+
+def _result_status(counts: dict[str, int]) -> str:
+    if counts.get("exceptions"):
+        return "error"
+    if counts.get("wrong"):
+        return "fail"
+    if counts.get("right"):
+        return "pass"
+    return "ignore" if counts.get("ignores") else "no checks"
+
+
+def _result_date(link: str | None) -> str | None:
+    found = _RESULT_DATE.search(link or "")
+    return found.group(1) if found else None
+
+
+def _history_summary(xml_bytes: bytes) -> dict | None:
+    """Condense pageHistory XML (a page's runs, a suite run or a test run); None if not one of them."""
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return None
+    text = lambda element, tag: (element.findtext(tag) or "").strip() or None  # noqa: E731
+    if root.tag == "PageHistory":
+        runs = [
+            {"page": text(page, "Name"), "date": text(run, "Date"),
+             "result_date": _result_date(text(run, "ResultLink")),
+             "pass": int(text(run, "Pass") or 0), "fail": int(text(run, "Fail") or 0)}
+            for page in root.iter("Page") for run in page.iter("TestResult")
+        ]
+        return {"runs": runs}
+    log = root.find("executionLog")
+    extras = {}
+    if log is not None:
+        if text(log, "exitCode") not in (None, "0"):
+            extras["exit_code"] = int(text(log, "exitCode"))
+        for tag, key in (("command", "command"), ("stdOut", "stdout"), ("stdErr", "stderr")):
+            if text(log, tag):  # only present when include_* asked for it
+                extras[key] = text(log, tag)
+    if root.tag == "suiteResults":
+        pages = []
+        for ref in root.iter("pageHistoryReference"):
+            counts = _int_counts(ref)
+            pages.append({"page": text(ref, "name"), "outcome": _result_status(counts), "counts": counts,
+                          "result_date": _result_date(text(ref, "pageHistoryLink")),
+                          "run_time_ms": int(text(ref, "runTimeInMillis") or 0)})
+        final = root.find("finalCounts")
+        return {
+            "page": text(root, "rootPath"), "date": text(root, "date"),
+            "final_counts": {c.tag: int(c.text or 0) for c in final} if final is not None else {},
+            "failed_pages": [p["page"] for p in pages if p["outcome"] in ("fail", "error")],
+            "pages": pages, **extras,
+        }
+    if root.tag == "testResults":
+        results = []
+        for res in root.iter("result"):
+            counts = _int_counts(res)
+            content = res.findtext("content") or ""
+            document = _parse_document(content)
+            entry = {"page": res.findtext("relativePageName") or text(root, "rootPath"),
+                     "outcome": _result_status(counts), "counts": counts, "date": text(res, "date"),
+                     "run_time_ms": int(text(res, "runTimeInMillis") or 0),
+                     "tables": _tables_text(content, document, only_failures=True)}
+            passed = sum(1 for t in document["tables"] if not _failed(t))
+            if passed:
+                entry["tables_without_failures"] = passed
+            results.append(entry)
+        if len(results) == 1:
+            return {**results[0], "page": text(root, "rootPath") or results[0]["page"], **extras}
+        return {"page": text(root, "rootPath"), "results": results, **extras}
+    return None
 
 
 def _strip_execution_log(raw: bytes, tags: set[str]) -> bytes:
@@ -1896,8 +2045,10 @@ def fitnesse_replace(
 @mcp.tool(
     name="fitnesse_get_suite_overview",
     description=(
-        "Shows the test pages of a suite as a tree with their latest results, without running "
-        "anything. Takes the same test selection as fitnesse_run_suite. Returns HTML."
+        "The latest result of each test page of a suite, without running anything: summary "
+        "(passed, not_run, failed), pages (page, outcome, result_date) and failed_pages. For why a "
+        "page failed, call fitnesse_get_page_history(page, result_date). Takes the same test "
+        "selection as fitnesse_run_suite. raw=true returns FitNesse's HTML instead."
     ),
     tags={"fitnesse", "rest", "tests", "read"},
     annotations={"readOnlyHint": True},
@@ -1909,9 +2060,10 @@ def fitnesse_get_suite_overview(
     run_tests_matching_all_tags: TagList = None,
     exclude_suite_filter: TagList = None,
     first_test: str | None = None,
+    raw: Annotated[bool, Field(description="Return FitNesse's HTML (body) instead of the condensed result.")] = False,
     timeout_seconds: float = _make_timeout(60.0),
 ) -> dict:
-    """Suite tree with latest results via responder=overview."""
+    """Suite tree with latest results via responder=overview (HTML only, no format parameter)."""
     params: dict[str, str | None] = {"responder": "overview"}
     params.update(
         _suite_filter_params(
@@ -1922,7 +2074,33 @@ def fitnesse_get_suite_overview(
             first_test,
         )
     )
-    return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+    result = _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+    summary = None if raw or not result.get("ok") or result.get("truncated") else _overview_summary(result.get("body"))
+    if summary is not None:
+        del result["body"]
+        result.update(summary)
+    return result
+
+
+_OVERVIEW_COUNT = re.compile(r"<td>\s*(\d+)\s*</td>\s*<td>[^<]*</td>\s*<td>\s*Test\(s\) (Passed|Not Run|Failed)")
+_OVERVIEW_PAGE = re.compile(r'<li class="completion_test">\s*<a href="([^"?]+)(?:\?[^"]*)?" class="([^"]*)"')
+_OVERVIEW_STATUS = {"done": "pass", "pass": "pass", "fail": "fail", "error": "error", "unrun": "not run"}
+
+
+def _overview_summary(body) -> dict | None:
+    """Counts and per-page status from the overview responder's HTML; None if it isn't one."""
+    if not isinstance(body, str) or "suiteOverview" not in body:
+        return None
+    counts = {k.lower().replace(" ", "_"): int(n) for n, k in _OVERVIEW_COUNT.findall(body)}
+    pages = []
+    for match in _OVERVIEW_PAGE.finditer(body):
+        href = _unescape_html(match.group(0))
+        pages.append({"page": match.group(1), "outcome": _OVERVIEW_STATUS.get(match.group(2), match.group(2) or "not run"),
+                      "result_date": _result_date(href)})
+    if not counts and not pages:
+        return None
+    return {"summary": counts, "failed_pages": [p["page"] for p in pages if p["outcome"] in ("fail", "error")],
+            "pages": pages}
 
 
 if COMPLETE_TOOLSET:
@@ -2183,7 +2361,43 @@ def _not_a_json_object(
     )
 
 
+class _IncompleteAnswer(ToolError):
+    """The connection ended before the whole answer arrived."""
+
+
+# debugTest/debugTable actions that only read: repeated when their answer ends early.
+_READ_ONLY_DEBUG_ACTIONS = frozenset({
+    "status", "log", "keywords", "keywordsJson", "definedActions", "definedAction", "dynamicVariables",
+    "scope", "liveView", "pageHtml", "source", "suitePages",
+})
+
+
 def _debug_post(
+    responder: str,
+    page_path: str,
+    action: str,
+    form: Mapping[str, str | int | bool | None] | None = None,
+    timeout_seconds: float | None = 30.0,
+    state: _DebugState | None = None,
+) -> dict:
+    """_debug_post_once; an answer that ends early is fetched again for actions that only read."""
+    attempts = _READ_ATTEMPTS if action in _READ_ONLY_DEBUG_ACTIONS else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return _debug_post_once(responder, page_path, action, form, timeout_seconds, state)
+        except _IncompleteAnswer as exc:
+            logger.warning("%s (attempt %d of %d)", exc, attempt, attempts)
+            if attempt == attempts:
+                if attempts > 1:
+                    raise ToolError(f"{exc} Tried {attempts} times; try again later.") from exc
+                raise ToolError(
+                    f"{exc} The call may have taken effect anyway: check fitnesse_debug_status "
+                    "before repeating it."
+                ) from exc
+    raise AssertionError("unreachable")
+
+
+def _debug_post_once(
     responder: str,
     page_path: str,
     action: str,
@@ -2221,7 +2435,7 @@ def _debug_post(
         with response:
             status = response.status if not isinstance(response, HTTPError) else response.code
             headers = response.headers
-            raw_bytes = response.read(DEBUG_MAX_BYTES + 1)
+            raw_bytes = _read_body(response, DEBUG_MAX_BYTES + 1)
     except TimeoutError as exc:
         raise ToolError(
             f"No answer to '{action}' within {timeout_seconds}s. The test process may still be "
@@ -2235,6 +2449,9 @@ def _debug_post(
             pair = header.split(";", 1)[0].strip()
             if pair.startswith(f"{_DEBUG_COOKIE}="):
                 state.cookie = pair
+    missing = _missing_bytes(headers, raw_bytes, DEBUG_MAX_BYTES + 1)
+    if missing:
+        raise _IncompleteAnswer(f"{missing} of the answer to '{action}'.")
     if len(raw_bytes) > DEBUG_MAX_BYTES:
         logger.warning("Response from %s exceeds FITNESSE_DEBUG_MAX_RESPONSE_BYTES=%d", url, DEBUG_MAX_BYTES)
         raise ToolError(
@@ -2506,19 +2723,24 @@ def _failed(table: dict) -> bool:
     return any(cell["status"] in ("fail", "error") for row in table["rows"] for cell in row)
 
 
-def _tables_text(html: str, document: dict | None = None, only_failures: bool = False) -> str:
+def _tables_text(
+    html: str, document: dict | None = None, only_failures: bool = False, numbers: list[int] | None = None
+) -> str:
     """Condense annotated FitLibrary HTML into one text block per table.
 
     Cells carry their status as a prefix: [pass], [fail], [error], [ignore]. Folding areas,
     links and images follow the table they belong to. only_failures keeps just the tables with
-    a [fail] or [error] cell, under their usual numbers.
+    a [fail] or [error] cell, under their usual numbers. numbers: the page's indices of the tables
+    that ran (run_page with tables), used as the tables' numbers when there is one per table.
     """
     document = document or _parse_document(html)
+    if not numbers or len(numbers) != len(document["tables"]):
+        numbers = list(range(len(document["tables"])))
     blocks = []
     leading = [] if only_failures else _extras_lines(document["leading"], "Before the first table")
     if leading:
         blocks.append("\n".join(leading))
-    for i, table in enumerate(document["tables"]):
+    for i, table in zip(numbers, document["tables"]):
         if only_failures and not _failed(table):
             continue
         lines = [f"Table {i}:"]
@@ -2650,7 +2872,8 @@ def _add_counts(state: _DebugState, page: str | None, counts: Mapping | None) ->
 
 
 def _document_result(
-    state: _DebugState, data: dict, page: str | None, include_html: bool, only_failures: bool = False
+    state: _DebugState, data: dict, page: str | None, include_html: bool, only_failures: bool = False,
+    numbers: list[int] | None = None,
 ) -> dict:
     html = data.get("html") or ""
     document = _parse_document(html)
@@ -2658,7 +2881,7 @@ def _document_result(
         "page": page,
         "counts": data.get("counts"),
         "page_totals": _add_counts(state, page, data.get("counts")),
-        "tables": _tables_text(html, document, only_failures),
+        "tables": _tables_text(html, document, only_failures, numbers),
     }
     if only_failures:
         passed = sum(1 for t in document["tables"] if not _failed(t))
@@ -2670,6 +2893,12 @@ def _document_result(
     if include_html:
         result["html"] = html
     return result
+
+
+def _covers_setup(html: str, tables: list[int]) -> bool:
+    """tables include every SetUp table of the page (run_page(tables=[...]) that ran the SetUp)."""
+    setup = _setup_indices(_parse_tables(html))
+    return bool(setup) and set(setup) <= set(tables)
 
 
 def _with_setup_hint(state: _DebugState, result: dict, timeout_seconds: float | None) -> dict:
@@ -3390,7 +3619,7 @@ if DEBUG_TOOLSET:
     )
     def fitnesse_debug_run_page(
         page_path: DebugPath = None,
-        tables: Annotated[list[int] | None, Field(description="Indices from fitnesse_debug_page_tables to run, in this order; omit to run the whole page.")] = None,
+        tables: Annotated[list[int] | None, Field(description="Indices from fitnesse_debug_page_tables to run, in this order (the result numbers the tables the same way); omit to run the whole page. Including all setup_tables counts as running the SetUp.")] = None,
         restart: Annotated[bool, Field(description="Begin the page's test afresh even if it is already the current page.")] = False,
         setup_only: Annotated[bool, Field(description="Run only the SetUp tables (setup_tables of fitnesse_debug_page_tables). Not together with tables.")] = False,
         only_failures: Annotated[bool, Field(description="Return only the tables with a [fail] or [error] cell (counts as usual; tables_without_failures says how many were left out). For long pages where you look for what went wrong.")] = False,
@@ -3404,7 +3633,7 @@ if DEBUG_TOOLSET:
         page = page_path or state.current_page or state.page
 
         def run() -> dict:
-            html = _page_html(state, page, timeout_seconds)
+            html = html_page = _page_html(state, page, timeout_seconds)
             chosen = tables
             skipped: list[int] = []
             if setup_only:
@@ -3424,11 +3653,11 @@ if DEBUG_TOOLSET:
                     raise ToolError(f"Table indices {bad} out of range: the page has {len(parts)} tables.")
                 html = "\n".join(parts[i] for i in chosen)
             data = _session_action(state, "runTable", {"html": html}, timeout_seconds=timeout_seconds)
-            if setup_only:
-                state.setup_ran = page
-            if setup_only or tables is None:
+            if setup_only or (tables is not None and _covers_setup(html_page, tables)):
+                state.setup_ran = page  # SetUp ran in this test: a later whole-page run skips it
+            if state.setup_ran == page or tables is None:
                 state.setup_seen = page
-            result = _document_result(state, data, page, include_html, only_failures)
+            result = _document_result(state, data, page, include_html, only_failures, chosen)
             if skipped:
                 result["skipped_setup"] = skipped
             return result

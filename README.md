@@ -191,6 +191,11 @@ Parameter mapping for `fitnesse_search_properties`:
   with "Not saved" instead of returning the merge form.
 - **`fitnesse_get_page_data`** also returns `edit_time` and `ticket_id` and
   makes two requests (`edit`, then `pageData`).
+- **`fitnesse_get_page_history` and `fitnesse_get_suite_overview` return a
+  condensed result** instead of FitNesse's XML/HTML in `body` (neither
+  responder has a JSON format): runs, a suite run's pages with status and
+  `result_date`, or a test run's failing tables. `raw=true` returns `body` as
+  before.
 
 ### Changed tool set
 
@@ -332,7 +337,7 @@ Compatibility details:
 |---|---|---|
 | `fitnesse_run_test` | `test` — `format` xml/junit/text, nohistory | execute |
 | `fitnesse_run_suite` | `suite` — tag filters, firstTest, partitions, `format` xml/junit/text, debug, nochunk | execute |
-| `fitnesse_get_suite_overview` | `overview` — suite tree with latest results | read |
+| `fitnesse_get_suite_overview` | `overview` — latest result per test page: `summary`, `pages` (`page`, `outcome`, `result_date`), `failed_pages`; `raw=true` for the HTML | read |
 | `fitnesse_partition_preview` | `partition` — TSV or HTML _(needs `complete`)_ | read |
 | `fitnesse_get_instruction` | `instruction` — Slim instructions _(needs `complete`)_ | read |
 | `fitnesse_stop_test` | `stoptest` | control |
@@ -345,7 +350,7 @@ Compatibility details:
 |---|---|---|
 | `fitnesse_get_test_history` | `testHistory` — XML, or HTML with `results`/`trim` _(needs `complete`)_ | read |
 | `fitnesse_get_execution_log` | `executionLog` _(needs `complete`)_ | read |
-| `fitnesse_get_page_history` | `pageHistory` _(drops `executionLog` `command`/`stdOut`/`stdErr` unless `include_command`/`include_stdout`/`include_stderr`)_ | read |
+| `fitnesse_get_page_history` | `pageHistory` (`format=xml`), condensed: without `result_date` the `runs`; for a suite run `final_counts`, `pages` and `failed_pages`; for a test run `outcome`, `counts` and only the failing `tables` (as in the debug tools). `raw=true` for the XML _(drops `executionLog` `command`/`stdOut`/`stdErr` unless `include_command`/`include_stdout`/`include_stderr`)_ | read |
 | `fitnesse_compare_history` | `compareHistory` | read |
 | `fitnesse_get_versions` | `versions` | read |
 | `fitnesse_view_version` | `viewVersion` | read |
@@ -388,7 +393,7 @@ All need `debug` in `FITNESSE_TOOLSETS`, plus the listed mode.
 | `fitnesse_debug_status` | `status` plus new `log` lines (each cut at 500 characters); `sessions` lists all of the account's (mod #159); `adopt` continues a running session, with several the one named by `session` | read |
 | `fitnesse_debug_run_wiki` | `runWiki` — wiki tables in the context of the current page, no SetUp/TearDown; `restart` runs `nextPage` first. Failing before the SetUp ran in this test, on a page that has one, the result gets a `hint` to run `setup_only` (one `pageHtml` per test to check) | test |
 | `fitnesse_debug_page_tables` | `pageHtml`, split into tables; each with `source_page`/`source_index` for editing (tables of included pages live on that page) | read |
-| `fitnesse_debug_run_page` | `nextPage` (on page change or `restart`), `pageHtml`, `runTable`. `setup_only` runs just the SetUp tables; a later call without `tables` skips them (`skipped_setup`). `only_failures` returns only tables with `[fail]`/`[error]` | test |
+| `fitnesse_debug_run_page` | `nextPage` (on page change or `restart`), `pageHtml`, `runTable`. `setup_only` (or `tables` that include all SetUp tables) runs the SetUp; a later call without `tables` skips it (`skipped_setup`). With `tables`, the result numbers the tables as on the page. `only_failures` returns only tables with `[fail]`/`[error]` | test |
 | `fitnesse_debug_inspect` | `keywordsJson` (without filter only the categories with their number of keywords; with filter the matching keywords in full), `definedActions` (the defined actions loaded by `define actions at`: `debugTest definedActions` as JSON, on older forks parsed from `keywords`; filterable), `dynamicVariables`, `scope`, `liveView` (VNC password removed) | read |
 | `fitnesse_debug_defined_action_source` | `debugTable definedAction` (with the session, or `page=` without one). Forks without it: page of the defined action from `keywords`, then `debugTable source` of that page, cut to the definition block as FitLibrary reads it (header first or after a line starting with exactly `----`, up to the next one; `-----` and dashes inside `!-…-!`, `{{{…}}}` or `#` comments don't separate; refuses a header found twice) | read |
 | `fitnesse_debug_end` | `end` or `abort`, with the unread log | test |
@@ -639,6 +644,13 @@ header. Confirm with `curl -u user:pass "$FITNESSE_BASE_URL/FrontPage?responder=
 **`Connection refused`** — check `FITNESSE_BASE_URL`. Inside a container,
 `localhost` is the container, not your host; use `host.docker.internal` (Docker
 Desktop) or the host's LAN address.
+
+**`FitNesse closed the connection after N of M bytes`** — the answer ended
+before its `Content-Length`. Seen with large answers (~60 KB and up) through
+`host.docker.internal`, with curl as well. Requests that only read are
+repeated up to 3 times (each early end is logged as a warning); for others,
+e.g. a table run, check with `fitnesse_debug_status` whether it took effect
+before repeating it.
 
 **A write, run, or debug tool is missing** — `FITNESSE_TOOLSETS` lacks
 `write`, `test`, or `debug` (or `complete` for the marked tools). Debug tools

@@ -216,6 +216,10 @@ enabled.
 
 ## Tools
 
+[docs/tools.md](docs/tools.md) lists every tool with its toolset, gates and full
+description; regenerate it with `python scripts/tools_list.py` after changing a tool
+(a test fails while it is out of date).
+
 27 tools with `FITNESSE_TOOLSETS=all` and no other flags, each mapping to
 one FitNesse responder. Set `FITNESSE_FILES_ROOT` to the files-section
 resource root on your FitNesse instance to also expose `fitnesse_list_files`,

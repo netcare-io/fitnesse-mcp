@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Cuts a release: runs tests, bumps pyproject.toml, tags git, pushes, and
-# (if `gh` is available) opens a GitHub release. Run from a clean working
-# tree on main. Does NOT build or publish the Docker image — see
-# scripts/docker-build-and-publish.sh for that, or scripts/release-and-publish.sh to
-# do both in one step.
+# Cuts a release. main only accepts pull requests, so this takes two runs:
+#
+#   1. scripts/release.sh 1.0.0   bumps pyproject.toml on branch release/v1.0.0 and opens a PR
+#   2. merge the PR once CI is green
+#   3. scripts/release.sh 1.0.0   again, on main: tags v1.0.0 and pushes the tag
+#
+# The tag triggers .github/workflows/release.yml: tests, pushes the image to
+# ghcr.io/netcare-io/fitnesse-mcp (1.0.0, 1.0, latest) and creates the GitHub
+# release.
 #
 # Usage: scripts/release.sh <new-version>
-#   e.g. scripts/release.sh 0.2.0
+#   e.g. scripts/release.sh 1.0.0
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+
+REPO_URL="https://github.com/netcare-io/fitnesse-mcp"
 
 if [[ $# -ne 1 ]]; then
 	echo "Usage: $0 <new-version>" >&2
@@ -36,35 +42,45 @@ if [[ "$CURRENT_BRANCH" != "main" ]]; then
 	exit 1
 fi
 
+git fetch --quiet --tags origin main
+if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+	echo "main is not in sync with origin/main; run git pull first." >&2
+	exit 1
+fi
+
 if git rev-parse "$TAG" >/dev/null 2>&1; then
 	echo "Tag $TAG already exists." >&2
 	exit 1
 fi
 
-echo "==> Running tests (in Docker; no local Python required)"
-TEST_IMAGE="fitnesse-mcp-test:local"
-docker build --target test -t "$TEST_IMAGE" -f .devcontainer/Dockerfile .
-docker run --rm -v "${ROOT_DIR}:/app" -w /app "$TEST_IMAGE"
+CURRENT_VERSION="$(sed -nE 's/^version = "(.*)"/\1/p' pyproject.toml)"
 
-echo "==> Bumping version to $NEW_VERSION in pyproject.toml"
-sed -i.bak -E "s/^version = \".*\"/version = \"${NEW_VERSION}\"/" pyproject.toml
-rm -f pyproject.toml.bak
+if [[ "$CURRENT_VERSION" != "$NEW_VERSION" ]]; then
+	BRANCH="release/${TAG}"
+	echo "==> Bumping version ${CURRENT_VERSION} -> ${NEW_VERSION} on ${BRANCH}"
+	git switch --quiet -c "$BRANCH"
+	sed -i.bak -E "s/^version = \".*\"/version = \"${NEW_VERSION}\"/" pyproject.toml
+	rm -f pyproject.toml.bak
+	git add pyproject.toml
+	git commit --quiet -m "Release ${TAG}"
+	git push --quiet -u origin "$BRANCH"
 
-git add pyproject.toml
-git commit -m "Release ${TAG}"
-git tag -a "$TAG" -m "Release ${TAG}"
+	if command -v gh >/dev/null 2>&1; then
+		gh pr create --base main --head "$BRANCH" --title "Release ${TAG}" \
+			--body "Bumps the version to ${NEW_VERSION}. After merging, run \`scripts/release.sh ${NEW_VERSION}\` on main to tag the release."
+	else
+		echo "==> gh CLI not found; open the PR manually:"
+		echo "    ${REPO_URL}/compare/main...${BRANCH}?expand=1"
+	fi
+	git switch --quiet main
 
-echo "==> Pushing git commit and tag"
-git push origin "$CURRENT_BRANCH"
-git push origin "$TAG"
-
-if command -v gh >/dev/null 2>&1; then
-	echo "==> Creating GitHub release"
-	gh release create "$TAG" --title "$TAG" --generate-notes
-else
-	echo "==> gh CLI not found; create the GitHub release manually:"
-	echo "    https://github.com/netcare-io/fitnesse-mcp/releases/new?tag=${TAG}"
+	echo "==> Merge the PR once CI is green, then run: git pull && $0 ${NEW_VERSION}"
+	exit 0
 fi
 
-echo "==> Done: ${TAG} tagged and pushed."
-echo "    Run scripts/docker-build-and-publish.sh to build and publish the Docker image."
+echo "==> Tagging ${TAG}"
+git tag -a "$TAG" -m "Release ${TAG}"
+git push --quiet origin "$TAG"
+
+echo "==> Done: ${TAG} pushed. The release workflow builds and publishes the image:"
+echo "    ${REPO_URL}/actions/workflows/release.yml"

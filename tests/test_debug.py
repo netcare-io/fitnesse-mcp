@@ -16,20 +16,20 @@ from fastmcp.exceptions import ToolError
 
 import server as my_server
 
-GATES = ("FITNESSE_KDTA_DEBUG", "FITNESSE_READONLY")
+GATES = ("FITNESSE_TOOLSETS",)
 
 
 def _reload(**env):
     for key in GATES:
         os.environ.pop(key, None)
-    os.environ.update(env)
+    os.environ.update({"FITNESSE_TOOLSETS": "read,write,test,debug", **env})
     importlib.reload(my_server)
 
 
 @pytest.fixture
 def debug_env():
     previous = {k: os.environ.get(k) for k in GATES}
-    _reload(FITNESSE_KDTA_DEBUG="1")
+    _reload(FITNESSE_TOOLSETS="all,debug")
     try:
         yield
     finally:
@@ -127,20 +127,34 @@ def test_tables_text_marks_status_and_cuts_long_cells():
 async def test_debug_tools_hidden_by_default():
     previous = {k: os.environ.get(k) for k in GATES}
     try:
-        _reload()
+        _reload(FITNESSE_TOOLSETS="all")
         async with Client(my_server.mcp) as c:
             names = {t.name for t in await c.list_tools()}
         assert not any("debug" in n or n.startswith("fitnesse_table_") for n in names)
-        _reload(FITNESSE_KDTA_DEBUG="1")
+        assert not hasattr(my_server, "fitnesse_debug_start")  # not even registered
+        _reload(FITNESSE_TOOLSETS="all,debug")
         async with Client(my_server.mcp) as c:
             names = {t.name for t in await c.list_tools()}
         assert "fitnesse_debug_run_wiki" in names and "fitnesse_table_source" in names
         assert "fitnesse_table_save" in names
-        _reload(FITNESSE_KDTA_DEBUG="1", FITNESSE_READONLY="1")
+        _reload(FITNESSE_TOOLSETS="read,write,test")
         async with Client(my_server.mcp) as c:
             names = {t.name for t in await c.list_tools()}
-        assert "fitnesse_debug_run_wiki" not in names and "fitnesse_table_save" not in names
-        assert {"fitnesse_debug_status", "fitnesse_table_source"} <= names
+        assert not any(n.startswith(("fitnesse_debug_", "fitnesse_table_")) for n in names)
+        debug = {"read": {"fitnesse_debug_status", "fitnesse_debug_page_tables", "fitnesse_debug_inspect",
+                          "fitnesse_table_source"},
+                 "write": {"fitnesse_table_save", "fitnesse_table_insert", "fitnesse_table_delete"},
+                 "test": {"fitnesse_debug_start", "fitnesse_debug_run_wiki", "fitnesse_debug_run_page",
+                          "fitnesse_debug_end"}}
+        for toolsets, modes in (("read,debug", {"read"}), ("write,debug", {"write"}),
+                                ("test,debug", {"test"}), ("read,test,debug", {"read", "test"})):
+            _reload(FITNESSE_TOOLSETS=toolsets)
+            async with Client(my_server.mcp) as c:
+                names = {t.name for t in await c.list_tools()}
+            assert {n for n in names if n.startswith(("fitnesse_debug_", "fitnesse_table_"))} \
+                == set().union(*(debug[m] for m in modes)), toolsets
+        with pytest.raises(RuntimeError, match="need at least one of"):
+            _reload(FITNESSE_TOOLSETS="debug")
     finally:
         for key, value in previous.items():
             if value is None:
@@ -326,3 +340,36 @@ async def test_table_save_block_and_conflict(debug_env):
             "fitnesse_table_delete", {"page_path": "P", "index": 0, "original": "o"},
             (409, {"error": "Page was modified"}),
         )
+
+
+@pytest.mark.asyncio
+async def test_debug_instructions_sent_only_with_visible_debug_tools():
+    import re
+    previous = {k: os.environ.get(k) for k in GATES}
+    try:
+        for env, expected in (({"FITNESSE_TOOLSETS": "all"}, False), ({"FITNESSE_TOOLSETS": "all,debug"}, True),
+                              ({"FITNESSE_TOOLSETS": "read,write,test"}, False),
+                              ({"FITNESSE_TOOLSETS": "read,debug"}, False),
+                              ({"FITNESSE_TOOLSETS": "test,debug"}, False),
+                              ({"FITNESSE_TOOLSETS": "read,test,debug"}, True),
+                              ({"FITNESSE_TOOLSETS": "all,debug,complete"}, True)):
+            _reload(**env)
+            async with Client(my_server.mcp) as c:
+                instructions = c.instructions or ""
+                names = {t.name for t in await c.list_tools()}
+            async with Client(my_server.mcp, mode="legacy") as c:
+                assert (c.initialize_result.instructions or "") == instructions
+            assert ("fitnesse_debug_start" in instructions) is expected, env
+            if expected:
+                # every full tool name the agent is told about must exist
+                assert set(re.findall(r"fitnesse_\w+", instructions)) - {"fitnesse_table_"} <= names
+                toolsets = env["FITNESSE_TOOLSETS"]
+                assert "fitnesse_table_source" in instructions
+                assert ("Editing tables" in instructions) is ("write" in toolsets or "all" in toolsets), env
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        importlib.reload(my_server)

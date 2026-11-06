@@ -9,6 +9,7 @@ import base64
 import importlib
 import os
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 import pytest
 from fastmcp import Client
@@ -54,8 +55,9 @@ def _patch_urlopen(body: bytes = b'{"ok":true}', content_type: str = "applicatio
 @pytest.fixture
 def clean_env():
     """Reload the server with every opt-in gate closed, whatever the ambient env."""
-    gates = ("FITNESSE_FILES_ROOT", "FITNESSE_COMPLETE_TOOLSET", "FITNESSE_ALLOW_SHUTDOWN", "FITNESSE_READONLY", "FITNESSE_KDTA_DEBUG")
+    gates = ("FITNESSE_FILES_ROOT", "FITNESSE_ALLOW_SHUTDOWN", "FITNESSE_TOOLSETS")
     previous = {k: os.environ.pop(k, None) for k in gates}
+    os.environ["FITNESSE_TOOLSETS"] = "all"
     try:
         importlib.reload(my_server)
         yield
@@ -72,7 +74,8 @@ def clean_env():
 async def test_tool_count_full(clean_env):
     async with Client(my_server.mcp) as c:
         tools = await c.list_tools()
-    assert len(tools) == 23
+    assert len(tools) == 27
+    assert "fitnesse_search" in {t.name for t in tools}
 
 
 @pytest.mark.asyncio
@@ -204,10 +207,10 @@ def files_env():
     FITNESSE_FILES_ROOT names the resource root on the *remote* FitNesse
     instance ("files"); neither download nor upload touches local disk.
     """
-    gates = ("FITNESSE_FILES_ROOT", "FITNESSE_COMPLETE_TOOLSET", "FITNESSE_ALLOW_SHUTDOWN", "FITNESSE_READONLY", "FITNESSE_KDTA_DEBUG")
+    gates = ("FITNESSE_FILES_ROOT", "FITNESSE_ALLOW_SHUTDOWN", "FITNESSE_TOOLSETS")
     previous = {k: os.environ.pop(k, None) for k in gates}
     os.environ["FITNESSE_FILES_ROOT"] = "files"
-    os.environ["FITNESSE_COMPLETE_TOOLSET"] = "1"
+    os.environ["FITNESSE_TOOLSETS"] = "all,complete"
     try:
         importlib.reload(my_server)
         yield
@@ -299,16 +302,17 @@ async def test_files_tools_hidden_without_files_root(tool):
 
 @pytest.mark.asyncio
 async def test_rename_file_needs_only_files_root():
-    """fitnesse_rename_file must not require FITNESSE_COMPLETE_TOOLSET."""
-    gates = ("FITNESSE_FILES_ROOT", "FITNESSE_COMPLETE_TOOLSET")
+    """fitnesse_rename_file must not require the complete toolset."""
+    gates = ("FITNESSE_FILES_ROOT", "FITNESSE_TOOLSETS")
     previous = {k: os.environ.pop(k, None) for k in gates}
     os.environ["FITNESSE_FILES_ROOT"] = "files"
+    os.environ["FITNESSE_TOOLSETS"] = "all"
     try:
         importlib.reload(my_server)
         async with Client(my_server.mcp) as c:
             tools = {t.name for t in await c.list_tools()}
         assert "fitnesse_rename_file" in tools
-        assert "fitnesse_get_page" not in tools  # a genuine FITNESSE_COMPLETE_TOOLSET tool
+        assert "fitnesse_get_page" not in tools  # a genuine complete-toolset tool
     finally:
         for key, value in previous.items():
             if value is None:
@@ -432,35 +436,145 @@ async def test_upload_file_exceeding_transfer_limit_rejected(files_env, monkeypa
 
 
 # ---------------------------------------------------------------------------
-# Read-only mode
+# FITNESSE_TOOLSETS
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_readonly_hides_write_tools():
-    os.environ["FITNESSE_READONLY"] = "1"
-    try:
+_TOOLSET_GATES = (
+    "FITNESSE_TOOLSETS", "FITNESSE_FILES_ROOT",
+    "FITNESSE_ALLOW_SHUTDOWN", "FITNESSE_ALLOW_ACCOUNT_ADMIN",
+)
+_OTHER_GATES_OPEN = {
+    "FITNESSE_FILES_ROOT": "files", "FITNESSE_ALLOW_SHUTDOWN": "1",
+    "FITNESSE_ALLOW_ACCOUNT_ADMIN": "1",
+}
+
+
+@pytest.fixture
+def toolsets_env():
+    """Reload the server with every other gate open and the given FITNESSE_TOOLSETS."""
+    previous = {k: os.environ.pop(k, None) for k in _TOOLSET_GATES}
+
+    async def load(toolsets: str | None) -> set[str]:
+        for key in _TOOLSET_GATES:
+            os.environ.pop(key, None)
+        os.environ.update(_OTHER_GATES_OPEN)
+        if toolsets is not None:
+            os.environ["FITNESSE_TOOLSETS"] = toolsets
         importlib.reload(my_server)
         async with Client(my_server.mcp) as c:
-            tools = {t.name for t in await c.list_tools()}
-        assert "fitnesse_delete_page" not in tools
-        assert "fitnesse_run_suite" not in tools
-        assert "fitnesse_get_page_data" in tools
+            return {t.name for t in await c.list_tools()}
+
+    try:
+        yield load
     finally:
-        del os.environ["FITNESSE_READONLY"]
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         importlib.reload(my_server)
 
 
+def _modes_of(tool) -> set[str]:
+    return {
+        mode
+        for mode in my_server.MODES
+        if tool.tags & my_server.MODE_TAGS[mode] or tool.name in my_server.MODE_NAMES[mode]
+    }
+
+
 @pytest.mark.asyncio
-async def test_readonly_false_string_does_not_enable():
-    os.environ["FITNESSE_READONLY"] = "false"
-    try:
-        importlib.reload(my_server)
-        async with Client(my_server.mcp) as c:
-            tools = {t.name for t in await c.list_tools()}
-        assert "fitnesse_delete_page" in tools
-    finally:
-        del os.environ["FITNESSE_READONLY"]
-        importlib.reload(my_server)
+async def test_every_tool_needs_exactly_one_mode(toolsets_env):
+    await toolsets_env("all,debug,complete")
+    tools = await my_server.mcp.list_tools()
+    assert len(tools) == 62
+    assert {t.name: _modes_of(t) for t in tools if len(_modes_of(t)) != 1} == {}
+    debug = {t.name: _modes_of(t).pop() for t in tools if "debug" in t.tags}
+    assert debug == {
+        "fitnesse_debug_status": "read", "fitnesse_debug_page_tables": "read",
+        "fitnesse_debug_inspect": "read", "fitnesse_table_source": "read",
+        "fitnesse_table_save": "write", "fitnesse_table_insert": "write", "fitnesse_table_delete": "write",
+        "fitnesse_debug_start": "test", "fitnesse_debug_run_wiki": "test",
+        "fitnesse_debug_run_page": "test", "fitnesse_debug_end": "test",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "toolsets",
+    ["read", "write", "test", "read,test", "read,write", "write,test", "read,debug", "test,debug",
+     "write,debug", "read,complete", "read,test,debug,complete", "read,write,test"],
+)
+async def test_toolsets_show_exactly_the_matching_tools(toolsets_env, toolsets):
+    everything = await toolsets_env("all,debug,complete")
+    tools = {t.name: t for t in await my_server.mcp.list_tools()}
+    complete_only = everything - await toolsets_env("read,write,test,debug")
+    visible = await toolsets_env(toolsets)
+    chosen = set(toolsets.split(","))
+    expected = {
+        name for name in everything
+        if _modes_of(tools[name]) <= chosen
+        and ("debug" in chosen or "debug" not in tools[name].tags)
+        and ("complete" in chosen or name not in complete_only)
+    }
+    assert visible == expected
+
+
+@pytest.mark.asyncio
+async def test_toolsets_examples(toolsets_env):
+    read = await toolsets_env("read")
+    assert {"fitnesse_get_page_data", "fitnesse_search"} <= read
+    assert not {"fitnesse_save_page_content", "fitnesse_run_suite", "fitnesse_stop_test"} & read
+    assert not any("debug" in n or "table" in n for n in read)
+    assert "fitnesse_get_raw" not in read
+    assert "fitnesse_get_raw" in await toolsets_env("read,complete")
+    debug_read = await toolsets_env("read,debug")
+    assert {"fitnesse_debug_status", "fitnesse_debug_inspect", "fitnesse_table_source"} <= debug_read
+    assert not {"fitnesse_debug_start", "fitnesse_table_save", "fitnesse_run_test"} & debug_read
+    debug_test = await toolsets_env("test,debug")
+    assert {"fitnesse_debug_start", "fitnesse_debug_run_wiki", "fitnesse_run_suite"} <= debug_test
+    assert not {"fitnesse_debug_status", "fitnesse_table_source"} & debug_test
+    write = await toolsets_env("read,write")
+    assert {"fitnesse_shutdown", "fitnesse_save_account"} <= write
+    assert not {"fitnesse_table_save", "fitnesse_run_test"} & write
+    assert "fitnesse_table_save" in await toolsets_env("write,debug")
+
+
+@pytest.mark.asyncio
+async def test_toolsets_default_all_and_spelling(toolsets_env):
+    default = await toolsets_env("read,write,test,debug")
+    assert default == await toolsets_env(" Read , WRITE,test,DEBUG ")
+    assert len(default) == 46  # 62 minus the 16 complete tools
+    assert await toolsets_env("all,debug") == default  # all leaves the areas out
+    assert await toolsets_env("read,all,debug") == default
+    assert len(await toolsets_env("all")) == 35  # minus 16 complete and 11 debug tools
+    assert len(await toolsets_env("all,debug,complete")) == 62
+    assert len(await toolsets_env("read,write,test,debug,complete")) == 62
+    assert len(await toolsets_env("read,write,test,complete")) == 51  # minus 11 debug tools
+
+
+@pytest.mark.parametrize("value", [None, "", "  "])
+def test_toolsets_required(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("FITNESSE_TOOLSETS", raising=False)
+    else:
+        monkeypatch.setenv("FITNESSE_TOOLSETS", value)
+    with pytest.raises(RuntimeError, match="FITNESSE_TOOLSETS is required"):
+        my_server._toolsets_from_env()
+
+
+@pytest.mark.parametrize("value", ["readonly", "read,admin", ",", "read;write", "everything"])
+def test_toolsets_reject_unknown_values(monkeypatch, value):
+    monkeypatch.setenv("FITNESSE_TOOLSETS", value)
+    with pytest.raises(RuntimeError, match="FITNESSE_TOOLSETS="):
+        my_server._toolsets_from_env()
+
+
+@pytest.mark.parametrize("value", ["debug", "complete", "debug,complete"])
+def test_toolsets_reject_area_without_mode(monkeypatch, value):
+    monkeypatch.setenv("FITNESSE_TOOLSETS", value)
+    with pytest.raises(RuntimeError, match="need at least one of read, write, test"):
+        my_server._toolsets_from_env()
 
 
 # ---------------------------------------------------------------------------
@@ -501,7 +615,7 @@ async def test_complete_toolset_hidden_by_default():
 
 @pytest.mark.asyncio
 async def test_complete_toolset_exposed_when_flagged(clean_env):
-    os.environ["FITNESSE_COMPLETE_TOOLSET"] = "1"
+    os.environ["FITNESSE_TOOLSETS"] = "all,complete"
     importlib.reload(my_server)
     async with Client(my_server.mcp) as c:
         tools = await c.list_tools()
@@ -509,7 +623,7 @@ async def test_complete_toolset_exposed_when_flagged(clean_env):
     assert "fitnesse_get_page" in names
     assert "fitnesse_get_raw" in names
     assert "fitnesse_publish" in names
-    assert len(tools) == 37
+    assert len(tools) == 43
 
 
 @pytest.mark.asyncio
@@ -526,7 +640,7 @@ async def test_files_root_adds_files_tools(files_env):
         "fitnesse_rename_file",
         "fitnesse_create_dir",
     } <= names
-    assert len(tools) == 43
+    assert len(tools) == 49
 
 
 # ---------------------------------------------------------------------------
@@ -596,3 +710,370 @@ async def test_read_tool_logs_when_truncated(monkeypatch, caplog):
             result = await c.call_tool("fitnesse_get_page_data", {"page_path": "FrontPage"})
     assert result.data["truncated"] is True
     assert "truncated to FITNESSE_MAX_RESPONSE_BYTES=4" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# saveData / saveProperties keep what FitNesse would otherwise remove
+# ---------------------------------------------------------------------------
+
+_PROPS = (
+    b'{"Help": "Old help", "Suites": ["smoke", "nightly"], "Test": true, "Suite": false,'
+    b' "Edit": true, "Versions": false, "secure-write": true, "Prune": false}'
+)
+
+
+def _spy_requests(properties: bytes = _PROPS):
+    """Record (method, url, form) of each request; answer properties with `properties`."""
+    calls: list[tuple[str, str, dict]] = []
+
+    def spy(req, timeout=None):
+        from urllib.parse import parse_qs
+        form = parse_qs(req.data.decode()) if req.data else {}
+        calls.append((req.get_method(), req.full_url, {k: v[0] for k, v in form.items()}))
+        if "properties" in req.full_url and "format=json" in req.full_url:
+            return _FakeResponse(properties)
+        return _FakeResponse(b"saved", "text/html")
+
+    return calls, patch("urllib.request.urlopen", side_effect=spy)
+
+
+@pytest.mark.asyncio
+async def test_save_page_content_keeps_help_text_and_tags():
+    calls, p = _spy_requests()
+    with p:
+        async with Client(my_server.mcp) as c:
+            await c.call_tool("fitnesse_save_page_content", {"page_path": "SuiteA.TestB", "page_content": "x"})
+    method, url, form = calls[-1]
+    assert method == "POST" and "saveData" in url
+    assert form == {
+        "pageContent": "x",
+        "editTime": str(2**63 - 1),
+        "helpText": "Old help",
+        "suites": "smoke,nightly",
+    }
+
+
+@pytest.mark.asyncio
+async def test_save_page_content_explicit_values_skip_lookup_and_empty_clears():
+    calls, p = _spy_requests()
+    with p:
+        async with Client(my_server.mcp) as c:
+            await c.call_tool(
+                "fitnesse_save_page_content",
+                {"page_path": "A", "page_content": "x", "help_text": "", "suites": "new"},
+            )
+    assert len(calls) == 1
+    assert calls[0][2] == {"pageContent": "x", "editTime": str(2**63 - 1), "suites": "new"}
+
+
+_MERGE_FORM = (
+    b'<form method="post"><input type="hidden" name="responder" value="saveData"/>'
+    b'<fieldset id="merge-new"></fieldset><fieldset id="merge-old">'
+    b'<textarea id="oldContent" name="oldContent" readonly="readonly">theirs</textarea>'
+    b"</fieldset></form>"
+)
+
+
+@pytest.mark.asyncio
+async def test_save_page_content_with_edit_time_reports_conflict():
+    calls: list[dict] = []
+
+    def spy(req, timeout=None):
+        from urllib.parse import parse_qs
+        calls.append({k: v[0] for k, v in parse_qs(req.data.decode()).items()})
+        return _FakeResponse(_MERGE_FORM, "text/html")
+
+    with patch("urllib.request.urlopen", side_effect=spy):
+        async with Client(my_server.mcp) as c:
+            with pytest.raises(ToolError, match="Not saved: A was changed by someone else"):
+                await c.call_tool(
+                    "fitnesse_save_page_content",
+                    {
+                        "page_path": "A",
+                        "page_content": "mine",
+                        "edit_time": "1730000000000",
+                        "ticket_id": "-42",
+                        "help_text": "",
+                        "suites": "",
+                    },
+                )
+    assert calls == [{"pageContent": "mine", "editTime": "1730000000000", "ticketId": "-42"}]
+
+
+@pytest.mark.asyncio
+async def test_save_page_content_rejects_non_numeric_edit_time():
+    async with Client(my_server.mcp) as c:
+        with pytest.raises(ToolError):
+            await c.call_tool(
+                "fitnesse_save_page_content",
+                {"page_path": "A", "page_content": "x", "edit_time": "yesterday"},
+            )
+
+
+_EDIT_FORM = (
+    b'<form method="post"><input type="hidden" name="responder" value="saveData"/>\n'
+    b' <input type="hidden" name="editTime" value="1793983817067"/>\n'
+    b' <input type="hidden" name="ticketId" value="-5646912860185278610"/>\n</form>'
+)
+
+
+def _page_data_server(edit_form: bytes | None = _EDIT_FORM):
+    calls: list[str] = []
+
+    def spy(req, timeout=None):
+        calls.append(req.full_url)
+        if "responder=edit" in req.full_url:
+            if edit_form is None:
+                raise HTTPError(req.full_url, 403, "Forbidden", {}, None)
+            return _FakeResponse(edit_form, "text/html")
+        return _FakeResponse(b"!1 Title\n|table|", "text/plain")
+
+    return calls, patch("urllib.request.urlopen", side_effect=spy)
+
+
+@pytest.mark.asyncio
+async def test_get_page_data_returns_edit_session_for_conflict_check():
+    calls, p = _page_data_server()
+    with p:
+        async with Client(my_server.mcp) as c:
+            result = await c.call_tool("fitnesse_get_page_data", {"page_path": "A"})
+    assert result.data["body"] == "!1 Title\n|table|"
+    assert result.data["edit_time"] == "1793983817067"
+    assert result.data["ticket_id"] == "-5646912860185278610"
+    # editTime is taken before the content is read.
+    assert ["responder=edit" in u for u in calls] == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_get_page_data_without_edit_form_still_returns_text():
+    _, p = _page_data_server(edit_form=None)
+    with p:
+        async with Client(my_server.mcp) as c:
+            result = await c.call_tool("fitnesse_get_page_data", {"page_path": "A"})
+    assert result.data["ok"] is True and result.data["body"] == "!1 Title\n|table|"
+    assert result.data["edit_time"] is None and result.data["ticket_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_save_page_content_aborts_when_properties_unreadable():
+    calls, p = _spy_requests(properties=b"<html>login</html>")
+    with p:
+        async with Client(my_server.mcp) as c:
+            with pytest.raises(ToolError, match="nothing was saved"):
+                await c.call_tool("fitnesse_save_page_content", {"page_path": "A", "page_content": "x"})
+    assert all(method == "GET" for method, _, _ in calls)
+
+
+@pytest.mark.asyncio
+async def test_save_properties_merges_onto_current():
+    calls, p = _spy_requests()
+    with p:
+        async with Client(my_server.mcp) as c:
+            await c.call_tool("fitnesse_save_properties", {"page_path": "A", "help_text": "New"})
+    assert calls[-1][2] == {
+        "PageType": "Test",
+        "Suites": "smoke,nightly",
+        "HelpText": "New",
+        "Edit": "on",
+        "secure-write": "on",
+    }
+
+
+@pytest.mark.asyncio
+async def test_save_properties_explicit_attributes_replace():
+    calls, p = _spy_requests()
+    with p:
+        async with Client(my_server.mcp) as c:
+            await c.call_tool(
+                "fitnesse_save_properties",
+                {
+                    "page_path": "A",
+                    "page_type": "Static",
+                    "suites": "",
+                    "help_text": "",
+                    "attributes": ["DisableTestHistory", "secure-read"],
+                },
+            )
+    assert len(calls) == 1
+    assert calls[0][2] == {"PageType": "Static", "DisableTestHistory": "on", "secure-read": "on"}
+
+
+@pytest.mark.parametrize("bad", [{"page_type": "Normal"}, {"attributes": ["Secure-Edit"]}, {"attributes": ["Test"]}])
+@pytest.mark.asyncio
+async def test_save_properties_rejects_outdated_names(bad):
+    async with Client(my_server.mcp) as c:
+        with pytest.raises(ToolError):
+            await c.call_tool("fitnesse_save_properties", {"page_path": "A", **bad})
+
+
+# ---------------------------------------------------------------------------
+# Parameters and responders of the RestfulServices documentation (20261101)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def complete_env(clean_env):
+    os.environ["FITNESSE_TOOLSETS"] = "all,complete"
+    importlib.reload(my_server)
+    yield
+
+
+async def _query(tool: str, args: dict) -> list[str]:
+    """Call tool against a stub and return the query items of the single GET it sent."""
+    calls, p = _spy_requests()
+    with p:
+        async with Client(my_server.mcp) as c:
+            await c.call_tool(tool, args)
+    assert len(calls) == 1
+    return calls[0][1].split("?", 1)[1].split("&")
+
+
+@pytest.mark.asyncio
+async def test_search_scope_and_method_search():
+    q = await _query(
+        "fitnesse_search",
+        {"search_string": "|click|x|", "method_search": True, "search_scope": "root"},
+    )
+    assert {"responder=search", "searchType=content", "isMethodSearch", "searchScope=root"} <= set(q)
+
+
+@pytest.mark.asyncio
+async def test_method_search_needs_content():
+    async with Client(my_server.mcp) as c:
+        with pytest.raises(ToolError, match="content"):
+            await c.call_tool("fitnesse_search", {"search_string": "x", "search_type": "title", "method_search": True})
+
+
+@pytest.mark.asyncio
+async def test_run_suite_selection_partition_and_format():
+    q = await _query(
+        "fitnesse_run_suite",
+        {
+            "page_path": "S",
+            "run_tests_matching_any_tag": "a,b",
+            "run_tests_matching_all_tags": "c",
+            "partition_count": 3,
+            "partition_index": 2,
+            "format": "junit",
+        },
+    )
+    assert {"format=junit", "runTestsMatchingAnyTag=a%2Cb", "runTestsMatchingAllTags=c",
+            "partitionCount=3", "partitionIndex=2"} <= set(q)
+
+
+@pytest.mark.parametrize("args", [{"partition_count": 2}, {"partition_count": 2, "partition_index": 2}])
+@pytest.mark.asyncio
+async def test_run_suite_rejects_bad_partition(args):
+    async with Client(my_server.mcp) as c:
+        with pytest.raises(ToolError, match="partition"):
+            await c.call_tool("fitnesse_run_suite", {"page_path": "S", **args})
+
+
+@pytest.mark.asyncio
+async def test_run_test_nohistory_and_text_format():
+    q = await _query("fitnesse_run_test", {"page_path": "T", "nohistory": True, "format": "text"})
+    assert {"nohistory", "format=text"} <= set(q)
+
+
+@pytest.mark.parametrize(
+    "tool,args,expected",
+    [
+        ("fitnesse_move_page", {"page_path": "A.B", "new_location": "C", "refactor_references": True}, {"refactorReferences"}),
+        ("fitnesse_rename_page", {"page_path": "A.B", "new_name": "D", "refactor_references": True}, {"refactorReferences"}),
+        ("fitnesse_purge_history", {"days": 7, "purge_global": True}, {"purgeGlobal=true"}),
+        ("fitnesse_delete_page", {"page_path": "A", "delete_versions": True}, {"deleteVersions=yes"}),
+        ("fitnesse_add_child_page", {"parent_page_path": "A", "page_name": "B", "help_text": "h", "suites": "t"}, {"helpText=h", "suites=t"}),
+        ("fitnesse_view_version", {"page_path": "A", "version": "v1", "variables": {"X": "1"}}, {"version=v1", "X=1"}),
+        ("fitnesse_get_suite_overview", {"page_path": "S", "suite_filter": "x"}, {"responder=overview", "suiteFilter=x"}),
+        ("fitnesse_compare_versions", {"page_path": "A", "versions": ["v1", "v2"]}, {"Version_v1", "Version_v2"}),
+        ("fitnesse_replace", {"page_path": "A", "search_string": "a+", "replacement_string": "b", "method_replace": True},
+         {"responder=replace", "searchString=a%2B", "replacementString=b", "isMethodReplace"}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_documented_inputs_forwarded(tool, args, expected):
+    assert expected <= set(await _query(tool, args))
+
+
+@pytest.mark.asyncio
+async def test_execution_log_rejects_bad_date(complete_env):
+    async with Client(my_server.mcp) as c:
+        with pytest.raises(ToolError):
+            await c.call_tool("fitnesse_get_execution_log", {"page_path": "A", "result_date": "yesterday"})
+
+
+@pytest.mark.asyncio
+async def test_search_properties_uses_compatible_names(complete_env):
+    q = await _query(
+        "fitnesse_search_properties",
+        {
+            "page_path": "A",
+            "page_types": ["Test", "Suite"],
+            "actions": ["Edit"],
+            "security": ["Any", "secure-read"],
+            "special": ["SetUp"],
+            "prune": True,
+            "search_scope": "root",
+        },
+    )
+    assert {"responder=searchProperties", "PageType=Test%2CSuite", "Action=Edit", "Security=Any",
+            "Special=SetUp", "Prune", "searchScope=root"} <= set(q)
+
+
+@pytest.mark.parametrize(
+    "tool,args,expected",
+    [
+        ("fitnesse_partition_preview", {"page_path": "S", "partition_count": 4}, {"responder=partition", "partitionCount=4", "format=tsv"}),
+        ("fitnesse_get_execution_log", {"page_path": "A"}, {"responder=executionLog", "resultDate=latest"}),
+        ("fitnesse_get_proxy_data", {"page_path": "A", "type": "meat", "version": "v1"}, {"type=meat", "version=v1"}),
+        ("fitnesse_get_refactor_screen", {"page_path": "A", "refactor_type": "move"}, {"type=move"}),
+        ("fitnesse_get_test_history", {"format": "html", "results": 5, "trim": "Suite."}, {"results=5", "trim=Suite."}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_complete_toolset_documented_inputs(complete_env, tool, args, expected):
+    assert expected <= set(await _query(tool, args))
+
+
+@pytest.mark.asyncio
+async def test_test_history_results_need_html(complete_env):
+    async with Client(my_server.mcp) as c:
+        with pytest.raises(ToolError, match="html"):
+            await c.call_tool("fitnesse_get_test_history", {"results": 5})
+
+
+@pytest.mark.asyncio
+async def test_save_account_gated_and_posts_form(clean_env):
+    async with Client(my_server.mcp) as c:
+        assert "fitnesse_save_account" not in {t.name for t in await c.list_tools()}
+    os.environ["FITNESSE_ALLOW_ACCOUNT_ADMIN"] = "1"
+    try:
+        importlib.reload(my_server)
+        calls, p = _spy_requests()
+        with p:
+            async with Client(my_server.mcp) as c:
+                await c.call_tool("fitnesse_save_account", {"action": "delete_user", "user_name": "bob"})
+                with pytest.raises(ToolError):
+                    await c.call_tool("fitnesse_save_account", {"action": "create_user", "user_name": "x"})
+        method, url, form = calls[0]
+        assert method == "POST" and "responder=saveAccount" in url
+        assert form == {"deleteUser": "yes", "UserNameText": "bob"}
+    finally:
+        os.environ.pop("FITNESSE_ALLOW_ACCOUNT_ADMIN", None)
+
+
+def test_fresh_import_with_every_gate_open():
+    """importlib.reload keeps old globals, so only a fresh process catches definition-order bugs."""
+    import subprocess
+    import sys
+    gates = {
+        "FITNESSE_TOOLSETS": "all,debug,complete", "FITNESSE_FILES_ROOT": "files", "FITNESSE_ALLOW_SHUTDOWN": "1",
+        "FITNESSE_ALLOW_ACCOUNT_ADMIN": "1",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", "import server"],
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        env={**os.environ, **gates},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr

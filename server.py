@@ -6,6 +6,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import threading
 import uuid
 import xml.etree.ElementTree as ET
@@ -13,7 +14,7 @@ from base64 import b64decode, b64encode
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
-from typing import Annotated, Literal
+from typing import Annotated, Literal, get_args
 from urllib import parse, request
 from urllib.error import HTTPError, URLError
 
@@ -59,8 +60,13 @@ type PageContent = Annotated[
     str, Field(description="Raw FitNesse wiki markup content for the page.")
 ]
 type PageType = Annotated[
-    Literal["Normal", "Test", "Suite", "Static", "Default"],
+    Literal["Static", "Test", "Suite"],
     Field(description="Page type."),
+]
+type TagList = Annotated[str | None, Field(description="Comma-separated tags.")]
+type RunFormat = Annotated[
+    Literal["xml", "junit", "text"],
+    Field(description="xml: full report; junit: simple jUnit XML; text: plain text summary."),
 ]
 
 
@@ -68,8 +74,50 @@ def _env_flag(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-# Extra low-traffic/read-heavy tools trimmed from the default set; opt back in with FITNESSE_COMPLETE_TOOLSET=1.
-FITNESSE_COMPLETE_TOOLSET = _env_flag("FITNESSE_COMPLETE_TOOLSET")
+# FITNESSE_TOOLSETS combines two kinds of values (all = every mode; areas are always named):
+# - modes: a tool is visible only when its mode is listed. read/write/test are named after
+#   FitNesse's secure-read / secure-write / secure-test page attributes.
+# - areas: tools beyond the standard ones, each still filtered by the modes. complete adds
+#   the lower-traffic tools, debug the KDTA debug tools (fitnesse_debug_*, fitnesse_table_*).
+type Mode = Literal["read", "write", "test"]
+MODES: tuple[str, ...] = get_args(Mode.__value__)
+type Area = Literal["complete", "debug"]
+AREAS: tuple[str, ...] = get_args(Area.__value__)
+TOOLSETS: tuple[str, ...] = MODES + AREAS
+# Areas stay opt-in even with all: debug needs netcare's FitNesse fork, complete only adds
+# rarely needed tools. all,debug,complete is everything.
+ALL_TOOLSETS = frozenset(MODES)
+def _toolsets_from_env() -> frozenset[str]:
+    """Toolsets from FITNESSE_TOOLSETS (comma-separated or 'all'); required, so nothing is granted by accident."""
+    raw = os.getenv("FITNESSE_TOOLSETS", "").strip()
+    if not raw:
+        raise RuntimeError(
+            "FITNESSE_TOOLSETS is required: 'all' or a comma-separated subset of "
+            f"{', '.join(TOOLSETS)} (e.g. 'read', 'read,test,debug', or 'all,debug,complete'). It replaces "
+            "FITNESSE_READONLY and FITNESSE_COMPLETE_TOOLSET."
+        )
+    chosen = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    if "all" in chosen:
+        chosen = (chosen - {"all"}) | ALL_TOOLSETS
+    unknown = chosen - set(TOOLSETS)
+    if unknown or not chosen:
+        raise RuntimeError(
+            f"FITNESSE_TOOLSETS={raw!r}: expected 'all' or a comma-separated subset of "
+            f"{', '.join(TOOLSETS)} (e.g. 'read', 'read,test,debug', or 'all,debug,complete')."
+        )
+    if not chosen & set(MODES):
+        # An area alone would show nothing: its tools are filtered by the modes too.
+        raise RuntimeError(
+            f"FITNESSE_TOOLSETS={raw!r}: {' and '.join(sorted(chosen))} need at least one of "
+            f"{', '.join(MODES)}, e.g. 'read,{','.join(sorted(chosen))}'."
+        )
+    return frozenset(chosen)
+
+
+FITNESSE_TOOLSETS = _toolsets_from_env()
+
+# Extra low-traffic/read-heavy tools trimmed from the default set; opt in with FITNESSE_TOOLSETS=...,complete.
+COMPLETE_TOOLSET = "complete" in FITNESSE_TOOLSETS
 
 
 def _make_timeout(default: float):
@@ -352,7 +400,7 @@ def _build_multipart_form_data(
 
 @mcp.tool(
     name="fitnesse_add_child_page",
-    description="Creates a new child page beneath the selected page using pageName and pageContent, with optional pageTemplate and pageType.",
+    description="Creates a new child page beneath the selected page using pageName and pageContent, with optional pageTemplate, pageType, help text and tags (suites).",
     tags={"fitnesse", "rest", "pages", "write"},
     annotations={"destructiveHint": False},
 )
@@ -362,6 +410,8 @@ def fitnesse_add_child_page(
     page_content: PageContent = "",
     page_template: str | None = None,
     page_type: PageType | None = None,
+    help_text: str | None = None,
+    suites: Annotated[str | None, Field(description="Comma-separated tags for the new page.")] = None,
     timeout_seconds: float = _make_timeout(30.0),
 ) -> dict:
     """Create a child page using responder=addChild."""
@@ -374,6 +424,10 @@ def fitnesse_add_child_page(
         params["pageTemplate"] = page_template
     if page_type:
         params["pageType"] = page_type
+    if help_text:
+        params["helpText"] = help_text
+    if suites:
+        params["suites"] = suites
     return _request(
         "GET", parent_page_path, params=params, timeout_seconds=timeout_seconds
     )
@@ -438,10 +492,16 @@ if os.getenv("FITNESSE_FILES_ROOT"):
 )
 def fitnesse_delete_page(
     page_path: WikiPath,
+    delete_versions: Annotated[
+        bool,
+        Field(description="Also delete the page's saved versions (FitNesse 20261101 or later; older releases ignore it)."),
+    ] = False,
     timeout_seconds: float = _make_timeout(30.0),
 ) -> dict:
     """Delete a page via responder=deletePage."""
     params: dict[str, str | None] = {"responder": "deletePage", "confirmed": "yes"}
+    if delete_versions:
+        params["deleteVersions"] = "yes"
     return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
 
 
@@ -470,7 +530,7 @@ if os.getenv("FITNESSE_FILES_ROOT"):
         )
 
 
-if FITNESSE_COMPLETE_TOOLSET:
+if COMPLETE_TOOLSET:
 
     @mcp.tool(
         name="fitnesse_edit_page",
@@ -498,40 +558,58 @@ if FITNESSE_COMPLETE_TOOLSET:
         )
 
 
-if FITNESSE_COMPLETE_TOOLSET:
+if COMPLETE_TOOLSET:
 
     @mcp.tool(
-        name="fitnesse_execute_search_properties",
-        description="Returns pages matching property criteria such as pageType, Suites, Action, and exclude flags for setup, teardown, or obsolete pages.",
+        name="fitnesse_search_properties",
+        description=(
+            "Finds pages by their properties (responder=searchProperties; the deprecated "
+            "executeSearchProperties is the same responder). Every criterion left out is ignored. "
+            "page_types: pages of any of these types. suites: pages with any of these tags. actions "
+            "/ security / special: each listed attribute must be set and each unlisted one of that "
+            "group must not be, so list exactly the combination you want ('Any' ignores the group). "
+            "special covers SetUp/TearDown pages: listed kinds are included, unlisted excluded. "
+            "prune=true finds only pages marked as skipped. Searches page_path and its children "
+            "unless search_scope names an ancestor or 'root'. Navigation actions (RecentChanges, "
+            "Files, Search) are only matched by FitNesse 20261101 or later."
+        ),
         tags={"fitnesse", "rest", "search", "read"},
         annotations={"readOnlyHint": True},
     )
-    def fitnesse_execute_search_properties(
-        page_path: WikiPath,
-        page_type: PageType | None = None,
-        suites: str | None = None,
-        action: str | None = None,
-        exclude_setup: bool = False,
-        exclude_teardown: bool = False,
-        exclude_obsolete: bool = False,
+    def fitnesse_search_properties(
+        page_path: WikiPath = "",
+        page_types: list[Literal["Static", "Test", "Suite"]] | None = None,
+        suites: TagList = None,
+        actions: list[
+            Literal[
+                "Any", "Edit", "Versions", "Properties", "Refactor", "WhereUsed",
+                "RecentChanges", "Files", "Search",
+            ]
+        ] | None = None,
+        security: list[Literal["Any", "secure-read", "secure-write", "secure-test"]] | None = None,
+        special: list[Literal["Any", "SetUp", "TearDown"]] | None = None,
+        prune: bool = False,
+        search_scope: Annotated[
+            str | None,
+            Field(description="Ancestor page to search below, or 'root' for the whole wiki."),
+        ] = None,
         timeout_seconds: float = _make_timeout(60.0),
     ) -> dict:
-        """Search by properties via responder=executeSearchProperties."""
-        params: dict[str, str | None] = {"responder": "executeSearchProperties"}
-        if page_type:
-            params["pageType"] = page_type
+        """Search by properties via responder=searchProperties."""
+        params: dict[str, str | None] = {"responder": "searchProperties"}
+        if page_types:
+            # "PageType": the only name FitNesse 20251025 reads; 20261101 still accepts it.
+            params["PageType"] = ",".join(page_types)
         if suites:
             params["Suites"] = suites
-        if action:
-            params["Action"] = action
-        if exclude_setup:
-            params["ExcludeSetUp"] = None
-        if exclude_teardown:
-            params["ExcludeTearDown"] = None
-        if exclude_obsolete:
-            params["ExcludeObsolete"] = None
+        for key, values in (("Action", actions), ("Security", security), ("Special", special)):
+            if values is not None:
+                params[key] = "Any" if "Any" in values else ",".join(values)
+        if prune:
+            params["Prune"] = None
+        if search_scope:
+            params["searchScope"] = search_scope
         return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
-
 
 if os.getenv("FITNESSE_FILES_ROOT"):
 
@@ -599,7 +677,7 @@ if os.getenv("FITNESSE_FILES_ROOT"):
         return ToolResult(content=[block], structured_content=result)
 
 
-if FITNESSE_COMPLETE_TOOLSET:
+if COMPLETE_TOOLSET:
 
     @mcp.tool(
         name="fitnesse_get_page",
@@ -695,7 +773,7 @@ def fitnesse_import_and_view(
     )
 
 
-if FITNESSE_COMPLETE_TOOLSET:
+if COMPLETE_TOOLSET:
 
     @mcp.tool(
         name="fitnesse_get_instruction",
@@ -705,13 +783,14 @@ if FITNESSE_COMPLETE_TOOLSET:
     )
     def fitnesse_get_instruction(
         page_path: WikiPath,
+        variables: dict[str, str] | None = None,
         timeout_seconds: float = _make_timeout(120.0),
     ) -> dict:
         """Get Slim instructions via responder=instruction."""
         return _request(
             "GET",
             page_path,
-            params={"responder": "instruction"},
+            params=_merge_extra({"responder": "instruction"}, variables),
             timeout_seconds=timeout_seconds,
         )
 
@@ -725,15 +804,16 @@ if FITNESSE_COMPLETE_TOOLSET:
 def fitnesse_move_page(
     page_path: WikiPath,
     new_location: str,
+    refactor_references: Annotated[
+        bool, Field(description="Also update references to the moved page.")
+    ] = False,
     timeout_seconds: float = _make_timeout(30.0),
 ) -> dict:
     """Move a page under another parent via responder=movePage."""
-    return _request(
-        "GET",
-        page_path,
-        params={"responder": "movePage", "newLocation": new_location},
-        timeout_seconds=timeout_seconds,
-    )
+    params: dict[str, str | None] = {"responder": "movePage", "newLocation": new_location}
+    if refactor_references:
+        params["refactorReferences"] = None
+    return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
 
 
 @mcp.tool(
@@ -763,7 +843,7 @@ def fitnesse_list_names(
     return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
 
 
-if FITNESSE_COMPLETE_TOOLSET:
+if COMPLETE_TOOLSET:
 
     @mcp.tool(
         name="fitnesse_get_new_page_form",
@@ -788,7 +868,7 @@ if FITNESSE_COMPLETE_TOOLSET:
         )
 
 
-if FITNESSE_COMPLETE_TOOLSET:
+if COMPLETE_TOOLSET:
 
     @mcp.tool(
         name="fitnesse_get_packet",
@@ -810,9 +890,25 @@ if FITNESSE_COMPLETE_TOOLSET:
         )
 
 
+_EDIT_FORM_FIELD = re.compile(r'<input type="hidden" name="(editTime|ticketId)" value="(-?\d+)"')
+
+
+def _edit_session(page_path: str, timeout_seconds: float) -> dict[str, str | None]:
+    """editTime/ticketId from the edit form (read permission suffices); None when unavailable."""
+    form = _request("GET", page_path, params={"responder": "edit"}, timeout_seconds=timeout_seconds)
+    body = form.get("body")
+    fields = dict(_EDIT_FORM_FIELD.findall(body)) if form.get("ok") and isinstance(body, str) else {}
+    return {"edit_time": fields.get("editTime"), "ticket_id": fields.get("ticketId")}
+
+
 @mcp.tool(
     name="fitnesse_get_page_data",
-    description="Returns the raw wiki text of the selected page via pageData responder.",
+    description=(
+        "Returns the raw wiki text of the selected page via pageData responder (body), plus "
+        "edit_time and ticket_id. Pass both to fitnesse_save_page_content when saving changes "
+        "based on this text: if someone else saved the page in between, the save fails "
+        "instead of overwriting their change."
+    ),
     tags={"fitnesse", "rest", "pages", "read"},
     annotations={"readOnlyHint": True},
 )
@@ -820,13 +916,18 @@ def fitnesse_get_page_data(
     page_path: WikiPath,
     timeout_seconds: float = _make_timeout(30.0),
 ) -> dict:
-    """Get raw wiki text via responder=pageData."""
-    return _request(
+    """Get raw wiki text via responder=pageData, with the edit form's editTime/ticketId."""
+    # editTime first: a save between the two requests then counts as a conflict.
+    session = _edit_session(page_path, timeout_seconds)
+    result = _request(
         "GET",
         page_path,
         params={"responder": "pageData"},
         timeout_seconds=timeout_seconds,
     )
+    if result.get("ok"):
+        result.update(session)
+    return result
 
 
 @mcp.tool(
@@ -916,7 +1017,7 @@ def fitnesse_get_properties(
     )
 
 
-if FITNESSE_COMPLETE_TOOLSET:
+if COMPLETE_TOOLSET:
 
     @mcp.tool(
         name="fitnesse_publish",
@@ -940,25 +1041,24 @@ if FITNESSE_COMPLETE_TOOLSET:
 
 @mcp.tool(
     name="fitnesse_purge_history",
-    description="Purges old test history files while preserving the configured number of days.",
+    description="Purges test history files older than `days` for the selected page and its children; purge_global=true purges the history of all pages instead.",
     tags={"fitnesse", "rest", "pages", "write"},
     annotations={"destructiveHint": True},
 )
 def fitnesse_purge_history(
     days: int,
     page_path: WikiPath = "",
+    purge_global: bool = False,
     timeout_seconds: float = _make_timeout(120.0),
 ) -> dict:
     """Purge old history via responder=purgeHistory."""
-    return _request(
-        "GET",
-        page_path,
-        params={"responder": "purgeHistory", "days": str(days)},
-        timeout_seconds=timeout_seconds,
-    )
+    params: dict[str, str | None] = {"responder": "purgeHistory", "days": str(days)}
+    if purge_global:
+        params["purgeGlobal"] = "true"
+    return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
 
 
-if FITNESSE_COMPLETE_TOOLSET:
+if COMPLETE_TOOLSET:
 
     @mcp.tool(
         name="fitnesse_get_raw",
@@ -979,7 +1079,7 @@ if FITNESSE_COMPLETE_TOOLSET:
         )
 
 
-if FITNESSE_COMPLETE_TOOLSET:
+if COMPLETE_TOOLSET:
 
     @mcp.tool(
         name="fitnesse_get_refactor_screen",
@@ -989,15 +1089,17 @@ if FITNESSE_COMPLETE_TOOLSET:
     )
     def fitnesse_get_refactor_screen(
         page_path: WikiPath,
+        refactor_type: Annotated[
+            Literal["replace", "delete", "rename", "move"] | None,
+            Field(description="Show only this refactoring form; all forms when omitted."),
+        ] = None,
         timeout_seconds: float = _make_timeout(30.0),
     ) -> dict:
         """Get refactor screen via responder=refactor."""
-        return _request(
-            "GET",
-            page_path,
-            params={"responder": "refactor"},
-            timeout_seconds=timeout_seconds,
-        )
+        params: dict[str, str | None] = {"responder": "refactor"}
+        if refactor_type:
+            params["type"] = refactor_type
+        return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
 
 
 if os.getenv("FITNESSE_FILES_ROOT"):
@@ -1035,16 +1137,17 @@ if os.getenv("FITNESSE_FILES_ROOT"):
 )
 def fitnesse_rename_page(
     page_path: WikiPath,
-    new_name: str,
+    new_name: PageName,
+    refactor_references: Annotated[
+        bool, Field(description="Also update references to the renamed page.")
+    ] = False,
     timeout_seconds: float = _make_timeout(30.0),
 ) -> dict:
     """Rename a page using responder=renamePage."""
-    return _request(
-        "GET",
-        page_path,
-        params={"responder": "renamePage", "newName": new_name},
-        timeout_seconds=timeout_seconds,
-    )
+    params: dict[str, str | None] = {"responder": "renamePage", "newName": new_name}
+    if refactor_references:
+        params["refactorReferences"] = None
+    return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
 
 
 @mcp.tool(
@@ -1086,31 +1189,107 @@ def fitnesse_get_rss(
     )
 
 
+type PageAttribute = Literal[
+    "Edit",
+    "Versions",
+    "Properties",
+    "Refactor",
+    "WhereUsed",
+    "RecentChanges",
+    "Files",
+    "Search",
+    "DisableTestHistory",
+    "secure-read",
+    "secure-write",
+    "secure-test",
+    "Prune",
+]
+PAGE_ATTRIBUTES: tuple[str, ...] = get_args(PageAttribute.__value__)
+
+
+def _current_properties(page_path: str, timeout_seconds: float) -> dict:
+    """Fetch properties?format=json; a missing page yields all flags false and no Help/Suites.
+
+    Raises ToolError when they cannot be read, because saveData and saveProperties
+    remove whatever is not sent and guessing would wipe help text, tags or flags.
+    """
+    result = _request(
+        "GET",
+        page_path,
+        params={"responder": "properties", "format": "json"},
+        timeout_seconds=timeout_seconds,
+    )
+    if not result["ok"] or not isinstance(result["body"], dict):
+        raise ToolError(
+            f"Could not read current properties of {page_path!r} "
+            f"({result.get('error') or 'response is not JSON'}); nothing was saved. "
+            "Pass help_text and suites explicitly to save without reading them."
+        )
+    return result["body"]
+
+
+def _suites_string(value: object) -> str:
+    if isinstance(value, list):
+        return ",".join(str(tag) for tag in value)
+    return str(value or "")
+
+
+# saveData answers with the merge form (templates/mergePage.vm, same marker in
+# 20251025 and 20261101) instead of saving when the page changed after editTime.
+_MERGE_FORM_MARKER = 'id="merge-old"'
+# Long.MAX_VALUE: never older than the last save, whatever the server's clock says.
+_OVERWRITE_EDIT_TIME = str(2**63 - 1)
+
+
 @mcp.tool(
     name="fitnesse_save_page_content",
-    description="Saves wiki page content via POST using pageContent and optional editTime, ticketId, and redirect fields.",
+    description=(
+        "Saves wiki page content via POST using pageContent and optional editTime, ticketId, "
+        "and redirect fields. FitNesse removes the page's help text and tags when they are "
+        "not sent, so help_text and suites are kept from the current page unless given; "
+        "pass an empty string to remove them. Without edit_time the save overwrites the page "
+        "(last write wins). With edit_time and ticket_id (from fitnesse_get_page_data) "
+        "FitNesse checks for a conflict: if someone else saved the page since then, nothing "
+        "is saved and the tool fails; re-read the page, merge, and save again."
+    ),
     tags={"fitnesse", "rest", "pages", "write"},
     annotations={"destructiveHint": False, "idempotentHint": True},
 )
 def fitnesse_save_page_content(
     page_path: WikiPath,
     page_content: PageContent,
-    edit_time: str | None = None,
-    ticket_id: str | None = None,
+    edit_time: Annotated[str | None, Field(description="edit_time returned by fitnesse_get_page_data; enables the conflict check. Omit to overwrite.", pattern=r"^\d+$")] = None,
+    ticket_id: Annotated[str | None, Field(description="ticket_id returned by the same fitnesse_get_page_data call; saves with the same ticket never conflict with each other.", pattern=r"^-?\d+$")] = None,
     redirect: str | None = None,
+    help_text: str | None = None,
+    suites: str | None = None,
     timeout_seconds: float = _make_timeout(30.0),
 ) -> dict:
     """Save a FitNesse page using responder=saveData form payload."""
-    form_data: dict[str, str] = {"pageContent": page_content}
-    if edit_time:
-        form_data["editTime"] = edit_time
+    if help_text is None or suites is None:
+        current = _current_properties(page_path, timeout_seconds)
+        if help_text is None:
+            help_text = str(current.get("Help") or "")
+        if suites is None:
+            suites = _suites_string(current.get("Suites"))
+
+    # Without editTime FitNesse compares against 0, so a page saved through the UI
+    # since the server started would silently turn this save into a merge form.
+    form_data: dict[str, str] = {
+        "pageContent": page_content,
+        "editTime": edit_time or _OVERWRITE_EDIT_TIME,
+    }
     if ticket_id:
         form_data["ticketId"] = ticket_id
     if redirect:
         form_data["redirect"] = redirect
+    if help_text:
+        form_data["helpText"] = help_text
+    if suites:
+        form_data["suites"] = suites
 
     body = parse.urlencode(form_data)
-    return _request(
+    result = _request(
         "POST",
         page_path,
         params={"responder": "saveData"},
@@ -1118,49 +1297,57 @@ def fitnesse_save_page_content(
         content_type="application/x-www-form-urlencoded",
         timeout_seconds=timeout_seconds,
     )
+    if result.get("ok") and _MERGE_FORM_MARKER in (result.get("body") or ""):
+        raise ToolError(
+            f"Not saved: {page_path} was changed by someone else after edit_time {edit_time}. "
+            "FitNesse answered with its merge form. Read the page again, merge your changes "
+            "into the current content, and save with a fresh edit_time (or without edit_time "
+            "to overwrite)."
+        )
+    return result
 
 
 @mcp.tool(
     name="fitnesse_save_properties",
-    description="Saves page properties via POST including pageType, attribute flags, Suites tags, and HelpText.",
+    description=(
+        "Saves page properties via POST: pageType, attribute flags, Suites tags and HelpText. "
+        "FitNesse resets every attribute that is not sent, so each argument left out keeps the "
+        "page's current value; `attributes` is the complete list of flags that end up set. "
+        "Pass an empty string or list to clear a value."
+    ),
     tags={"fitnesse", "rest", "pages", "write"},
     annotations={"destructiveHint": False, "idempotentHint": True},
 )
 def fitnesse_save_properties(
     page_path: WikiPath,
-    page_type: PageType = "Normal",
+    page_type: PageType | None = None,
     suites: str | None = None,
     help_text: str | None = None,
-    attributes: list[
-        Literal[
-            "Test",
-            "Suite",
-            "Prune",
-            "Edit",
-            "Versions",
-            "Properties",
-            "Refactor",
-            "WhereUsed",
-            "RecentChanges",
-            "Files",
-            "Search",
-            "Secure-Test",
-            "Secure-Edit",
-            "Secure-Read",
-        ]
-    ]
-    | None = None,
+    attributes: list[PageAttribute] | None = None,
     timeout_seconds: float = _make_timeout(30.0),
 ) -> dict:
-    """Save properties with responder=saveProperties."""
-    form_data: dict[str, str] = {"pageType": page_type}
-    if suites is not None:
+    """Save properties with responder=saveProperties, merged onto the current ones."""
+    if page_type is None or suites is None or help_text is None or attributes is None:
+        current = _current_properties(page_path, timeout_seconds)
+        if page_type is None:
+            page_type = (
+                "Test" if current.get("Test") else "Suite" if current.get("Suite") else "Static"
+            )
+        if suites is None:
+            suites = _suites_string(current.get("Suites"))
+        if help_text is None:
+            help_text = str(current.get("Help") or "")
+        if attributes is None:
+            attributes = [a for a in PAGE_ATTRIBUTES if current.get(a) is True]
+
+    # "PageType": the only name FitNesse 20251025 reads; 20261101 still accepts it.
+    form_data: dict[str, str] = {"PageType": page_type}
+    if suites:
         form_data["Suites"] = suites
-    if help_text is not None:
+    if help_text:
         form_data["HelpText"] = help_text
-    if attributes:
-        for attr in attributes:
-            form_data[attr] = "on"
+    for attr in dict.fromkeys(attributes):
+        form_data[attr] = "on"
 
     body = parse.urlencode(form_data)
     return _request(
@@ -1173,31 +1360,44 @@ def fitnesse_save_properties(
     )
 
 
-if FITNESSE_COMPLETE_TOOLSET:
+@mcp.tool(
+    name="fitnesse_search",
+    description=(
+        "Searches pages for searchString in page names (search_type='title') or page content "
+        "(search_type='content'). Text search is plain text, not a regex. method_search=true "
+        "(content only) finds pages using a method or scenario: give a wiki line that evaluates to "
+        "it, e.g. '|click|x|'. Searches page_path and its children, unless search_scope names an "
+        "ancestor page or 'root' for the whole wiki. Returns an HTML table of matches."
+    ),
+    tags={"fitnesse", "rest", "search", "read"},
+    annotations={"readOnlyHint": True},
+)
+def fitnesse_search(
+    search_string: str,
+    page_path: WikiPath = "",
+    search_type: Literal["title", "content"] = "content",
+    method_search: bool = False,
+    search_scope: Annotated[
+        str | None,
+        Field(description="Ancestor page to search below, or 'root' for the whole wiki."),
+    ] = None,
+    timeout_seconds: float = _make_timeout(30.0),
+) -> dict:
+    """Search pages with responder=search."""
+    if method_search and search_type != "content":
+        raise ToolError("method_search only works with search_type='content'")
+    params: dict[str, str | None] = {
+        "responder": "search",
+        "searchString": search_string,
+        "searchType": search_type,
+    }
+    if method_search:
+        params["isMethodSearch"] = None
+    if search_scope:
+        params["searchScope"] = search_scope
+    return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
 
-    @mcp.tool(
-        name="fitnesse_search",
-        description="Searches for pages matching searchString with searchType for content or title matching.",
-        tags={"fitnesse", "rest", "search", "read"},
-        annotations={"readOnlyHint": True},
-    )
-    def fitnesse_search(
-        page_path: WikiPath,
-        search_string: str,
-        search_type: str = "content",
-        timeout_seconds: float = _make_timeout(30.0),
-    ) -> dict:
-        """Search pages with responder=search."""
-        return _request(
-            "GET",
-            page_path,
-            params={
-                "responder": "search",
-                "searchString": search_string,
-                "searchType": search_type,
-            },
-            timeout_seconds=timeout_seconds,
-        )
+if COMPLETE_TOOLSET:
 
     @mcp.tool(
         name="fitnesse_get_search_form",
@@ -1252,9 +1452,37 @@ def fitnesse_stop_test(
     return _request("GET", "", params=params, timeout_seconds=timeout_seconds)
 
 
+def _suite_filter_params(
+    suite_filter: str | None,
+    run_tests_matching_any_tag: str | None,
+    run_tests_matching_all_tags: str | None,
+    exclude_suite_filter: str | None,
+    first_test: str | None,
+) -> dict[str, str | None]:
+    """Test selection inputs shared by suite, partition and overview."""
+    params: dict[str, str | None] = {}
+    for key, value in (
+        ("suiteFilter", suite_filter),
+        ("runTestsMatchingAnyTag", run_tests_matching_any_tag),
+        ("runTestsMatchingAllTags", run_tests_matching_all_tags),
+        ("excludeSuiteFilter", exclude_suite_filter),
+        ("firstTest", first_test),
+    ):
+        if value:
+            params[key] = value
+    return params
+
+
 @mcp.tool(
     name="fitnesse_run_suite",
-    description="Runs a suite of tests under the selected page with support for filters, debug options, and history controls. Returns XML.",
+    description=(
+        "Runs all tests below the selected page. Select tests with tags (suite_filter / "
+        "run_tests_matching_any_tag: any of the tags, the latter wins; run_tests_matching_all_tags; "
+        "exclude_suite_filter), first_test, or a partition (partition_count + zero-based "
+        "partition_index; preview with fitnesse_partition_preview). Returns XML unless format "
+        "says otherwise. Do not combine nohistory with format='xml': the XML report is built "
+        "from the history."
+    ),
     tags={"fitnesse", "rest", "tests", "execute"},
     annotations={"destructiveHint": False},
 )
@@ -1262,27 +1490,42 @@ def fitnesse_run_suite(
     page_path: WikiPath,
     debug: bool = False,
     remote_debug: bool = False,
-    suite_filter: str | None = None,
-    exclude_suite_filter: str | None = None,
+    suite_filter: TagList = None,
+    exclude_suite_filter: TagList = None,
     first_test: str | None = None,
     nohistory: bool = False,
     includehtml: bool = False,
     nochunk: bool = False,
     variables: dict[str, str] | None = None,
+    run_tests_matching_any_tag: TagList = None,
+    run_tests_matching_all_tags: TagList = None,
+    partition_count: Annotated[int | None, Field(ge=1)] = None,
+    partition_index: Annotated[int | None, Field(ge=0)] = None,
+    format: RunFormat = "xml",
     timeout_seconds: float | None = _make_run_timeout(),
 ) -> dict:
     """Run a suite with full documented controls for responder=suite."""
-    params: dict[str, str | None] = {"responder": "suite", "format": "xml"}
+    if (partition_count is None) != (partition_index is None):
+        raise ToolError("Give partition_count and partition_index together")
+    if partition_count is not None and partition_index >= partition_count:
+        raise ToolError("partition_index must be smaller than partition_count")
+    params: dict[str, str | None] = {"responder": "suite", "format": format}
     if debug:
         params["debug"] = None
     if remote_debug:
         params["remote_debug"] = None
-    if suite_filter:
-        params["suiteFilter"] = suite_filter
-    if exclude_suite_filter:
-        params["excludeSuiteFilter"] = exclude_suite_filter
-    if first_test:
-        params["firstTest"] = first_test
+    params.update(
+        _suite_filter_params(
+            suite_filter,
+            run_tests_matching_any_tag,
+            run_tests_matching_all_tags,
+            exclude_suite_filter,
+            first_test,
+        )
+    )
+    if partition_count is not None:
+        params["partitionCount"] = str(partition_count)
+        params["partitionIndex"] = str(partition_index)
     if nohistory:
         params["nohistory"] = None
     if includehtml:
@@ -1325,7 +1568,7 @@ def fitnesse_manage_symlink(
 
 @mcp.tool(
     name="fitnesse_run_test",
-    description="Runs a test page and supports debug, remote_debug, nochunk, and markup variable inputs. Returns XML.",
+    description="Runs a test page and supports debug, remote_debug, nochunk, nohistory, and markup variable inputs. Returns XML unless format says otherwise.",
     tags={"fitnesse", "rest", "tests", "execute"},
     annotations={"destructiveHint": False},
 )
@@ -1335,39 +1578,54 @@ def fitnesse_run_test(
     remote_debug: bool = False,
     nochunk: bool = False,
     variables: dict[str, str] | None = None,
+    nohistory: bool = False,
+    format: RunFormat = "xml",
     timeout_seconds: float | None = _make_run_timeout(),
 ) -> dict:
     """Run a test with responder=test and optional controls."""
-    params: dict[str, str | None] = {"responder": "test", "format": "xml"}
+    params: dict[str, str | None] = {"responder": "test", "format": format}
     if debug:
         params["debug"] = None
     if remote_debug:
         params["remote_debug"] = None
     if nochunk:
         params["nochunk"] = None
+    if nohistory:
+        params["nohistory"] = None
     params = _merge_extra(params, variables)
     return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
 
 
-if FITNESSE_COMPLETE_TOOLSET:
+if COMPLETE_TOOLSET:
 
     @mcp.tool(
         name="fitnesse_get_test_history",
-        description="Displays current test history for a page subtree or all history. Returns XML.",
+        description="Displays current test history for a page subtree or all history. Returns XML; results and trim only shape the HTML view (format='html').",
         tags={"fitnesse", "rest", "history", "read"},
         annotations={"readOnlyHint": True},
     )
     def fitnesse_get_test_history(
         page_path: WikiPath = "",
+        format: Literal["xml", "html"] = "xml",
+        results: Annotated[
+            int | None, Field(ge=1, description="HTML only: most recent results shown per page.")
+        ] = None,
+        trim: Annotated[
+            str | None, Field(description="HTML only: prefix removed from the page names shown.")
+        ] = None,
         timeout_seconds: float = _make_timeout(30.0),
     ) -> dict:
         """Get test history via responder=testHistory."""
-        return _request(
-            "GET",
-            page_path,
-            params={"responder": "testHistory", "format": "xml"},
-            timeout_seconds=timeout_seconds,
-        )
+        if format == "xml" and (results is not None or trim):
+            raise ToolError("results and trim only apply to format='html'")
+        params: dict[str, str | None] = {"responder": "testHistory"}
+        if format == "xml":
+            params["format"] = "xml"
+        if results is not None:
+            params["results"] = str(results)
+        if trim:
+            params["trim"] = trim
+        return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
 
 
 if os.getenv("FITNESSE_FILES_ROOT"):
@@ -1454,18 +1712,19 @@ def fitnesse_get_versions(
 def fitnesse_view_version(
     page_path: WikiPath,
     version: str,
+    variables: dict[str, str] | None = None,
     timeout_seconds: float = _make_timeout(30.0),
 ) -> dict:
     """View one saved version via responder=viewVersion."""
     return _request(
         "GET",
         page_path,
-        params={"responder": "viewVersion", "version": version},
+        params=_merge_extra({"responder": "viewVersion", "version": version}, variables),
         timeout_seconds=timeout_seconds,
     )
 
 
-if FITNESSE_COMPLETE_TOOLSET:
+if COMPLETE_TOOLSET:
 
     @mcp.tool(
         name="fitnesse_where_used",
@@ -1505,7 +1764,7 @@ def fitnesse_get_variables(
     )
 
 
-if FITNESSE_COMPLETE_TOOLSET:
+if COMPLETE_TOOLSET:
 
     @mcp.tool(
         name="fitnesse_get_page_content",
@@ -1527,12 +1786,242 @@ if FITNESSE_COMPLETE_TOOLSET:
 
 
 # ---------------------------------------------------------------------------
-# KDTA debug mode: responder=debugTest and responder=debugTable.
-# These responders exist only in netcare's FitNesse fork (fitnesse-netcare-mod),
-# so the tools are registered only with FITNESSE_KDTA_DEBUG set.
+# Responders documented in RestfulServices (FitNesse 20251025 and 20261101)
 # ---------------------------------------------------------------------------
 
-FITNESSE_KDTA_DEBUG = _env_flag("FITNESSE_KDTA_DEBUG")
+
+@mcp.tool(
+    name="fitnesse_compare_versions",
+    description=(
+        "Shows the differences between two saved versions of a page, or between one version and "
+        "the latest when only one is given. Version ids as listed by fitnesse_get_versions. "
+        "Returns HTML."
+    ),
+    tags={"fitnesse", "rest", "history", "read"},
+    annotations={"readOnlyHint": True},
+)
+def fitnesse_compare_versions(
+    page_path: WikiPath,
+    versions: Annotated[list[str], Field(min_length=1, max_length=2)],
+    timeout_seconds: float = _make_timeout(30.0),
+) -> dict:
+    """Diff versions via responder=compareVersions (Version_<id> flags)."""
+    params: list[tuple[str, str | None]] = [("responder", "compareVersions")]
+    params += [(f"Version_{version}", None) for version in versions]
+    return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+
+
+@mcp.tool(
+    name="fitnesse_replace",
+    description=(
+        "Replaces text in the selected page and all its children and saves every changed page; "
+        "returns an HTML table of the changed pages. Text replace: search_string is a regular "
+        "expression. method_replace=true: search_string is a wiki line that evaluates to a "
+        "method or scenario (e.g. '|click|x|'). search_scope limits it to an ancestor page or "
+        "'root'. Try the search with fitnesse_search first: this cannot be undone in one step."
+    ),
+    tags={"fitnesse", "rest", "pages", "write"},
+    annotations={"destructiveHint": True},
+)
+def fitnesse_replace(
+    page_path: WikiPath,
+    search_string: str,
+    replacement_string: str,
+    method_replace: bool = False,
+    search_scope: Annotated[
+        str | None,
+        Field(description="Ancestor page to work below, or 'root' for the whole wiki."),
+    ] = None,
+    timeout_seconds: float = _make_timeout(120.0),
+) -> dict:
+    """Search and replace via responder=replace."""
+    params: dict[str, str | None] = {
+        "responder": "replace",
+        "searchString": search_string,
+        "replacementString": replacement_string,
+    }
+    if method_replace:
+        params["isMethodReplace"] = None
+    if search_scope:
+        params["searchScope"] = search_scope
+    return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+
+
+@mcp.tool(
+    name="fitnesse_get_suite_overview",
+    description=(
+        "Shows the test pages of a suite as a tree with their latest results, without running "
+        "anything. Takes the same test selection as fitnesse_run_suite. Returns HTML."
+    ),
+    tags={"fitnesse", "rest", "tests", "read"},
+    annotations={"readOnlyHint": True},
+)
+def fitnesse_get_suite_overview(
+    page_path: WikiPath,
+    suite_filter: TagList = None,
+    run_tests_matching_any_tag: TagList = None,
+    run_tests_matching_all_tags: TagList = None,
+    exclude_suite_filter: TagList = None,
+    first_test: str | None = None,
+    timeout_seconds: float = _make_timeout(60.0),
+) -> dict:
+    """Suite tree with latest results via responder=overview."""
+    params: dict[str, str | None] = {"responder": "overview"}
+    params.update(
+        _suite_filter_params(
+            suite_filter,
+            run_tests_matching_any_tag,
+            run_tests_matching_all_tags,
+            exclude_suite_filter,
+            first_test,
+        )
+    )
+    return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+
+
+if COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_get_execution_log",
+        description=(
+            "Shows the execution log of a test run of the page: test system, command, exit code, "
+            "stdout/stderr and exceptions. result_date is a timestamp (yyyyMMddHHmmss, as in "
+            "fitnesse_get_page_history) or 'latest' (default). Returns HTML."
+        ),
+        tags={"fitnesse", "rest", "history", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_get_execution_log(
+        page_path: WikiPath,
+        result_date: Annotated[
+            str, Field(pattern=r"^(latest|\d{14})$", description="yyyyMMddHHmmss or 'latest'.")
+        ] = "latest",
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """Execution log via responder=executionLog."""
+        return _request(
+            "GET",
+            page_path,
+            params={"responder": "executionLog", "resultDate": result_date},
+            timeout_seconds=timeout_seconds,
+        )
+
+    @mcp.tool(
+        name="fitnesse_partition_preview",
+        description=(
+            "Previews how fitnesse_run_suite(partition_count=...) distributes the suite's tests over "
+            "partitions, without running them. Takes the same test selection as fitnesse_run_suite. "
+            "Returns tab-separated lines (format='tsv', default) or HTML."
+        ),
+        tags={"fitnesse", "rest", "tests", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_partition_preview(
+        page_path: WikiPath,
+        partition_count: Annotated[int, Field(ge=1)],
+        format: Literal["tsv", "html"] = "tsv",
+        suite_filter: TagList = None,
+        run_tests_matching_any_tag: TagList = None,
+        run_tests_matching_all_tags: TagList = None,
+        exclude_suite_filter: TagList = None,
+        first_test: str | None = None,
+        timeout_seconds: float = _make_timeout(60.0),
+    ) -> dict:
+        """Partition preview via responder=partition."""
+        params: dict[str, str | None] = {
+            "responder": "partition",
+            "partitionCount": str(partition_count),
+        }
+        if format == "tsv":
+            params["format"] = "tsv"
+        params.update(
+            _suite_filter_params(
+                suite_filter,
+                run_tests_matching_any_tag,
+                run_tests_matching_all_tags,
+                exclude_suite_filter,
+                first_test,
+            )
+        )
+        return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+
+    @mcp.tool(
+        name="fitnesse_get_proxy_data",
+        description=(
+            "Returns the serialized page data the import responder uses: type 'pages' (child "
+            "pages), 'data', 'versions', or 'meat' (with version: that version's data)."
+        ),
+        tags={"fitnesse", "rest", "pages", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_get_proxy_data(
+        page_path: WikiPath,
+        type: Literal["pages", "data", "versions", "meat"],
+        version: str | None = None,
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """Serialized page data via responder=proxy."""
+        params: dict[str, str | None] = {"responder": "proxy", "type": type}
+        if version:
+            params["version"] = version
+        return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+
+if _env_flag("FITNESSE_ALLOW_ACCOUNT_ADMIN"):
+
+    @mcp.tool(
+        name="fitnesse_save_account",
+        description=(
+            "Changes FitNesse accounts (responder=saveAccount), as the account FITNESSE_USERNAME "
+            "logs in with. action='change_password': new password for that account "
+            "(current_password, new_password). 'create_user' and 'delete_user' need the admin "
+            "user: user_name, plus user_password for create_user. Only on explicit request."
+        ),
+        tags={"fitnesse", "rest", "admin", "control"},
+        annotations={"destructiveHint": True},
+    )
+    def fitnesse_save_account(
+        action: Literal["change_password", "create_user", "delete_user"],
+        current_password: str | None = None,
+        new_password: str | None = None,
+        user_name: str | None = None,
+        user_password: str | None = None,
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """Account changes via responder=saveAccount (POST form)."""
+        if action == "change_password":
+            if not (current_password and new_password):
+                raise ToolError("change_password needs current_password and new_password")
+            form = {
+                "changePassword": "yes",
+                "CurrentPasswordText": current_password,
+                "NewPasswordText": new_password,
+                "ConfirmPasswordText": new_password,
+            }
+        elif action == "create_user":
+            if not (user_name and user_password):
+                raise ToolError("create_user needs user_name and user_password")
+            form = {"createUser": "yes", "UserNameText": user_name, "UserPasswordText": user_password}
+        else:
+            if not user_name:
+                raise ToolError("delete_user needs user_name")
+            form = {"deleteUser": "yes", "UserNameText": user_name}
+        return _request(
+            "POST",
+            "",
+            params={"responder": "saveAccount"},
+            body=parse.urlencode(form),
+            content_type="application/x-www-form-urlencoded",
+            timeout_seconds=timeout_seconds,
+        )
+
+
+# ---------------------------------------------------------------------------
+# KDTA debug mode: responder=debugTest and responder=debugTable.
+# These responders exist only in netcare's FitNesse fork (fitnesse-netcare-mod),
+# so the tools are registered only with debug in FITNESSE_TOOLSETS.
+# ---------------------------------------------------------------------------
+
+DEBUG_TOOLSET = "debug" in FITNESSE_TOOLSETS
 # Must exceed the server's debugTest.timeoutMinutes (default 10 min), which answers 504 itself.
 _debug_timeout_env = float(os.getenv("FITNESSE_DEBUG_TIMEOUT_SECONDS", "660"))
 DEBUG_TIMEOUT_SECONDS = _debug_timeout_env if _debug_timeout_env > 0 else None
@@ -1991,7 +2480,7 @@ def _run_document(
     return result
 
 
-if FITNESSE_KDTA_DEBUG:
+if DEBUG_TOOLSET:
 
     @mcp.tool(
         name="fitnesse_debug_start",
@@ -2156,7 +2645,8 @@ if FITNESSE_KDTA_DEBUG:
         description=(
             "Lists the tables that running a page executes, in order, including those of its "
             "SetUp/TearDown and included pages: index, number of rows and the first row. Use the "
-            "indices to run only some of them with fitnesse_debug_run_page(tables=[...]). Requires a "
+            "indices to run only some of them with fitnesse_debug_run_page(tables=[...]). These indices "
+            "differ from fitnesse_table_source's, which counts only the page's own tables. Requires a "
             "debug session; omit page_path for the page currently being tested."
         ),
         tags={"fitnesse", "debug", "read"},
@@ -2234,7 +2724,7 @@ if FITNESSE_KDTA_DEBUG:
             "- 'liveView': the Selenium grid session of the open browser and live_view_url, a link "
             "where a person can watch the browser (password not included)."
         ),
-        tags={"fitnesse", "debug", "execute"},
+        tags={"fitnesse", "debug", "read"},
         annotations={"destructiveHint": False},
     )
     def fitnesse_debug_inspect(
@@ -2314,7 +2804,9 @@ if FITNESSE_KDTA_DEBUG:
             "with fitnesse_table_save, fitnesse_table_insert and fitnesse_table_delete. Result: "
             "tables (wiki markup of each of the page's own tables; tables from included pages and "
             "tables nested in cells are not counted) and texts, where texts[i] is the text before "
-            "tables[i] and the last text follows the last table. Does not need a debug session."
+            "tables[i] and the last text follows the last table. Its indices differ from "
+            "fitnesse_debug_page_tables', which also counts SetUp, TearDown and included pages. Does "
+            "not need a debug session."
         ),
         tags={"fitnesse", "debug", "read"},
         annotations={"readOnlyHint": True},
@@ -2326,7 +2818,7 @@ if FITNESSE_KDTA_DEBUG:
         """source via responder=debugTable."""
         return _debug_post("debugTable", page_path, "source", timeout_seconds=timeout_seconds)
 
-    # debugTable saves wiki pages for real: tagged write, so FITNESSE_READONLY hides them.
+    # debugTable saves wiki pages for real: tagged write, so they need FITNESSE_TOOLSETS=write.
     _TABLE_EDIT = (
         " This saves the wiki page for real (it shows up in recent changes): change only pages you "
         "are asked to change. Read fitnesse_table_source first and pass its texts unchanged; if the "
@@ -2398,10 +2890,69 @@ if FITNESSE_KDTA_DEBUG:
         )
 
 
-if _env_flag("FITNESSE_READONLY"):
-    # hide write/execute/control tools in read-only deployments
-    mcp.add_transform(Visibility(False, tags={"write", "execute", "control"}))
+# The mode each tool needs: by tag, plus the few control tools by name.
+# tests/test_server.py checks that every tool has exactly one.
+MODE_TAGS: dict[str, set[str]] = {"read": {"read"}, "write": {"write"}, "test": {"execute"}}
+MODE_NAMES: dict[str, set[str]] = {
+    "read": set(),
+    "write": {"fitnesse_shutdown", "fitnesse_save_account"},
+    "test": {"fitnesse_stop_test"},
+}
+
+for _mode in set(MODES) - FITNESSE_TOOLSETS:
+    mcp.add_transform(Visibility(False, tags=MODE_TAGS[_mode]))
+    if MODE_NAMES[_mode]:
+        mcp.add_transform(Visibility(False, names=MODE_NAMES[_mode]))
+# The areas complete and debug gate registration (COMPLETE_TOOLSET, DEBUG_TOOLSET above).
+
+
+# Sent to the client at initialize; agents see it, the README they do not.
+DEBUG_INSTRUCTIONS = """\
+KDTA debug tools - how they depend on each other:
+- Session first: fitnesse_debug_start (or fitnesse_debug_status(adopt=true) for a running \
+session) must succeed before fitnesse_debug_run_wiki, _run_page, _page_tables, _inspect and \
+_end work. fitnesse_debug_status without adopt and the fitnesse_table_* tools need no session.
+- Typical flow: start -> inspect(kind='keywords') -> run_wiki / run_page, repeatedly -> end. \
+Always call fitnesse_debug_end when done; the session holds server resources.
+- Write run_wiki tables with the exact keyword wording from inspect(kind='keywords').
+- State (open browser, scope, variables) carries over between run_wiki and run_page calls on \
+the same page. run_page on another page, or restart=true, first ends the current page's test \
+(tear down in previous_page_teardown).
+- run_wiki adds no SetUp/TearDown: if the steps need them, run those tables first with \
+run_page(tables=[...]), indices from fitnesse_debug_page_tables.
+- Suite session (start with suite=true): call run_page for each page with runnable=true from \
+'pages', in that order.
+- busy=true in fitnesse_debug_status: wait and poll status, or fitnesse_debug_end(abort=true); \
+a run_wiki/run_page call fails at once while busy.
+"""
+
+# fitnesse_table_source needs debug and read, like the base part.
+DEBUG_TABLE_SOURCE_INSTRUCTIONS = """\
+- Table indices differ: fitnesse_debug_page_tables counts every table a run executes (SetUp, \
+TearDown, included pages); fitnesse_table_source counts only the page's own tables. Never pass \
+an index from one to the other.
+"""
+
+# Only with write as well, where fitnesse_table_save/_insert/_delete are visible.
+DEBUG_TABLE_EDIT_INSTRUCTIONS = """\
+- Editing tables: read fitnesse_table_source, pass its texts unchanged to fitnesse_table_save / \
+_insert / _delete, then read the source again before the next edit (indices shift). A running \
+session sees the change when the tables are run again.
+"""
+
+# Each part names only tools the toolsets make visible: the base part needs the session
+# tools (test) and status/page_tables/inspect (read).
+if {"debug", "read", "test"} <= FITNESSE_TOOLSETS:
+    mcp.instructions = DEBUG_INSTRUCTIONS + DEBUG_TABLE_SOURCE_INSTRUCTIONS
+    if "write" in FITNESSE_TOOLSETS:
+        mcp.instructions += DEBUG_TABLE_EDIT_INSTRUCTIONS
+
+
+
+def main() -> None:
+    """Entry point of the fitnesse-mcp command: stdio unless FASTMCP_TRANSPORT says otherwise."""
+    mcp.run()
 
 
 if __name__ == "__main__":
-    mcp.run()
+    main()

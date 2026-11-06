@@ -72,4 +72,5 @@ COPY --chown=app:app . .
 USER app
 EXPOSE 8000
 
-CMD ["fastmcp", "run", "server.py:mcp"]
+# stdio by default; FASTMCP_TRANSPORT=http (plus FASTMCP_HOST / FASTMCP_PORT) serves HTTP.
+CMD ["fitnesse-mcp"]

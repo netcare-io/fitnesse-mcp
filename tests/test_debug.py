@@ -252,6 +252,7 @@ async def test_start_replace_and_session_forwarded(debug_env):
     data, fake = await _call(
         "fitnesse_debug_run_wiki", {"wiki": "|with browser|"},
         (200, {"html": RESULT_HTML, "counts": {"right": 1, "wrong": 1, "ignores": 0, "exceptions": 1}}),
+        (200, {"html": "<table><tr><td>own</td></tr></table>"}),  # pageHtml: no SetUp, so no hint
     )
     assert fake.requests[0]["form"] == {"action": "runWiki", "session": "s1", "wiki": "|with browser|"}
     assert fake.requests[0]["timeout"] == my_server.DEBUG_TIMEOUT_SECONDS
@@ -439,6 +440,9 @@ async def test_status_reads_log_and_end_forgets_session(debug_env):
     assert fake.actions == ["status", "log"]
     assert data["known_to_this_server"] is True
     assert data["log"]["more"] is True and data["log"]["lines"][0] == "t [out] l0"
+    long = {"stream": "info", "text": "Command: java -cp " + "x.jar:" * 1000, "time": "t"}
+    assert my_server._log_line(long).endswith(f"… ({len(long['text'])} chars)")
+    assert len(my_server._log_line(long)) < 600
     data, fake = await _call("fitnesse_debug_end", {}, (200, {"ended": True, "html": "", "counts": {}, "log": {"lines": lines[3:]}}))
     assert fake.requests[0]["form"]["logFrom"] == "3"
     assert data["ended"] is True and len(data["log"]) == 2
@@ -844,7 +848,8 @@ async def test_run_page_setup_only_runs_the_setup_tables(debug_env):
 async def test_run_wiki_failing_before_the_setup_hints_at_setup_only(debug_env):
     await _start()
     wrong = (200, {"html": "<table><tr><td class=\"error\">greet</td></tr></table>", "counts": {"exceptions": 1}})
-    data, _ = await _call("fitnesse_debug_run_wiki", {"wiki": "|greet|"}, wrong)
+    data, fake = await _call("fitnesse_debug_run_wiki", {"wiki": "|greet|"}, wrong, (200, {"html": TEARDOWN_HTML}))
+    assert fake.actions == ["runWiki", "pageHtml"]  # the page has a SetUp
     assert "has not run in this test" in data["hint"] and "setup_only=true" in data["hint"]
 
     data, _ = await _call("fitnesse_debug_run_wiki", {"wiki": "|ok|"}, (200, {"html": "<table><tr><td class=\"pass\">ok</td></tr></table>", "counts": {"right": 1}}))
@@ -857,6 +862,17 @@ async def test_run_wiki_failing_before_the_setup_hints_at_setup_only(debug_env):
     )
     data, _ = await _call("fitnesse_debug_run_wiki", {"wiki": "|greet|"}, wrong)
     assert "hint" not in data  # SetUp ran: a real failure
+
+
+@pytest.mark.asyncio
+async def test_run_wiki_failing_on_a_page_without_setup_has_no_setup_hint(debug_env):
+    await _start()
+    wrong = (200, {"html": "<table><tr><td class=\"fail\">docker run</td></tr></table>", "counts": {"wrong": 1}})
+    no_setup = (200, {"html": "<table><tr><td>own</td></tr></table>"})
+    data, fake = await _call("fitnesse_debug_run_wiki", {"wiki": "|docker run|x|"}, wrong, no_setup)
+    assert fake.actions == ["runWiki", "pageHtml"] and "hint" not in data
+    data, fake = await _call("fitnesse_debug_run_wiki", {"wiki": "|docker run|x|"}, wrong)
+    assert fake.actions == ["runWiki"] and "hint" not in data  # looked up once per test
 
 
 @pytest.mark.asyncio

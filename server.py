@@ -2640,13 +2640,20 @@ def _document_result(
     return result
 
 
-def _with_setup_hint(state: _DebugState, result: dict) -> dict:
+def _with_setup_hint(state: _DebugState, result: dict, timeout_seconds: float | None) -> dict:
     """run_wiki before the SetUp: a failure there is often a defined action, browser or fixture
-    the SetUp would have provided."""
+    the SetUp would have provided. Only for pages that have a SetUp."""
     counts = result.get("counts") or {}
-    if state.setup_seen == state.current_page or not (counts.get("wrong") or counts.get("exceptions")):
-        return result
     page = state.current_page or state.page
+    if not page or state.setup_seen == page or not (counts.get("wrong") or counts.get("exceptions")):
+        return result
+    try:
+        has_setup = bool(_setup_indices(_parse_tables(_page_html(state, page, timeout_seconds))))
+    except ToolError:
+        return result  # the hint is optional
+    if not has_setup:
+        state.setup_seen = page  # nothing to run: don't ask again in this test
+        return result
     return {**result, "hint": (
         f"The SetUp of {page} has not run in this test, so defined actions, the browser and "
         "fixtures it provides may be missing: run fitnesse_debug_run_page(setup_only=true), then "
@@ -3054,8 +3061,18 @@ def _reload_defined_actions(page: str) -> dict:
     return result
 
 
+_LOG_LINE_CHARS = 500  # the test process' command line alone (its classpath) has several KB
+
+
+def _log_line(line: dict) -> str:
+    text = str(line.get("text", ""))
+    if len(text) > _LOG_LINE_CHARS:
+        text = f"{text[:_LOG_LINE_CHARS]}… ({len(text)} chars)"
+    return f"{line.get('time', '')} [{line.get('stream', '')}] {text}"
+
+
 def _log_lines(lines) -> list[str]:
-    return [f"{l.get('time', '')} [{l.get('stream', '')}] {l.get('text', '')}" for l in lines or []]
+    return [_log_line(l) for l in lines or [] if isinstance(l, dict)]
 
 
 def _read_log(state: _DebugState, max_lines: int, timeout_seconds: float | None) -> dict:
@@ -3262,7 +3279,7 @@ if DEBUG_TOOLSET:
                     state,
                     _session_action(state, "runWiki", {"wiki": wiki}, timeout_seconds=timeout_seconds),
                     state.current_page, include_html,
-                )),
+                ), timeout_seconds),
             ))
 
     @mcp.tool(

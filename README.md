@@ -210,7 +210,17 @@ Parameter mapping for `fitnesse_search_properties`:
   as `?test` does: the first `fitnesse_debug_run_page` runs the SuiteSetUp
   first, `fitnesse_debug_end` the SuiteTearDown. Before, they only ran with
   `suite=true`, and pages that get their browser from the SuiteSetUp failed.
-  `fitnesse_debug_start` asks for `suitePages` also without `suite`.
+  `fitnesse_debug_start` asks for `suitePages` also without `suite`. Each of
+  the two runs only if the page has it; the SuiteTearDown also without a
+  SuiteSetUp, once a `fitnesse_debug_run_page` ran.
+- **`fitnesse_debug_start` decides by the page's type.** `suite` is optional:
+  left out, the page's properties decide (Suite: a suite session, Test: a
+  session on the page; both: a suite, with a `note`). A page that is neither
+  is refused unless `suite` is given; if the properties can't be read, it
+  starts as a test page. Before, a missing `suite` always meant a test page.
+  The result always has `suite` and `pages` (for a test page: its
+  SuiteSetUp, the page, its SuiteTearDown); filters on a test page are ignored
+  (`filters_ignored`).
 
 ### Changed tool set
 
@@ -404,14 +414,14 @@ All need `debug` in `FITNESSE_TOOLSETS`, plus the listed mode.
 
 | Tool | Action | Mode |
 |---|---|---|
-| `fitnesse_debug_start` | `status`, then `start`; refuses if a session of the account runs on the same page (forks before mod #159: anywhere), unless `replace`, and while this server's own session still runs. Then `suitePages`: with `suite` the suite's pages, without it the page's SuiteSetUp/SuiteTearDown (`suite_setup`/`suite_teardown`) | test |
+| `fitnesse_debug_start` | without `suite`: `properties` (Suite/Test decide; neither: refused); `status`, then `start`; refuses if a session of the account runs on the same page (forks before mod #159: anywhere), unless `replace`, and while this server's own session still runs. Then `suitePages`: with `suite` the suite's pages, without it the page's SuiteSetUp/SuiteTearDown (`suite_setup`/`suite_teardown`, each only if present). The result has `suite` and `pages` | test |
 | `fitnesse_debug_status` | `status` plus new `log` lines (each cut at 500 characters); `sessions` lists all of the account's (mod #159); `adopt` continues a running session, with several the one named by `session` | read |
 | `fitnesse_debug_run_wiki` | `runWiki` — wiki tables in the context of the current page, no SetUp/TearDown; `restart` runs `nextPage` first. Failing before the SetUp ran in this test, on a page that has one, the result gets a `hint` to run `setup_only` (one `pageHtml` per test to check). `with_variables`/`with_live_view` send `withDynamicVariables`/`withLiveView` (mod v1.5.0/v1.6.0) and return `dynamicVariables`/`liveView` with the result; older forks: the separate actions afterwards | test |
 | `fitnesse_debug_page_tables` | `pageHtml`, split into tables; each with `source_page`/`source_index` for editing (tables of included pages live on that page) | read |
 | `fitnesse_debug_run_page` | `nextPage` (on page change or `restart`), `pageHtml`, `runTable`. Outside a suite session the first call runs the SuiteSetUp first (`nextPage`, `pageHtml`, `runTable`, `nextPage` back; result `suite_setup`). `setup_only` (or `tables` that include all SetUp tables) runs the SetUp; a later call without `tables` skips it (`skipped_setup`). With `tables`, the result numbers the tables as on the page. `only_failures` returns only tables with `[fail]`/`[error]`. `with_variables`/`with_live_view` as for `run_wiki` | test |
 | `fitnesse_debug_inspect` | `keywordsJson` (without filter only the categories with their number of keywords; with filter the matching keywords without help texts unless `details=true`), `definedActions` (the defined actions loaded by `define actions at`: `debugTest definedActions` as JSON, on older forks parsed from `keywords`; filterable), `dynamicVariables`, `scope`, `liveView` (VNC password removed) | read |
 | `fitnesse_debug_defined_action_source` | `debugTable definedAction` (with the session, or `page=` without one). Forks without it: page of the defined action from `keywords`, then `debugTable source` of that page, cut to the definition block as FitLibrary reads it (header first or after `----`, exactly four dashes anywhere between two tables, up to the next one; `-----` and dashes inside `!-…-!`, `{{{…}}}` or `#` comments don't separate; refuses a header found twice) | read |
-| `fitnesse_debug_end` | if the SuiteSetUp ran: `nextPage` to the SuiteTearDown and run it (`suite_teardown`); `log` (number of lines), then `end` or `abort` with `logFrom` and `logMax` (mod #162; older forks send all lines from `logFrom`, cut here): the last unread log lines | test |
+| `fitnesse_debug_end` | single page with a SuiteTearDown, after a `fitnesse_debug_run_page`: `nextPage` to the SuiteTearDown and run it (`suite_teardown`); `log` (number of lines), then `end` or `abort` with `logFrom` and `logMax` (mod #162; older forks send all lines from `logFrom`, cut here): the last unread log lines | test |
 | `fitnesse_table_source` | `debugTable source` | read |
 | `fitnesse_table_save`, `fitnesse_table_insert`, `fitnesse_table_delete`, `fitnesse_table_move`, `fitnesse_table_save_text`, `fitnesse_table_move_text` | `debugTable save`/`saveBlock`, `insert`, `delete`, `move`, `saveText`, `moveText` — saves the wiki page, refused with 409 if it changed since it was read. The result's `source` is the page after the change (from the answer since mod #157, else read again). With `reload_defined_actions=true` every `fitnesse_table_*` edit sends `reload=true` with the session, so the fork reloads the page's defined actions; forks that don't answer `reloaded` get `\|define actions at\|.<page>\|` via `runWiki` instead | write |
 
@@ -460,7 +470,7 @@ fitnesse_table_source ──> fitnesse_table_save / _insert / _delete / _move / 
   `restart=true` or another page runs them again. If `run_wiki` fails
   before the SetUp or the SuiteSetUp ran, its result has a `hint` saying so
   (only on pages that have one).
-- **Suite sessions:** `fitnesse_debug_start(suite=true)` returns `pages`;
+- **Suite sessions:** `fitnesse_debug_start` on a suite page (or with `suite=true`) returns `pages`;
   call `fitnesse_debug_run_page` for each page with `runnable=true` in that
   order.
 - **Results:** `run_wiki`, `run_page` and `end` return every table as text,

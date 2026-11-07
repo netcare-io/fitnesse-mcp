@@ -114,12 +114,13 @@ nor does `----` inside `!-…-!`, `{{{…}}}` or a `#` comment line.
 ## 5. Go through a suite
 
 ```
-fitnesse_debug_start(suite_page, suite=true)    pages: run order, kind, runnable
+fitnesse_debug_start(suite_page)                suite=true, pages: run order, kind, runnable
 for each page with runnable=true:
     fitnesse_debug_run_page(page, only_failures=true)
 fitnesse_debug_end                              page_totals per page
 ```
 
+The page's type decides between a suite and a test session; `suite=true`/`false` overrides it.
 `only_failures` runs the whole page as usual, SetUp included, and only leaves the tables without
 `[fail]`/`[error]` out of the result. Moving to the next page ends the previous page's test; its
 tear down comes back as `previous_page_teardown`. For a failing page, continue with flow 1 on it.

@@ -77,7 +77,8 @@ class FakeFitNesse:
         self.requests = []
 
     def __call__(self, req, timeout=None):
-        form = dict(parse.parse_qsl(req.data.decode(), keep_blank_values=True))
+        query = req.data.decode() if req.data else parse.urlsplit(req.full_url).query  # GET: the URL's
+        form = dict(parse.parse_qsl(query, keep_blank_values=True))
         self.requests.append({"url": req.full_url, "form": form, "headers": dict(req.header_items()), "timeout": timeout})
         if isinstance(self.answers[0], BaseException):
             raise self.answers.pop(0)
@@ -89,7 +90,7 @@ class FakeFitNesse:
 
     @property
     def actions(self):
-        return [r["form"]["action"] for r in self.requests]
+        return [r["form"].get("action") or r["form"].get("responder") for r in self.requests]
 
 
 async def _call(tool, args=None, *answers):
@@ -277,7 +278,7 @@ async def test_debug_tools_hidden_by_default():
 async def test_start_refuses_running_session(debug_env):
     with pytest.raises(ToolError, match="already running"):
         await _call(
-            "fitnesse_debug_start", {"page_path": "FrontPage.T"},
+            "fitnesse_debug_start", {"suite": False, "page_path": "FrontPage.T"},
             (200, {"running": True, "session": "browser", "page": "X", "currentPage": "X"}),
         )
 
@@ -285,7 +286,7 @@ async def test_start_refuses_running_session(debug_env):
 @pytest.mark.asyncio
 async def test_start_replace_and_session_forwarded(debug_env):
     data, fake = await _call(
-        "fitnesse_debug_start", {"page_path": "FrontPage.T", "replace": True},
+        "fitnesse_debug_start", {"suite": False, "page_path": "FrontPage.T", "replace": True},
         (200, {"running": True, "session": "browser"}),
         (200, {"started": True, "page": "FrontPage.T", "session": "s1"}),
         (200, {"pages": []}),
@@ -316,7 +317,7 @@ async def test_start_with_several_sessions_per_account(debug_env):
     # mod #159: one session per page and account; others' sessions elsewhere don't matter
     browser = _entry("b1", "Other.Page")
     data, fake = await _call(
-        "fitnesse_debug_start", {"page_path": ".FrontPage.T"},
+        "fitnesse_debug_start", {"suite": False, "page_path": ".FrontPage.T"},
         (200, {"running": True, "sessions": [browser], **browser}),  # the only one: status describes it
         (200, {"started": True, "page": "FrontPage.T", "session": "s1"}),
         (200, {"pages": []}),
@@ -325,19 +326,19 @@ async def test_start_with_several_sessions_per_account(debug_env):
 
     # this server's own session: keep using it here, end it before going elsewhere
     with pytest.raises(ToolError, match="already running on FrontPage.T: keep using it"):
-        await _call("fitnesse_debug_start", {"page_path": "FrontPage.T"},
+        await _call("fitnesse_debug_start", {"suite": False, "page_path": "FrontPage.T"},
                     (200, {"running": True, "sessions": [browser, _entry("s1", "FrontPage.T")]}))
     with pytest.raises(ToolError, match="still running on FrontPage.T"):
-        await _call("fitnesse_debug_start", {"page_path": "Third"},
+        await _call("fitnesse_debug_start", {"suite": False, "page_path": "Third"},
                     (200, {"running": False, "sessions": [browser, _entry("s1", "FrontPage.T")]}))
     await _call("fitnesse_debug_end", {}, (200, {"lines": [], "next": 0}), (200, {"ended": True, "html": "", "counts": {}}))
 
     # someone's session on the same page: refused, with how to adopt it
     with pytest.raises(ToolError, match=r"already running on Other.Page.*adopt=true, session='b1'"):
-        await _call("fitnesse_debug_start", {"page_path": "Other.Page"},
+        await _call("fitnesse_debug_start", {"suite": False, "page_path": "Other.Page"},
                     (200, {"running": True, "sessions": [browser], **browser}))
     _, fake = await _call(
-        "fitnesse_debug_start", {"page_path": "Other.Page", "replace": True},
+        "fitnesse_debug_start", {"suite": False, "page_path": "Other.Page", "replace": True},
         (200, {"running": True, "sessions": [browser], **browser}),
         (200, {"started": True, "page": "Other.Page", "session": "s2"}),
         (200, {"pages": []}),
@@ -372,7 +373,7 @@ async def test_session_codes_of_mod_159_have_hints(debug_env):
         await _call("fitnesse_debug_inspect", {"kind": "scope"},
                     (409, {"code": "sessionRequired", "error": "Several debug sessions are running"}))
     with pytest.raises(ToolError, match="tooManySessions.*maxSessionsPerUser"):
-        await _call("fitnesse_debug_start", {"page_path": "P", "replace": True},
+        await _call("fitnesse_debug_start", {"suite": False, "page_path": "P", "replace": True},
                     (200, {"running": False, "sessions": []}),
                     (429, {"code": "tooManySessions", "error": "Too many debug sessions"}))
 
@@ -999,7 +1000,7 @@ async def test_table_save_and_insert_let_the_fork_reload(debug_env):
 async def test_reload_by_the_fork_sends_the_session_cookie(debug_env):
     # found live on 8091: without the cookie the fork answers reloaded=false, code=noSession
     await _call(
-        "fitnesse_debug_start", {"page_path": "FrontPage.T"},
+        "fitnesse_debug_start", {"suite": False, "page_path": "FrontPage.T"},
         (200, {"running": False}),
         (200, {"started": True, "page": "FrontPage.T", "session": "s1"}, "application/json",
          ["debugTestSession=abc; Path=/; HttpOnly"]),
@@ -1263,9 +1264,11 @@ ROW = "<table><tr><td class=\"pass\">{}</td></tr></table>"
 async def _start_with_frame():
     data, fake = await _call(
         "fitnesse_debug_start", {"page_path": "S.T"},
+        (200, {"Test": True, "Suite": False}),  # properties: a test page
         (200, {"running": False}), (200, {"started": True, "page": "S.T", "session": "s1"}), SUITE_FRAME,
     )
-    assert fake.actions == ["status", "start", "suitePages"]
+    assert fake.actions == ["properties", "status", "start", "suitePages"]
+    assert data["suite"] is False and [p["kind"] for p in data["pages"]] == ["suiteSetUp", "test", "suiteTearDown"]
     return data
 
 
@@ -1320,7 +1323,7 @@ async def test_suite_setup_hint_and_abort_without_suite_teardown(debug_env):
 
 
 @pytest.mark.asyncio
-async def test_no_suite_teardown_unless_the_suite_setup_ran(debug_env):
+async def test_no_suite_teardown_unless_a_page_ran(debug_env):
     await _start_with_frame()
     _, fake = await _call("fitnesse_debug_end", {}, (200, {"lines": [], "next": 0}), (200, {"ended": True, "html": "", "counts": {}}))
     assert fake.actions == ["log", "end"]
@@ -1330,9 +1333,92 @@ async def test_no_suite_teardown_unless_the_suite_setup_ran(debug_env):
 async def test_older_fork_without_suite_pages_for_a_single_page(debug_env):
     data, fake = await _call(
         "fitnesse_debug_start", {"page_path": "S.T"},
+        (200, {"Test": True, "Suite": False}),  # properties: a test page
         (200, {"running": False}), (200, {"started": True, "page": "S.T", "session": "s1"}),
         (400, {"error": "unknownAction"}),
     )
     assert data["started"] and "suite_setup" not in data
+    assert data["pages"] == [{"path": "S.T", "kind": "test", "runnable": True}]
     _, fake = await _call("fitnesse_debug_run_page", {}, (200, {"page": "S.T", "html": ""}), (200, {"html": "", "counts": {}}))
     assert fake.actions == ["pageHtml", "runTable"]
+
+
+@pytest.mark.asyncio
+async def test_start_takes_suite_or_test_from_the_page_type(debug_env):
+    pages = (200, {"page": "S", "pages": [{"path": "S.T", "kind": "test", "runnable": True}]})
+    data, fake = await _call(
+        "fitnesse_debug_start", {"page_path": "S", "suite_filter": "smoke"},
+        (200, {"Suite": True, "Test": False}),
+        (200, {"running": False}), (200, {"started": True, "page": "S", "session": "s1"}), pages,
+    )
+    assert fake.actions == ["properties", "status", "start", "suitePages"]
+    assert "responder=properties" in fake.requests[0]["url"] and fake.requests[0]["form"]["format"] == "json"
+    assert fake.requests[2]["form"]["suite"] == "true" and fake.requests[3]["form"]["suiteFilter"] == "smoke"
+    assert data["suite"] is True and data["pages"][0]["path"] == "S.T" and "note" not in data
+    await _call("fitnesse_debug_end", {}, (200, {"lines": [], "next": 0}), (200, {"ended": True, "html": "", "counts": {}}))
+
+    data, fake = await _call(  # both: a suite, with a note; override with suite=false
+        "fitnesse_debug_start", {"page_path": "S"},
+        (200, {"Suite": True, "Test": True}),
+        (200, {"running": False}), (200, {"started": True, "page": "S", "session": "s2"}), pages,
+    )
+    assert data["suite"] is True and "suite=false" in data["note"]
+    await _call("fitnesse_debug_end", {}, (200, {"lines": [], "next": 0}), (200, {"ended": True, "html": "", "counts": {}}))
+
+    data, fake = await _call(
+        "fitnesse_debug_start", {"page_path": "S", "suite": False, "first_test": "S.T"},
+        (200, {"running": False}), (200, {"started": True, "page": "S", "session": "s3"}), (200, {"pages": []}),
+    )
+    assert fake.actions == ["status", "start", "suitePages"] and "suite" not in fake.requests[1]["form"]
+    assert data["suite"] is False and "only apply to suites" in data["filters_ignored"]
+    await _call("fitnesse_debug_end", {}, (200, {"lines": [], "next": 0}), (200, {"ended": True, "html": "", "counts": {}}))
+
+
+@pytest.mark.asyncio
+async def test_start_refuses_a_page_that_is_neither_test_nor_suite(debug_env):
+    with pytest.raises(ToolError, match="neither a test nor a suite page.*suite=true or suite=false"):
+        await _call("fitnesse_debug_start", {"page_path": "Static"}, (200, {"Suite": False, "Test": False}))
+    data, fake = await _call(  # properties not readable: started as a test page, the fork decides
+        "fitnesse_debug_start", {"page_path": "P"},
+        (404, {"error": "not found"}),
+        (200, {"running": False}), (200, {"started": True, "page": "P", "session": "s1"}), (200, {"pages": []}),
+    )
+    assert fake.actions == ["properties", "status", "start", "suitePages"] and data["suite"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_setup, has_teardown", [(True, True), (True, False), (False, True), (False, False)])
+async def test_single_page_with_or_without_suite_setup_and_teardown(debug_env, has_setup, has_teardown):
+    pages = [{"path": "S.T", "runnable": True, "kind": "test"}]
+    if has_setup:
+        pages.insert(0, {"path": "S.SuiteSetUp", "runnable": True, "kind": "suiteSetUp"})
+    if has_teardown:
+        pages.append({"path": "S.SuiteTearDown", "runnable": True, "kind": "suiteTearDown"})
+    data, _ = await _call(
+        "fitnesse_debug_start", {"page_path": "S.T"},
+        (200, {"Test": True}), (200, {"running": False}),
+        (200, {"started": True, "page": "S.T", "session": "s1"}), (200, {"page": "S.T", "pages": pages}),
+    )
+    assert data["pages"] == pages
+    assert ("suite_setup" in data) == has_setup and ("suite_teardown" in data) == has_teardown
+
+    answers = [(200, {"page": "S.T", "html": ROW.format("check")}), (200, {"html": ROW.format("check"), "counts": {"right": 1}})]
+    if has_setup:
+        answers = [(200, {"page": "S.SuiteSetUp", "html": "", "counts": {}}), (200, {"html": ROW.format("open")}),
+                   (200, {"html": ROW.format("open"), "counts": {"right": 1}}),
+                   (200, {"page": "S.T", "html": "", "counts": {}})] + answers
+    data, fake = await _call("fitnesse_debug_run_page", {}, *answers)
+    assert fake.actions == ["nextPage", "pageHtml", "runTable"] * has_setup + ["nextPage"] * has_setup + ["pageHtml", "runTable"]
+    assert ("suite_setup" in data) == has_setup and "[pass] check" in data["tables"]
+
+    answers = [(200, {"lines": [], "next": 0}), (200, {"ended": True, "html": ROW.format("end"), "counts": {}})]
+    if has_teardown:
+        answers = [(200, {"page": "S.SuiteTearDown", "html": ROW.format("page teardown"), "counts": {}}),
+                   (200, {"html": ROW.format("close")}), (200, {"html": ROW.format("close"), "counts": {"right": 1}})] + answers
+    data, fake = await _call("fitnesse_debug_end", {}, *answers)
+    assert fake.actions == ["nextPage", "pageHtml", "runTable"] * has_teardown + ["log", "end"]
+    if has_teardown:
+        assert data["teardown"]["page"] == "S.T" and "close" in data["suite_teardown"]["tables"]
+        assert "end" in data["suite_teardown"]["end"]["tables"]
+    else:
+        assert "suite_teardown" not in data and "end" in data["teardown"]["tables"]

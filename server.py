@@ -2314,13 +2314,13 @@ class _DebugState:
     # ?test of one page; pageHtml leaves them out. From suitePages of the page itself.
     suite_setup: str | None = None
     suite_teardown: str | None = None
-    suite_setup_ran: bool = False
+    frame_started: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def reset(self) -> None:
         self.session = self.page = self.current_page = self.setup_ran = self.setup_seen = None
         self.suite_setup = self.suite_teardown = None
-        self.suite_setup_ran = False
+        self.frame_started = False
         self.suite = False
         self.log_next = 0
         self.page_counts = {}
@@ -3004,7 +3004,7 @@ def _with_setup_hint(state: _DebugState, result: dict, timeout_seconds: float | 
     page = state.current_page or state.page
     if not (counts.get("wrong") or counts.get("exceptions")):
         return result
-    if state.suite_setup and not state.suite_setup_ran:
+    if state.suite_setup and not state.frame_started:
         return {**result, "hint": (
             f"The SuiteSetUp ({state.suite_setup}) has not run in this session, so the browser, "
             "defined actions and fixtures it provides may be missing: run "
@@ -3550,15 +3550,19 @@ def _with_extras(state, data: dict, result: dict, variables: bool, live_view: bo
     return result
 
 
-def _suite_frame(state: _DebugState, timeout_seconds: float | None) -> None:
+def _suite_frame(state: _DebugState, timeout_seconds: float | None) -> list:
     """Single-page session: remember the page's SuiteSetUp/SuiteTearDown from suitePages (they are
-    not in pageHtml). Older forks without suitePages outside a suite: nothing to remember."""
+    not in pageHtml) and return the pages. Older forks without suitePages outside a suite: the page
+    alone."""
+    alone = [{"path": state.page, "kind": "test", "runnable": True}]
     try:
         pages = _session_action(state, "suitePages", timeout_seconds=timeout_seconds).get("pages")
     except ToolError as exc:
         logger.info("suitePages for a single page: %s", exc)
-        return
-    for entry in pages if isinstance(pages, list) else []:
+        return alone
+    if not isinstance(pages, list) or not pages:
+        return alone
+    for entry in pages:
         if not isinstance(entry, dict) or entry.get("runnable") is False:
             continue
         path = str(entry.get("path") or "").lstrip(".")
@@ -3566,6 +3570,25 @@ def _suite_frame(state: _DebugState, timeout_seconds: float | None) -> None:
             state.suite_setup = path or None
         elif entry.get("kind") == "suiteTearDown":
             state.suite_teardown = path or None
+    return pages
+
+
+def _is_suite(page_path: str) -> tuple[bool, str | None]:
+    """Whether to start page_path as a suite, from its Suite/Test properties, and a note for the
+    result. Properties that can't be read: a test page (the start then says what is wrong)."""
+    result = _request("GET", page_path, params={"responder": "properties", "format": "json"}, timeout_seconds=30.0)
+    flags = result.get("body") if result.get("ok") else None
+    if not isinstance(flags, dict):
+        return False, None
+    suite, test = bool(flags.get("Suite")), bool(flags.get("Test"))
+    if suite and test:
+        return True, "The page is a suite and a test page; started as a suite. suite=false runs only its own tables."
+    if not suite and not test:
+        raise ToolError(
+            f"{page_path} is neither a test nor a suite page (its properties). Start a test or suite "
+            "page, or pass suite=true or suite=false to start it anyway."
+        )
+    return suite, None
 
 
 def _run_whole_page(state: _DebugState, page: str, timeout_seconds: float | None) -> dict:
@@ -3577,19 +3600,23 @@ def _run_whole_page(state: _DebugState, page: str, timeout_seconds: float | None
 
 
 def _run_suite_setup(state: _DebugState, page: str, timeout_seconds: float | None) -> dict | None:
-    """Run the SuiteSetUp once per single-page session, before the first page run, as ?test does;
-    then begin page's test again."""
-    if state.suite or not state.suite_setup or state.suite_setup_ran:
+    """Run the SuiteSetUp (if any) once per single-page session, before the first page run, as
+    ?test does; then begin page's test again. The first page run starts the frame: from then on
+    end runs the SuiteTearDown (if any), with or without a SuiteSetUp."""
+    if state.suite or state.frame_started:
         return None
-    state.suite_setup_ran = True  # also when it fails: a real run goes on as well
+    state.frame_started = True  # also when the SuiteSetUp fails: a real run goes on as well
+    if not state.suite_setup:
+        return None
     result = _run_whole_page(state, state.suite_setup, timeout_seconds)
     _next_page(state, page, timeout_seconds)
     return result
 
 
 def _run_suite_teardown(state: _DebugState, result: dict, timeout_seconds: float | None) -> None:
-    """Before end: the page's tear down (nextPage) and the SuiteTearDown, if the SuiteSetUp ran."""
-    if state.suite or not state.suite_teardown or not state.suite_setup_ran:
+    """Before end: the page's tear down (nextPage) and the SuiteTearDown, if a page run started the
+    frame (see _run_suite_setup)."""
+    if state.suite or not state.suite_teardown or not state.frame_started:
         return
     try:
         result["teardown"] = _next_page(state, state.suite_teardown, timeout_seconds)
@@ -3625,7 +3652,8 @@ if DEBUG_TOOLSET:
             " try out steps, build a new test, or step through a failing one; for a plain complete "
             "run use fitnesse_run_test instead. Nothing is written to the test history.\n"
             "The page decides which fixtures and variables are available, so start on the test page "
-            "(or, with suite=true, on the suite page) you want to work on.\n"
+            "or suite page you want to work on; its type decides how (suite=true/false only to "
+            "override it).\n"
             "Typical flow: fitnesse_debug_start -> fitnesse_debug_run_page(setup_only=true) -> "
             "fitnesse_debug_inspect(kind='keywords' or 'definedActions') -> fitnesse_debug_run_wiki or "
             "fitnesse_debug_run_page, repeatedly -> fitnesse_debug_end. Run the SetUp first: defined "
@@ -3636,12 +3664,12 @@ if DEBUG_TOOLSET:
             "or end it. Sessions on other pages are not affected. This server works with one session "
             "at a time: end its own before starting another. Use replace=true only when told to: it "
             "kills the running session without tear down, and a browser tab on it then shows 'replaced'.\n"
-            "Without suite, suite_setup/suite_teardown in the result name the page's SuiteSetUp and "
-            "SuiteTearDown: as in a normal test run, the first fitnesse_debug_run_page runs the "
-            "SuiteSetUp first and fitnesse_debug_end the SuiteTearDown.\n"
-            "With suite=true the result contains 'pages': the suite's pages in run order, each with "
-            "path, kind (test, suiteSetUp, suiteTearDown) and runnable (false = cannot run in this "
-            "session; skip it).\n"
+            "The result says suite (true/false) and lists 'pages' in run order, each with path, kind "
+            "(test, suiteSetUp, suiteTearDown) and runnable (false = cannot run in this session; skip "
+            "it). Suite: run each runnable page with fitnesse_debug_run_page, in that order. Test page: "
+            "the pages around it are its SuiteSetUp and SuiteTearDown (also named as suite_setup/"
+            "suite_teardown), which run by themselves as in a normal test run: the first "
+            "fitnesse_debug_run_page runs the SuiteSetUp first, fitnesse_debug_end the SuiteTearDown.\n"
             "Always end the session with fitnesse_debug_end when done: it occupies a server slot and "
             "browsers until then."
         ),
@@ -3649,17 +3677,20 @@ if DEBUG_TOOLSET:
         annotations={"destructiveHint": False},
     )
     def fitnesse_debug_start(
-        page_path: Annotated[str, Field(description="Dotted path of the test page, e.g. 'FrontPage.Project.MyTest'; with suite=true the suite page.")],
-        suite: Annotated[bool, Field(description="Start on a suite page to run its test pages one after another; returns the list of pages.")] = False,
+        page_path: Annotated[str, Field(description="Dotted path of the test or suite page, e.g. 'FrontPage.Project.MyTest'.")],
+        suite: Annotated[bool | None, Field(description="Leave out: the page's type decides (suite page: suite session, test page: that page). true/false only to override it.")] = None,
         replace: Annotated[bool, Field(description="Only when told to: kill a running session of this account on this page (older forks: anywhere; maybe a person's) without tear down.")] = False,
-        suite_filter: Annotated[str | None, Field(description="suite=true: only tests matching any of these comma-separated tags.")] = None,
-        run_tests_matching_all_tags: Annotated[str | None, Field(description="suite=true: only tests matching all of these comma-separated tags.")] = None,
-        exclude_suite_filter: Annotated[str | None, Field(description="suite=true: leave out tests with any of these comma-separated tags.")] = None,
-        first_test: Annotated[str | None, Field(description="suite=true: start the list at this test page.")] = None,
+        suite_filter: Annotated[str | None, Field(description="Suites only: only tests matching any of these comma-separated tags.")] = None,
+        run_tests_matching_all_tags: Annotated[str | None, Field(description="Suites only: only tests matching all of these comma-separated tags.")] = None,
+        exclude_suite_filter: Annotated[str | None, Field(description="Suites only: leave out tests with any of these comma-separated tags.")] = None,
+        first_test: Annotated[str | None, Field(description="Suites only: start the list at this test page.")] = None,
         timeout_seconds: float | None = Depends(lambda: DEBUG_TIMEOUT_SECONDS),
     ) -> dict:
-        """status check, start and (suite) suitePages via responder=debugTest."""
+        """properties (page type), status check, start and suitePages via responder=debugTest."""
         state = _debug_state()
+        note = None
+        if suite is None:
+            suite, note = _is_suite(page_path)
         with _document(state):
             # without session: a stale id would answer 409 instead of describing the running session
             status = _status(page_path, state, 30.0, with_session=False)
@@ -3684,12 +3715,17 @@ if DEBUG_TOOLSET:
             state.page = data.get("page") or page_path
             state.current_page = state.page
             state.suite = suite
+        data["suite"] = suite
+        if note:
+            data["note"] = note
         if not suite:
-            _suite_frame(state, 30.0)
+            data["pages"] = _suite_frame(state, 30.0)
             if state.suite_setup:
                 data["suite_setup"] = state.suite_setup
             if state.suite_teardown:
                 data["suite_teardown"] = state.suite_teardown
+            if suite_filter or run_tests_matching_all_tags or exclude_suite_filter or first_test:
+                data["filters_ignored"] = "suite_filter, run_tests_matching_all_tags, exclude_suite_filter and first_test only apply to suites."
         if suite:
             try:
                 pages = _session_action(
@@ -3985,8 +4021,8 @@ if DEBUG_TOOLSET:
     @mcp.tool(
         name="fitnesse_debug_end",
         description=(
-            "Ends the debug session: the running test's tear down (and the SuiteTearDown, if the "
-            "SuiteSetUp ran: suite_teardown) run, then the test process stops. Returns the tear-down result, the remaining log "
+            "Ends the debug session: the running test's tear down (and the SuiteTearDown, if "
+            "fitnesse_debug_run_page ran: suite_teardown) run, then the test process stops. Returns the tear-down result, the remaining log "
             "lines (the last max_log_lines of them; log_omitted counts the others: to read the whole "
             "log, call fitnesse_debug_status before ending) and page_totals (counts per page). Call it "
             "whenever you are done.\n"
@@ -4287,8 +4323,9 @@ the same page. run_page on another page, or restart=true, first ends the current
 (tear down in previous_page_teardown).
 - run_wiki adds no SetUp/TearDown: run_page(setup_only=true) runs the SetUp; other tables with \
 run_page(tables=[...]), indices from fitnesse_debug_page_tables.
-- Suite session (start with suite=true): call run_page for each page with runnable=true from \
-'pages', in that order.
+- fitnesse_debug_start decides by the page's type: a suite page starts a suite session (call \
+run_page for each page with runnable=true from 'pages', in that order), a test page a session on \
+that page (its SuiteSetUp and SuiteTearDown run by themselves).
 - busy=true in fitnesse_debug_status: wait and poll status, or fitnesse_debug_end(abort=true); \
 a run_wiki/run_page call fails at once while busy.
 """

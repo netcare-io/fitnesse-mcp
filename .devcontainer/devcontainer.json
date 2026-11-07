@@ -5,10 +5,6 @@
         "dockerfile": "Dockerfile",
         "target": "devcontainer"
     },
-    // Docker CLI + host socket, so scripts/docker-build-and-publish.sh runs in here.
-    "features": {
-        "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
-    },
     "workspaceMount": "source=${localWorkspaceFolder},target=/app,type=bind",
     "workspaceFolder": "/app",
     "customizations": {

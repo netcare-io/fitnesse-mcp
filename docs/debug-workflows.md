@@ -23,7 +23,8 @@ What to keep in mind:
   suite session they also carry over from page to page, as in a `?suite` run.
 - **SetUp first.** `fitnesse_debug_run_wiki` does not add the page's SetUp. Run
   `fitnesse_debug_run_page(setup_only=true)` right after the start, otherwise defined actions,
-  the browser and fixtures are missing.
+  the browser and fixtures are missing. As in a normal test run, the first `run_page` also runs
+  the SuiteSetUp (`suite_setup` in the result), and `fitnesse_debug_end` the SuiteTearDown.
 - **Trying out changes nothing.** `run_wiki` only runs tables; the `fitnesse_table_*` tools
   save the wiki page for real.
 - **Two kinds of table index.** `fitnesse_debug_page_tables` counts everything a run executes

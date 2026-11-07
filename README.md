@@ -196,6 +196,16 @@ Parameter mapping for `fitnesse_search_properties`:
   responder has a JSON format): runs, a suite run's pages with status and
   `result_date`, or a test run's failing tables. `raw=true` returns `body` as
   before.
+- **`fitnesse_debug_inspect(kind='keywords', filter=…)` leaves out the help
+  texts**; a help text marking a required row becomes `mandatory: true`.
+  `details=true` returns them as before.
+- **`fitnesse_debug_end` returns the last 30 unread log lines**
+  (`max_log_lines`, 0 for none), `log_omitted` counts the others. It asks
+  FitNesse for the number of log lines first (`log` with a large `from`) and
+  sends `logFrom` so that only those lines come back; the answer used to carry
+  the whole log (several hundred KB). Forks with `logMax` (mod #162) cut it
+  to those lines themselves. Read the whole log with
+  `fitnesse_debug_status` before ending.
 
 ### Changed tool set
 
@@ -391,12 +401,12 @@ All need `debug` in `FITNESSE_TOOLSETS`, plus the listed mode.
 |---|---|---|
 | `fitnesse_debug_start` | `status`, then `start`; refuses if a session of the account runs on the same page (forks before mod #159: anywhere), unless `replace`, and while this server's own session still runs. With `suite`: also `suitePages` | test |
 | `fitnesse_debug_status` | `status` plus new `log` lines (each cut at 500 characters); `sessions` lists all of the account's (mod #159); `adopt` continues a running session, with several the one named by `session` | read |
-| `fitnesse_debug_run_wiki` | `runWiki` — wiki tables in the context of the current page, no SetUp/TearDown; `restart` runs `nextPage` first. Failing before the SetUp ran in this test, on a page that has one, the result gets a `hint` to run `setup_only` (one `pageHtml` per test to check) | test |
+| `fitnesse_debug_run_wiki` | `runWiki` — wiki tables in the context of the current page, no SetUp/TearDown; `restart` runs `nextPage` first. Failing before the SetUp ran in this test, on a page that has one, the result gets a `hint` to run `setup_only` (one `pageHtml` per test to check). `with_variables`/`with_live_view` send `withDynamicVariables`/`withLiveView` (mod v1.5.0/v1.6.0) and return `dynamicVariables`/`liveView` with the result; older forks: the separate actions afterwards | test |
 | `fitnesse_debug_page_tables` | `pageHtml`, split into tables; each with `source_page`/`source_index` for editing (tables of included pages live on that page) | read |
-| `fitnesse_debug_run_page` | `nextPage` (on page change or `restart`), `pageHtml`, `runTable`. `setup_only` (or `tables` that include all SetUp tables) runs the SetUp; a later call without `tables` skips it (`skipped_setup`). With `tables`, the result numbers the tables as on the page. `only_failures` returns only tables with `[fail]`/`[error]` | test |
-| `fitnesse_debug_inspect` | `keywordsJson` (without filter only the categories with their number of keywords; with filter the matching keywords in full), `definedActions` (the defined actions loaded by `define actions at`: `debugTest definedActions` as JSON, on older forks parsed from `keywords`; filterable), `dynamicVariables`, `scope`, `liveView` (VNC password removed) | read |
-| `fitnesse_debug_defined_action_source` | `debugTable definedAction` (with the session, or `page=` without one). Forks without it: page of the defined action from `keywords`, then `debugTable source` of that page, cut to the definition block as FitLibrary reads it (header first or after a line starting with exactly `----`, up to the next one; `-----` and dashes inside `!-…-!`, `{{{…}}}` or `#` comments don't separate; refuses a header found twice) | read |
-| `fitnesse_debug_end` | `end` or `abort`, with the unread log | test |
+| `fitnesse_debug_run_page` | `nextPage` (on page change or `restart`), `pageHtml`, `runTable`. `setup_only` (or `tables` that include all SetUp tables) runs the SetUp; a later call without `tables` skips it (`skipped_setup`). With `tables`, the result numbers the tables as on the page. `only_failures` returns only tables with `[fail]`/`[error]`. `with_variables`/`with_live_view` as for `run_wiki` | test |
+| `fitnesse_debug_inspect` | `keywordsJson` (without filter only the categories with their number of keywords; with filter the matching keywords without help texts unless `details=true`), `definedActions` (the defined actions loaded by `define actions at`: `debugTest definedActions` as JSON, on older forks parsed from `keywords`; filterable), `dynamicVariables`, `scope`, `liveView` (VNC password removed) | read |
+| `fitnesse_debug_defined_action_source` | `debugTable definedAction` (with the session, or `page=` without one). Forks without it: page of the defined action from `keywords`, then `debugTable source` of that page, cut to the definition block as FitLibrary reads it (header first or after `----`, exactly four dashes anywhere between two tables, up to the next one; `-----` and dashes inside `!-…-!`, `{{{…}}}` or `#` comments don't separate; refuses a header found twice) | read |
+| `fitnesse_debug_end` | `log` (number of lines), then `end` or `abort` with `logFrom` and `logMax` (mod #162; older forks send all lines from `logFrom`, cut here): the last unread log lines | test |
 | `fitnesse_table_source` | `debugTable source` | read |
 | `fitnesse_table_save`, `fitnesse_table_insert`, `fitnesse_table_delete`, `fitnesse_table_move`, `fitnesse_table_save_text`, `fitnesse_table_move_text` | `debugTable save`/`saveBlock`, `insert`, `delete`, `move`, `saveText`, `moveText` — saves the wiki page, refused with 409 if it changed since it was read. The result's `source` is the page after the change (from the answer since mod #157, else read again). With `reload_defined_actions=true` every `fitnesse_table_*` edit sends `reload=true` with the session, so the fork reloads the page's defined actions; forks that don't answer `reloaded` get `\|define actions at\|.<page>\|` via `runWiki` instead | write |
 
@@ -452,10 +462,17 @@ fitnesse_table_source ──> fitnesse_table_save / _insert / _delete / _move / 
   `run_page(only_failures=true)` returns only the tables with a `[fail]` or
   `[error]` cell, under their usual numbers (`tables_without_failures` counts
   the others).
+  Cells of nested tables keep their prefix inline, and a `[fail]` inside one
+  counts as a failing table. Under a `|condition|` table a line says what it
+  did (`then ran`, `else ran`, `condition false`, `condition error`,
+  `skipped`): FitLibrary marks no condition value, only an appended
+  `Result of then`/`Result of else` row shows that a branch ran.
 - **Keywords:** `inspect(kind='keywords')` without filter lists only the
   categories with their number of keywords (the full list runs to tens of
   kilobytes); pass a word or a category such as `Web / Browser` as `filter`
-  for syntax and parameters.
+  for syntax, parameters and table rows (`details=true` adds the help texts).
+  `filter` on `definedActions` searches the call, note, author and page, not
+  the body of the action.
 - **Table edits:** `save`/`insert`/`delete`/`move`/`save_text`/`move_text`
   take as `original` the unchanged wiki of exactly the table or text they
   change (`tables[index]` / `texts[index]` of `fitnesse_table_source`). Each
@@ -490,7 +507,13 @@ fitnesse_table_source ──> fitnesse_table_save / _insert / _delete / _move / 
   edited on that page, which changes every page that includes it.
 - **`busy=true`** from `fitnesse_debug_status`: wait until it is false, or
   call `fitnesse_debug_end(abort=true)`; a `run_wiki`/`run_page` call fails
-  at once meanwhile instead of queueing.
+  at once meanwhile instead of queueing. Calls that only read (`status`,
+  `inspect`, `page_tables`, sources) are tried again on 423 after 2 and 5
+  seconds; runs and edits are not.
+- **Variables and live view with a run:** `run_wiki`/`run_page` with
+  `with_variables=true` or `with_live_view=true` return the dynamic variables
+  (without system properties) or the live view along with the result, which
+  saves a `fitnesse_debug_inspect` call.
 
 Notes:
 
@@ -645,12 +668,14 @@ header. Confirm with `curl -u user:pass "$FITNESSE_BASE_URL/FrontPage?responder=
 `localhost` is the container, not your host; use `host.docker.internal` (Docker
 Desktop) or the host's LAN address.
 
-**`FitNesse closed the connection after N of M bytes`** — the answer ended
-before its `Content-Length`. Seen with large answers (~60 KB and up) through
-`host.docker.internal`, with curl as well. Requests that only read are
-repeated up to 3 times (each early end is logged as a warning); for others,
-e.g. a table run, check with `fitnesse_debug_status` whether it took effect
-before repeating it.
+**`FitNesse closed the connection after N of M bytes`** or **`… without a
+complete answer (BadStatusLine)`** — the answer ended before its
+`Content-Length`, or before it began. Seen with large answers (~60 KB and up)
+through `host.docker.internal`, with curl as well. Requests that only read are
+repeated up to 3 times (each early end is logged as a warning). Requests that
+act are not: after a test or suite run (`fitnesse_run_test`/`_suite` are GETs)
+check `fitnesse_get_page_history` before running it again, after a table run
+`fitnesse_debug_status`.
 
 **A write, run, or debug tool is missing** — `FITNESSE_TOOLSETS` lacks
 `write`, `test`, or `debug` (or `complete` for the marked tools). Debug tools

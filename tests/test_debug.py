@@ -79,6 +79,8 @@ class FakeFitNesse:
     def __call__(self, req, timeout=None):
         form = dict(parse.parse_qsl(req.data.decode(), keep_blank_values=True))
         self.requests.append({"url": req.full_url, "form": form, "headers": dict(req.header_items()), "timeout": timeout})
+        if isinstance(self.answers[0], BaseException):
+            raise self.answers.pop(0)
         status, body, *rest = self.answers.pop(0)
         resp = _Resp(status, body, *rest)
         if status >= 400:
@@ -143,6 +145,43 @@ MEDIA_HTML = (
     '<div>log line 1<br>line 2<div>nested</div></div></div>'
     '<div class="other">not a folding area</div>'
 )
+
+
+_IF = "<tr><td{c}>if</td><td>get</td><td>x</td><td>is</td><td>true</td></tr><tr><td{c}>then</td><td>set</td><td>y</td></tr>"
+CONDITION_TRUE_HTML = (
+    "<table><tr><td>condition</td></tr>" + _IF.format(c="")
+    + "<tr><td><b>Result of then</b></td><td colspan=\"4\"><table border=\"1\">"
+    "<tr><td>set</td><td>y</td></tr>"
+    "<tr><td>get</td><td>y</td><td>is</td><td class=\"fail\">false <span>expected</span><hr>true <span>actual</span></td></tr>"
+    "</table></td></tr></table>"
+)
+
+
+def test_tables_text_says_what_a_condition_did():
+    text = my_server._tables_text(CONDITION_TRUE_HTML)
+    assert "Table 0 – condition: then ran" in text
+    assert "[fail] false expected" in text  # a nested cell keeps its status
+    assert my_server._failed(my_server._parse_tables(CONDITION_TRUE_HTML)[0])
+    assert "Table 0:" in my_server._tables_text(CONDITION_TRUE_HTML, only_failures=True)
+
+    false_html = "<table><tr><td>condition</td></tr>" + _IF.format(c="") + "</table>"
+    assert "condition: condition false, then did not run" in my_server._tables_text(false_html)
+    assert not my_server._failed(my_server._parse_tables(false_html)[0])
+
+    else_html = false_html.replace("</table>", "<tr><td>Result of else</td><td><table><tr><td>x</td></tr></table></td></tr></table>")
+    assert "condition: else ran" in my_server._tables_text(else_html)
+
+    error_html = (
+        "<table><tr><td colspan=\"5\" class=\"error\">condition<hr/> <span class=\"fit_label\"><b>if</b> statement "
+        "must return <u>true</u> or <u>false</u>.</span></td></tr>" + _IF.format(c=' class="ignore"') + "</table>"
+    )
+    assert "condition: condition error, then and else did not run" in my_server._tables_text(error_html)
+
+    skipped_html = "<table><tr><td class=\"ignore\">condition</td></tr>" + _IF.format(c=' class="ignore"').replace(
+        "<td>", "<td class=\"ignore\">") + "</table>"
+    assert "condition: skipped, not run" in my_server._tables_text(skipped_html)
+
+    assert "condition:" not in my_server._tables_text(FAILING_HTML)
 
 
 def test_tables_text_lists_images_links_and_folding_areas():
@@ -289,7 +328,7 @@ async def test_start_with_several_sessions_per_account(debug_env):
     with pytest.raises(ToolError, match="still running on FrontPage.T"):
         await _call("fitnesse_debug_start", {"page_path": "Third"},
                     (200, {"running": False, "sessions": [browser, _entry("s1", "FrontPage.T")]}))
-    await _call("fitnesse_debug_end", {}, (200, {"ended": True, "html": "", "counts": {}}))
+    await _call("fitnesse_debug_end", {}, (200, {"lines": [], "next": 0}), (200, {"ended": True, "html": "", "counts": {}}))
 
     # someone's session on the same page: refused, with how to adopt it
     with pytest.raises(ToolError, match=r"already running on Other.Page.*adopt=true, session='b1'"):
@@ -372,6 +411,45 @@ async def test_debug_answer_that_ends_early_is_fetched_again_only_for_reading_ac
 
 
 @pytest.mark.asyncio
+async def test_busy_process_is_asked_again_later_for_reading_actions(debug_env):
+    await _start()
+    busy = (423, {"error": "busy", "code": "busy"})
+    with patch("time.sleep") as sleep:
+        data, fake = await _call("fitnesse_debug_inspect", {"kind": "scope"}, busy, busy,
+                                 (200, {"html": "<table><tr><td>scope</td></tr></table>"}))
+    assert fake.actions == ["scope"] * 3 and [c.args[0] for c in sleep.call_args_list] == [2.0, 5.0]
+    with patch("time.sleep"), pytest.raises(ToolError, match="HTTP 423.*Tried 3 times"):
+        await _call("fitnesse_debug_inspect", {"kind": "scope"}, busy, busy, busy)
+    with patch("time.sleep") as sleep, pytest.raises(ToolError, match="HTTP 423") as err:
+        await _call("fitnesse_debug_run_wiki", {"wiki": "|x|"}, busy)
+    assert not sleep.called and "Tried" not in str(err.value)  # a run is never repeated
+
+
+@pytest.mark.asyncio
+async def test_end_uses_log_max_where_the_fork_has_it(debug_env):
+    await _start()
+    lines = [{"stream": "out", "text": f"l{i}", "time": "t"} for i in range(30)]
+    data, fake = await _call("fitnesse_debug_end", {}, (200, {"lines": [], "next": 45}),
+                             (200, {"ended": True, "html": "", "counts": {}, "log": {"lines": lines, "skipped": 2}}))
+    assert fake.requests[1]["form"]["logMax"] == "30" and fake.requests[1]["form"]["logFrom"] == "15"
+    assert data["log_omitted"] == 17 and len(data["log"]) == 30  # 15 before logFrom, 2 left out by FitNesse
+    await _start()
+    _, fake = await _call("fitnesse_debug_end", {"max_log_lines": 0}, (200, {"lines": [], "next": 45}),
+                          (200, {"ended": True, "html": "", "counts": {}}))
+    assert "logMax" not in fake.requests[1]["form"]
+
+
+@pytest.mark.asyncio
+async def test_debug_connection_closed_without_answer(debug_env):
+    import http.client
+    data, fake = await _call("fitnesse_debug_status", {}, http.client.BadStatusLine(""), (200, {"running": False}))
+    assert data["running"] is False and fake.actions == ["status", "status"]
+    await _start()
+    with pytest.raises(ToolError, match=r"closed the connection without a complete answer \(RemoteDisconnected: gone\) to 'runWiki'.*may have taken effect"):
+        await _call("fitnesse_debug_run_wiki", {"wiki": "|x|"}, http.client.RemoteDisconnected("gone"))
+
+
+@pytest.mark.asyncio
 async def test_json_answer_that_is_no_object_shows_what_arrived(debug_env, caplog):
     body = b'{"ended": true, "log": ["' + b"x" * 500 + b'", "cut'
     with caplog.at_level(logging.WARNING), pytest.raises(ToolError) as err:
@@ -403,6 +481,50 @@ async def test_state_queries_parsed(debug_env):
     )
     assert data["browsers"][0]["name"] == "chrome" and data["selenium_session"] == "abc"
     assert "secret" not in json.dumps(data)
+
+
+VARIABLES_HTML = (
+    "<table><tr><td>dynamicVariables</td><td>name</td><td>value</td><td>system</td></tr>"
+    "<tr><td></td><td>user</td><td>bob</td><td>false</td></tr></table>"
+)
+LIVE_VIEW = {
+    "html": '<table><tr><td>liveView</td><td>http://hub/wd/hub</td><td>abc</td><td>[]</td></tr></table>',
+    "counts": {}, "liveViewUrl": "http://hub/ui", "liveViewPassword": "secret", "liveViewOnly": False,
+}
+PASS_HTML = "<table><tr><td class=\"pass\">ok</td></tr></table>"
+
+
+@pytest.mark.asyncio
+async def test_run_extras_come_with_the_run(debug_env):
+    await _start()
+    data, fake = await _call(
+        "fitnesse_debug_run_wiki", {"wiki": "|ok|", "with_variables": True, "with_live_view": True},
+        (200, {"html": PASS_HTML, "counts": {"right": 1}, "dynamicVariables": VARIABLES_HTML, "liveView": LIVE_VIEW}),
+    )
+    assert fake.actions == ["runWiki"]
+    assert fake.requests[0]["form"]["withDynamicVariables"] == "true" and fake.requests[0]["form"]["withLiveView"] == "true"
+    assert data["dynamicVariables"] == [{"name": "user", "value": "bob", "system": False}]
+    assert data["liveView"]["selenium_session"] == "abc" and data["liveView"]["live_view_url"] == "http://hub/ui"
+    assert "secret" not in json.dumps(data)
+
+    data, fake = await _call("fitnesse_debug_run_wiki", {"wiki": "|ok|"}, (200, {"html": PASS_HTML, "counts": {"right": 1}}))
+    assert "withDynamicVariables" not in fake.requests[0]["form"] and "withLiveView" not in fake.requests[0]["form"]
+    assert "dynamicVariables" not in data and "liveView" not in data
+
+
+@pytest.mark.asyncio
+async def test_run_extras_fall_back_to_the_actions_on_an_older_fork(debug_env):
+    await _start()
+    data, fake = await _call(
+        "fitnesse_debug_run_page", {"with_variables": True, "with_live_view": True},
+        (200, {"page": "FrontPage.T", "html": PASS_HTML}),
+        (200, {"html": PASS_HTML, "counts": {"right": 1}}),  # the fork ignored the extras
+        (200, {"html": VARIABLES_HTML, "counts": {}}),
+        (200, LIVE_VIEW),
+    )
+    assert fake.actions[-3:] == ["runTable", "dynamicVariables", "liveView"]
+    assert data["dynamicVariables"][0]["name"] == "user"
+    assert data["liveView"]["hub"] == "http://hub/wd/hub" and "secret" not in json.dumps(data)
 
 
 FAILING_HTML = (
@@ -447,6 +569,29 @@ async def test_keywords_filter(debug_env):
 
 
 @pytest.mark.asyncio
+async def test_keywords_filter_leaves_out_help_texts(debug_env):
+    await _start()
+    kw = [{"name": "Web", "children": [
+        {"syntax": "click %1", "helpText": "clicks", "tableItems": [
+            {"syntax": "with %1", "helpText": "This statement is mandatory."},
+            {"syntax": "or %1", "helpText": "optional"},
+        ]},
+        {"syntax": "click hard %1", "helpText": "clicks harder"},
+    ]}]
+    html = "<table><tr><td>keywordsJson</td><td>" + json.dumps(kw).replace("&", "&amp;").replace("<", "&lt;") + "</td><td>[]</td></tr></table>"
+    data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords", "filter": "clicks", "limit": 1},
+                          (200, {"html": html, "counts": {}}))
+    assert data["matches"] == 2 and len(data["keywords"]) == 1  # the filter still searches help texts
+    entry = data["keywords"][0]
+    assert "helpText" not in entry
+    assert entry["tableItems"] == [{"syntax": "with %1", "mandatory": True}, {"syntax": "or %1"}]
+    data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords", "filter": "clicks", "details": True},
+                          (200, {"html": html, "counts": {}}))
+    assert data["keywords"][0]["helpText"] == "clicks"
+    assert data["keywords"][0]["tableItems"][0]["helpText"] == "This statement is mandatory."
+
+
+@pytest.mark.asyncio
 async def test_run_page_changes_page_and_selects_tables(debug_env):
     await _start("FrontPage.Suite", suite=True)
     page_html = "<div><table><tr><td>setup</td></tr></table><table><tr><td>t1</td></tr></table><table><tr><td>t2</td></tr></table></div>"
@@ -485,11 +630,36 @@ async def test_status_reads_log_and_end_forgets_session(debug_env):
     long = {"stream": "info", "text": "Command: java -cp " + "x.jar:" * 1000, "time": "t"}
     assert my_server._log_line(long).endswith(f"… ({len(long['text'])} chars)")
     assert len(my_server._log_line(long)) < 600
-    data, fake = await _call("fitnesse_debug_end", {}, (200, {"ended": True, "html": "", "counts": {}, "log": {"lines": lines[3:]}}))
-    assert fake.requests[0]["form"]["logFrom"] == "3"
-    assert data["ended"] is True and len(data["log"]) == 2
+    data, fake = await _call("fitnesse_debug_end", {}, (200, {"lines": [], "next": 5, "dropped": 0}),
+                             (200, {"ended": True, "html": "", "counts": {}, "log": {"lines": lines[3:]}}))
+    assert fake.actions == ["log", "end"] and fake.requests[0]["form"]["from"] == "999999999"
+    assert fake.requests[1]["form"]["logFrom"] == "3"  # the unread lines, fewer than 30
+    assert data["ended"] is True and len(data["log"]) == 2 and "log_omitted" not in data
     with pytest.raises(ToolError, match="no debug session"):
         await _call("fitnesse_debug_page_tables", {})
+
+
+@pytest.mark.asyncio
+async def test_end_returns_only_the_last_log_lines(debug_env):
+    await _start()
+    lines = [{"stream": "out", "text": f"l{i}", "time": "t"} for i in range(40)]
+    # FitNesse is asked only for the last 30 lines: logFrom = total - 30
+    data, fake = await _call("fitnesse_debug_end", {}, (200, {"lines": [], "next": 40}),
+                             (200, {"ended": True, "html": "", "counts": {}, "log": {"lines": lines[10:]}}))
+    assert fake.requests[1]["form"]["logFrom"] == "10"
+    assert data["log_omitted"] == 10 and len(data["log"]) == 30 and data["log"][0] == "t [out] l10"
+    # without logFrom FitNesse sends no log at all
+    await _start()
+    data, fake = await _call("fitnesse_debug_end", {"max_log_lines": 0}, (200, {"lines": [], "next": 40}),
+                             (200, {"ended": True, "html": "", "counts": {}}))
+    assert "logFrom" not in fake.requests[1]["form"]
+    assert "log" not in data and data["log_omitted"] == 40
+    # an older fork or a failing log call: every unread line, cut here
+    await _start()
+    data, fake = await _call("fitnesse_debug_end", {}, (500, {"error": "boom"}),
+                             (200, {"ended": True, "html": "", "counts": {}, "log": {"lines": lines}}))
+    assert fake.requests[1]["form"]["logFrom"] == "0"
+    assert data["log_omitted"] == 10 and len(data["log"]) == 30
 
 
 @pytest.mark.asyncio
@@ -672,8 +842,11 @@ def test_definition_block_follows_fitlibrary_rules():
 
 
 def test_separators_are_exactly_four_dashes_outside_literals_and_comments():
+    # as FitNesse renders them (fork: exactly four dashes become <hr/>, anywhere between two tables)
     for text, splits in (("\n----\n", True), ("\n---- next\n", True), ("\n-----\n", False),
-                         ("  ----\n", False), ("!-\n----\n-!", False), ("{{{\n----\n}}}", False),
+                         ("\n------\n", False), ("  ----\n", True), ("text ---- text", True),
+                         ("x----y", True), ("\n----", True),  # "----|b|": the table follows on the line
+                         ("!-\n----\n-!", False), ("{{{\n----\n}}}", False), ("--!-x-!--", False),
                          ("#----\n", False), ("#c\n----\n", True), ("text\n", False)):
         assert my_server._separates(text) is splits, text
 

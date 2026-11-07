@@ -157,6 +157,29 @@ async def test_answer_that_ends_early_is_fetched_again_for_get_only():
     assert result["ok"] is False and urlopen.call_count == 1 and "may have taken effect" in result["error"]
 
 
+def test_get_that_runs_tests_is_never_repeated():
+    body = b'{"ok": true, "pad": "' + b"x" * 300 + b'"}'
+    for responder in ("suite", "test", "deletePage", "purgeHistory"):
+        with patch("urllib.request.urlopen", side_effect=lambda *a, **k: _CutResponse(body, 50)) as urlopen:
+            result = my_server._request("GET", "S", params={"responder": responder, "format": "xml"})
+        assert urlopen.call_count == 1, responder
+        assert "may have taken effect" in result["error"] and "fitnesse_get_page_history" in result["error"]
+    with patch("urllib.request.urlopen", side_effect=lambda *a, **k: _CutResponse(body, 50)) as urlopen:
+        my_server._request("GET", "S", [("responder", "names"), ("format", "json")])
+    assert urlopen.call_count == 3  # params as a list of pairs, a responder that only reads
+
+
+def test_connection_closed_before_the_status_line():
+    import http.client
+    with patch("urllib.request.urlopen", side_effect=http.client.BadStatusLine("")) as urlopen:
+        result = my_server._request("GET", "S", params={"responder": "suite"})
+    assert urlopen.call_count == 1 and result["ok"] is False
+    assert result["error"].startswith("FitNesse closed the connection without a complete answer (BadStatusLine)")
+    with patch("urllib.request.urlopen", side_effect=ConnectionResetError("reset")) as urlopen:
+        result = my_server._request_bytes("GET", "S", params={"responder": "pageHistory"})
+    assert urlopen.call_count == 3 and "(ConnectionResetError: reset); tried 3 times" in result["error"]
+
+
 @pytest.mark.asyncio
 async def test_timeout_resolved_to_float():
     """Depends injection must resolve timeout to a float before urlopen is called."""

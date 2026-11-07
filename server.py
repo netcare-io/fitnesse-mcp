@@ -3,12 +3,14 @@
 
 import binascii
 from html import unescape as _unescape_html
+import http.client
 import json
 import logging
 import mimetypes
 import os
 import re
 import threading
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from base64 import b64decode, b64encode
@@ -296,19 +298,44 @@ def _missing_bytes(headers, body: bytes, limit: int) -> str | None:
 
 
 _READ_ATTEMPTS = 3  # for answers that end early; only requests that change nothing are repeated
+# GET responders that only read. Others act on a GET (test, suite, deletePage, purgeHistory, …)
+# and are never repeated: a run whose answer broke off may still have happened.
+_READ_ONLY_RESPONDERS = {
+    None, "compareHistory", "compareVersions", "edit", "executionLog", "files", "getPage", "names",
+    "overview", "packet", "pageData", "pageHistory", "properties", "raw", "rss", "search",
+    "searchForm", "searchProperties", "testHistory", "variables", "versions", "viewVersion",
+    "whereUsed",
+}
+_CLOSED = (http.client.HTTPException, ConnectionError)  # e.g. BadStatusLine: closed before the status line
+
+
+def _closed_error(exc: BaseException) -> str:
+    text = str(exc).strip(" '\"")  # BadStatusLine('') prints as ''
+    detail = f": {text}" if text else ""
+    return f"FitNesse closed the connection without a complete answer ({type(exc).__name__}{detail})"
+
+
+def _responder(params) -> str | None:
+    items = params.items() if isinstance(params, Mapping) else (params or [])
+    return next((value for key, value in items if key == "responder"), None)
 
 
 def _retrying(once):
-    """Repeat a GET whose answer ended early (result '_incomplete'); report it after the last try."""
+    """Repeat a read-only GET whose answer ended early (result '_incomplete'); report it after the
+    last try. A GET that acts (a test run) is not repeated: its error says it may have run."""
     def call(method: str, path: str, *args, **kwargs) -> dict:
-        attempts = _READ_ATTEMPTS if method.upper() in ("GET", "HEAD") else 1
+        params = kwargs.get("params", args[0] if args else None)
+        reads = method.upper() in ("GET", "HEAD") and _responder(params) in _READ_ONLY_RESPONDERS
+        attempts = _READ_ATTEMPTS if reads else 1
         for attempt in range(1, attempts + 1):
             result = once(method, path, *args, **kwargs)
             if not result.pop("_incomplete", False):
                 return result
             logger.warning("%s (%s, attempt %d of %d)", result["error"], result["url"], attempt, attempts)
         result["error"] += (
-            f"; tried {attempts} times" if attempts > 1 else "; the request may have taken effect anyway"
+            f"; tried {attempts} times" if attempts > 1 else
+            "; the request may have taken effect anyway (a test or suite may have run: check "
+            "fitnesse_get_page_history before running it again)"
         )
         return result
     call.__wrapped__ = once
@@ -394,6 +421,9 @@ def _request(
             "error": f"Connection error: {exc.reason}",
             "body": None,
         }
+    except _CLOSED as exc:
+        return {"ok": False, "status": None, "url": url, "error": _closed_error(exc), "body": None,
+                "_incomplete": True}
 
 
 @_retrying
@@ -460,6 +490,9 @@ def _request_bytes(
             "error": f"Connection error: {exc.reason}",
             "body": None,
         }
+    except _CLOSED as exc:
+        return {"ok": False, "status": None, "url": url, "error": _closed_error(exc), "body": None,
+                "_incomplete": True}
 
 
 def _build_multipart_form_data(
@@ -2048,7 +2081,9 @@ def fitnesse_replace(
         "The latest result of each test page of a suite, without running anything: summary "
         "(passed, not_run, failed), pages (page, outcome, result_date) and failed_pages. For why a "
         "page failed, call fitnesse_get_page_history(page, result_date). Takes the same test "
-        "selection as fitnesse_run_suite. raw=true returns FitNesse's HTML instead."
+        "selection as fitnesse_run_suite. raw=true returns FitNesse's HTML instead.\n"
+        "These are the stored results: after a run of your own, check that result_date is from "
+        "that run; an older one means the run did not finish or was not stored."
     ),
     tags={"fitnesse", "rest", "tests", "read"},
     annotations={"readOnlyHint": True},
@@ -2324,8 +2359,9 @@ _DEBUG_CODE_HINTS = {
     "notLoaded": "The call runs no defined action in this session: check its keywords and number of "
                  "arguments with fitnesse_debug_inspect(kind='definedActions'), or load its page with "
                  "|define actions at|.",
-    "unknownPlace": "The fork can't place this definition (a |define action| table, or |define actions "
-                    "at| with |from| another root): edit it where it is (fitnesse_table_source of its page).",
+    "unknownPlace": "The definition is not on a page (a |define action| table in the test, or |define "
+                    "actions at| with |from| another root), or its page no longer has it: edit it where it "
+                    "is (fitnesse_table_source of its page).",
     "sessionRequired": "Several debug sessions of this account are running and this server knows none of "
                        "them: fitnesse_debug_status lists them in 'sessions'; continue one with "
                        "fitnesse_debug_status(adopt=true, session=...) or start one with fitnesse_debug_start.",
@@ -2361,6 +2397,13 @@ def _not_a_json_object(
     )
 
 
+class _Busy(ToolError):
+    """HTTP 423: the test process is still working on another document (e.g. after a 504)."""
+
+
+_BUSY_WAITS = (2.0, 5.0)  # seconds before the 2nd and 3rd try of a read-only action
+
+
 class _IncompleteAnswer(ToolError):
     """The connection ended before the whole answer arrived."""
 
@@ -2385,6 +2428,11 @@ def _debug_post(
     for attempt in range(1, attempts + 1):
         try:
             return _debug_post_once(responder, page_path, action, form, timeout_seconds, state)
+        except _Busy as exc:
+            if attempt == attempts:
+                raise ToolError(f"{exc} Tried {attempts} times." if attempts > 1 else str(exc)) from exc
+            logger.warning("%s (attempt %d of %d)", exc, attempt, attempts)
+            time.sleep(_BUSY_WAITS[min(attempt, len(_BUSY_WAITS)) - 1])
         except _IncompleteAnswer as exc:
             logger.warning("%s (attempt %d of %d)", exc, attempt, attempts)
             if attempt == attempts:
@@ -2443,6 +2491,8 @@ def _debug_post_once(
         ) from exc
     except URLError as exc:
         raise ToolError(f"Connection error: {exc.reason}") from exc
+    except _CLOSED as exc:
+        raise _IncompleteAnswer(f"{_closed_error(exc)} to '{action}'.") from exc
 
     if state is not None and headers is not None:
         for header in headers.get_all("Set-Cookie") or []:
@@ -2499,7 +2549,7 @@ def _debug_post_once(
         elif status == 409 and responder == "debugTable":
             hint = "The page changed since 'original' was read. Read fitnesse_table_source again and retry."
         detail = f" ({code})" if code else ""
-        raise ToolError(f"HTTP {status}{detail}: {message}. {hint}".strip())
+        raise (_Busy if status == 423 else ToolError)(f"HTTP {status}{detail}: {message}. {hint}".strip())
     return _without_secrets(data)
 
 
@@ -2609,10 +2659,14 @@ class _TableParser(HTMLParser):
         elif tag in {"td", "th"}:
             if self._depth == 1 and self.tables and self.tables[-1]["rows"]:
                 status = next((c for c in classes if c in _CELL_STATES), None)
-                self._cell = {"parts": [], "status": status}
+                self._cell = {"parts": [], "status": status, "nested": set()}
                 self.tables[-1]["rows"][-1].append(self._cell)
             else:
-                self._text(" | ")
+                # a cell of a nested table (e.g. FitLibrary's "Result of then"): keep its status inline
+                status = next((c for c in classes if c in _CELL_STATES), None)
+                self._text(f" | [{status}] " if status else " | ")
+                if status and self._cell is not None:
+                    self._cell["nested"].add(status)
         elif tag == "div" and self._depth == 0:
             self._divs.append({"collapsible": "collapsible" in classes, "include": None})
             if self._fold is not None:
@@ -2681,7 +2735,8 @@ def _parse_document(html: str) -> dict:
         if table["end"] is None:  # unclosed
             table["end"] = len(html)
         table["rows"] = [
-            [{"text": "".join(c["parts"]), "status": c["status"]} for c in row]
+            [{"text": "".join(c["parts"]), "status": c["status"], **({"nested": c["nested"]} if c["nested"] else {})}
+             for c in row]
             for row in table["rows"]
         ]
     for owner in (parser.leading, *parser.tables):
@@ -2720,7 +2775,37 @@ def _extras_lines(owner: dict, label: str) -> list[str]:
 
 
 def _failed(table: dict) -> bool:
-    return any(cell["status"] in ("fail", "error") for row in table["rows"] for cell in row)
+    """A [fail] or [error] cell, also inside a nested table (e.g. the result of a condition's then)."""
+    return any(
+        cell["status"] in ("fail", "error") or cell.get("nested", set()) & {"fail", "error"}
+        for row in table["rows"] for cell in row
+    )
+
+
+def _first_line(cell: dict) -> str:
+    return _squash(cell["text"], 0).split("\n", 1)[0].strip().lower()
+
+
+def _condition_outcome(table: dict) -> str | None:
+    """What a FitLibrary |condition| table did. Only an appended "Result of then"/"Result of else"
+    row shows that a branch ran; nothing marks the condition's value itself."""
+    rows = [row for row in table["rows"] if row]
+    # the header cell carries the error message after the keyword: "condition<hr/> if statement…"
+    if not rows or (_first_line(rows[0][0]).split() or [""])[0] != "condition":
+        return None
+    firsts = [_first_line(row[0]) for row in rows]
+    if any(f.startswith("result of then") for f in firsts):
+        return "then ran"
+    if any(f.startswith("result of else") for f in firsts):
+        return "else ran"
+    if rows[0][0]["status"] == "error":
+        return "condition error, then and else did not run"
+    cells = [cell for row in rows for cell in row]
+    if all(cell["status"] == "ignore" for cell in cells):
+        return "skipped, not run"
+    if not any(cell["status"] for cell in cells):
+        return "condition false, then did not run"
+    return None
 
 
 def _tables_text(
@@ -2750,6 +2835,9 @@ def _tables_text(
                 text = _squash(cell["text"]).replace("\n", " ⏎ ")
                 cells.append(f"[{cell['status']}] {text}" if cell["status"] else text)
             lines.append("| " + " | ".join(cells) + " |")
+        outcome = _condition_outcome(table)
+        if outcome:
+            lines.append(f"Table {i} – condition: {outcome}")
         lines.extend(_extras_lines(table, f"Table {i}"))
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
@@ -3036,7 +3124,23 @@ def _walk_keywords(node, path: tuple[str, ...] = ()):
             yield from _walk_keywords(children, sub)
 
 
-def _keywords(html: str, filter: str | None, limit: int) -> dict:
+_MANDATORY = "this statement is mandatory"
+
+
+def _without_help(node):
+    """A keyword entry without its help texts; a help text saying the row is mandatory becomes
+    mandatory=true."""
+    if isinstance(node, list):
+        return [_without_help(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    result = {k: _without_help(v) for k, v in node.items() if k != "helpText"}
+    if _MANDATORY in str(node.get("helpText") or "").lower():
+        result["mandatory"] = True
+    return result
+
+
+def _keywords(html: str, filter: str | None, limit: int, details: bool = False) -> dict:
     rows = _query_rows(html)
     cells = rows[0] if rows else []
     try:
@@ -3052,7 +3156,8 @@ def _keywords(html: str, filter: str | None, limit: int) -> dict:
     if filter:
         needle = filter.lower()
         hits = [e for e in found if needle in json.dumps(e, ensure_ascii=False).lower()]
-        return {"matches": len(hits), "keywords": hits[:limit]}
+        shown = hits[:limit] if details else [_without_help(e) for e in hits[:limit]]
+        return {"matches": len(hits), "keywords": shown}
     categories: dict[str, int] = {}
     for entry in found:
         label = entry["category"] + (" (special)" if entry["special"] else "")
@@ -3076,14 +3181,16 @@ _NO_DEFINED_ACTIONS = (
     "fitnesse_debug_run_page(tables=[...])."
 )
 _MARKUP = re.compile(r"</?\w+>|'{2,3}")
-# FitLibrary splits a page of defined actions at lines that start with exactly four dashes (text
-# may follow), not inside !-...-!, {{{...}}} or # comment lines.
-_SEPARATOR = re.compile(r"(?m)^----(?!-)")
-_NOT_WIKI = re.compile(r"!-.*?-!|\{\{\{.*?\}\}\}|^#[^\n]*", re.S | re.M)
+# FitLibrary (DefinedActionBodyCollector) ends a definition at an <hr/> between two tables. FitNesse
+# renders exactly four dashes as <hr/> anywhere in the text, five or more as <hr size=…/>, and
+# nothing inside !-...-!, {{{...}}} or # comment lines. Same as the mod's DefinedActionBlocks.
+_SEPARATOR = re.compile(r"(?<!-)----(?!-)")
+_NOT_WIKI = re.compile(r"!-.*?-!|\{\{\{.*?\}\}\}|^#[^\n]*", re.S | re.M)  # a comment is one line
 
 
 def _separates(text: str) -> bool:
-    return bool(_SEPARATOR.search(_NOT_WIKI.sub("", text)))
+    """Whether the text between two tables ends a definition."""
+    return bool(_SEPARATOR.search(_NOT_WIKI.sub(" ", text)))
 
 
 def _plain(text: str) -> str:
@@ -3162,7 +3269,8 @@ def _definition_block(source: Mapping, action: dict) -> dict:
 
     The header is a table whose first row's keyword cells (every other cell, starting with the
     first) match the action's keywords, and that is the page's first table or comes right after
-    a ---- line. The block runs to the table before the next ----, with the text in between.
+    a ---- (see _separates). The block runs to the table before the next ----, with the text in
+    between.
     """
     tables = list(source.get("tables") or [])
     texts = list(source.get("texts") or [])
@@ -3350,6 +3458,22 @@ def _log_lines(lines) -> list[str]:
     return [_log_line(l) for l in lines or [] if isinstance(l, dict)]
 
 
+def _log_lines_total(state: _DebugState, timeout_seconds: float) -> int | None:
+    """Number of log lines so far: a log call from a line far ahead answers no lines, only 'next'."""
+    try:
+        return int(_session_action(state, "log", {"from": 999_999_999}, timeout_seconds=timeout_seconds).get("next"))
+    except (ToolError, TypeError, ValueError):
+        return None
+
+
+def _log_from(total: int | None, unread: int, max_lines: int) -> int | None:
+    """logFrom for end/abort. FitNesse sends every line from logFrom on (the test process' command
+    line alone has ~40 KB), so start max_lines before the end; None leaves the log out."""
+    if not max_lines:
+        return None
+    return unread if total is None else max(unread, total - max_lines)
+
+
 def _read_log(state: _DebugState, max_lines: int, timeout_seconds: float | None) -> dict:
     start = state.log_next
     data = _session_action(state, "log", {"from": start}, timeout_seconds=timeout_seconds)
@@ -3359,6 +3483,50 @@ def _read_log(state: _DebugState, max_lines: int, timeout_seconds: float | None)
     # the first returned line has number start + dropped
     state.log_next = start + dropped + max_lines if more else data.get("next", start)
     return {"lines": _log_lines(lines[:max_lines]), "dropped": dropped, "more": more}
+
+
+def _live_view(data: dict) -> dict:
+    """An answer of action=liveView (also the liveView extra of a run)."""
+    cells = (_query_rows(data.get("html") or "") or [[]])[0]
+    try:
+        browsers = json.loads(cells[3]) if len(cells) > 3 and cells[3] else []
+    except json.JSONDecodeError:
+        browsers = cells[3]
+    return _without_secrets({
+        "hub": cells[1] if len(cells) > 1 else "",
+        "selenium_session": cells[2] if len(cells) > 2 else "",
+        "browsers": browsers,
+        "live_view_url": data.get("liveViewUrl"),
+        "live_view_only": data.get("liveViewOnly"),
+    })
+
+
+def _variables(html: str, include_system: bool = False) -> list[dict]:
+    records = _query_records(html, "dynamicVariables")
+    for record in records:
+        record["system"] = record.get("system", "").lower() == "true"
+    return records if include_system else [r for r in records if not r["system"]]
+
+
+def _run_form(form: dict, variables: bool, live_view: bool) -> dict:
+    """Ask for the extras of a run (mod v1.5.0: withDynamicVariables, v1.6.0: withLiveView)."""
+    return {**form, "withDynamicVariables": True if variables else None, "withLiveView": True if live_view else None}
+
+
+def _with_extras(state, data: dict, result: dict, variables: bool, live_view: bool, timeout_seconds) -> dict:
+    """Add the variables and the live view after a run: from the run's answer, or, where the fork
+    left them out (older fork, a failing query), from the separate actions."""
+    if variables:
+        html = data.get("dynamicVariables")
+        if not isinstance(html, str):
+            html = _session_action(state, "dynamicVariables", timeout_seconds=timeout_seconds).get("html") or ""
+        result["dynamicVariables"] = _variables(html)
+    if live_view:
+        view = data.get("liveView")
+        if not isinstance(view, dict):
+            view = _session_action(state, "liveView", timeout_seconds=timeout_seconds)
+        result["liveView"] = _live_view(view)
+    return result
 
 
 def _run_document(
@@ -3525,12 +3693,16 @@ if DEBUG_TOOLSET:
             "Result: 'tables' holds every table as text, one row per line; a cell's outcome is "
             "prefixed: [pass] check passed, [fail] check failed (the cell shows expected and actual),"
             " [error] exception (message and shortened stack trace), [ignore] not run. Cells without "
-            "prefix are plain input. 'counts' are this call's right/wrong/ignores/exceptions; "
+            "prefix are plain input. Cells of nested tables keep their prefix inline. Under a "
+            "|condition| table a line says what it did (then ran, else ran, condition false, "
+            "condition error, skipped): only the appended 'Result of then' row shows that then ran. 'counts' are this call's right/wrong/ignores/exceptions; "
             "'page_totals' add up all calls since the current page's test began.\n"
             "Below each table come what belongs to it: folding areas after it ('after: <title>', "
             "e.g. FitLibrary's show after or logs), links ('link in row R, column C: text -> url') "
             "and images. Inline screenshots ('[image N]' in a cell) are attached as image content "
             f"(at most {DEBUG_MAX_IMAGES} per call); 'images' lists which one is where.\n"
+            "A [pass] on a click only means the call returned: check its effect (URL, a text, an "
+            "element's visibility) before the next step.\n"
             "Find the available keywords and their exact wording with "
             "fitnesse_debug_inspect(kind='keywords') before writing tables.\n"
             "restart=true first ends the running test (its tear down runs, result in "
@@ -3543,19 +3715,20 @@ if DEBUG_TOOLSET:
         wiki: Annotated[str, Field(description="Wiki markup: one or more tables of '|cell|cell|' rows, tables separated by an empty line.")],
         restart: Annotated[bool, Field(description="First end the running test (tear down) and begin it afresh, for a clean state.")] = False,
         include_html: Annotated[bool, Field(description="Also return the raw result HTML (large; normally not needed).")] = False,
+        with_variables: Annotated[bool, Field(description="Also return the dynamic variables after the run (as fitnesse_debug_inspect(kind='dynamicVariables')), in the same call.")] = False,
+        with_live_view: Annotated[bool, Field(description="Also return the live view after the run (as fitnesse_debug_inspect(kind='liveView')), in the same call.")] = False,
         timeout_seconds: float | None = Depends(lambda: DEBUG_TIMEOUT_SECONDS),
     ) -> dict:
         """(nextPage +) runWiki via responder=debugTest."""
         state = _require_session()
+        def run() -> dict:
+            data = _session_action(state, "runWiki", _run_form({"wiki": wiki}, with_variables, with_live_view),
+                                   timeout_seconds=timeout_seconds)
+            result = _with_setup_hint(state, _document_result(state, data, state.current_page, include_html), timeout_seconds)
+            return _with_extras(state, data, result, with_variables, with_live_view, timeout_seconds)
+
         with _document(state):
-            return _with_images(_run_document(
-                state, None, restart, timeout_seconds,
-                lambda: _with_setup_hint(state, _document_result(
-                    state,
-                    _session_action(state, "runWiki", {"wiki": wiki}, timeout_seconds=timeout_seconds),
-                    state.current_page, include_html,
-                ), timeout_seconds),
-            ))
+            return _with_images(_run_document(state, None, restart, timeout_seconds, run))
 
     @mcp.tool(
         name="fitnesse_debug_page_tables",
@@ -3584,7 +3757,7 @@ if DEBUG_TOOLSET:
         own: dict[str, int] = {}
         parsed = _parse_tables(_page_html(state, page, timeout_seconds))
         for i, table in enumerate(parsed):
-            first = " | ".join(_squash(c["text"], 80) for c in (table["rows"][0] if table["rows"] else []))
+            first = " | ".join(_squash(c["text"], 200) for c in (table["rows"][0] if table["rows"] else []))
             source_page = table["include"] or page
             source_index = own[source_page] = own.get(source_page, -1) + 1
             entry = {"index": i, "rows": len(table["rows"]), "first_row": first,
@@ -3609,8 +3782,8 @@ if DEBUG_TOOLSET:
             "right after fitnesse_debug_start, before fitnesse_debug_run_wiki or inspect. A later call "
             "without tables then leaves the SetUp out (skipped_setup lists its indices) instead of "
             "running it twice; restart=true or another page runs it again.\n"
-            "only_failures=true returns only the tables with a [fail] or [error] cell, for long "
-            "pages.\n"
+            "only_failures=true still runs the tables as usual and returns only those with a [fail] "
+            "or [error] cell, for long pages.\n"
             "In a suite session, call it for each page with runnable=true from fitnesse_debug_start's"
             " 'pages', in that order."
         ),
@@ -3624,6 +3797,8 @@ if DEBUG_TOOLSET:
         setup_only: Annotated[bool, Field(description="Run only the SetUp tables (setup_tables of fitnesse_debug_page_tables). Not together with tables.")] = False,
         only_failures: Annotated[bool, Field(description="Return only the tables with a [fail] or [error] cell (counts as usual; tables_without_failures says how many were left out). For long pages where you look for what went wrong.")] = False,
         include_html: Annotated[bool, Field(description="Also return the raw result HTML (large; normally not needed).")] = False,
+        with_variables: Annotated[bool, Field(description="Also return the dynamic variables after the run (as fitnesse_debug_inspect(kind='dynamicVariables')), in the same call.")] = False,
+        with_live_view: Annotated[bool, Field(description="Also return the live view after the run (as fitnesse_debug_inspect(kind='liveView')), in the same call.")] = False,
         timeout_seconds: float | None = Depends(lambda: DEBUG_TIMEOUT_SECONDS),
     ) -> dict:
         """(nextPage +) pageHtml + runTable via responder=debugTest."""
@@ -3652,7 +3827,8 @@ if DEBUG_TOOLSET:
                 if bad:
                     raise ToolError(f"Table indices {bad} out of range: the page has {len(parts)} tables.")
                 html = "\n".join(parts[i] for i in chosen)
-            data = _session_action(state, "runTable", {"html": html}, timeout_seconds=timeout_seconds)
+            data = _session_action(state, "runTable", _run_form({"html": html}, with_variables, with_live_view),
+                                   timeout_seconds=timeout_seconds)
             if setup_only or (tables is not None and _covers_setup(html_page, tables)):
                 state.setup_ran = page  # SetUp ran in this test: a later whole-page run skips it
             if state.setup_ran == page or tables is None:
@@ -3660,7 +3836,7 @@ if DEBUG_TOOLSET:
             result = _document_result(state, data, page, include_html, only_failures, chosen)
             if skipped:
                 result["skipped_setup"] = skipped
-            return result
+            return _with_extras(state, data, result, with_variables, with_live_view, timeout_seconds)
 
         with _document(state):
             return _with_images(_run_document(state, page, restart, timeout_seconds, run))
@@ -3671,15 +3847,16 @@ if DEBUG_TOOLSET:
             "Looks into the debug session. kind:\n"
             "- 'keywords': the keywords you can use in tables right now. Without filter: only the "
             "categories with their number of keywords (the full list is large). With filter (a word "
-            "such as 'click', or a category such as 'Web / Browser'): matching entries in full: "
-            "syntax, where %1, %2 are the cells for parameters (e.g. 'click %1' -> "
-            "'|click|//button|'), parameters (label, allowed options), returnType, tableItems (the rows a keyword "
-            "expects in the rest of its table; 'This statement is mandatory' in helpText marks "
-            "required rows) and helpText. Defined actions are not in it: see 'definedActions'.\n"
+            "such as 'click', or a category such as 'Web / Browser'; it also searches the help texts): "
+            "matching entries: syntax, where %1, %2 are the cells for parameters (e.g. 'click %1' -> "
+            "'|click|//button|'), parameters (label, allowed options), returnType and tableItems (the "
+            "rows a keyword expects in the rest of its table; mandatory=true marks required rows). "
+            "details=true adds the help texts. Defined actions are not in it: see 'definedActions'.\n"
             "- 'definedActions': the defined actions loaded in this session by |define actions at| "
             "(usually from SetUp): action (call syntax, parameters as cells), parameters, note, "
             "deprecated, author, page (where it is defined; edit it with "
-            "fitnesse_debug_defined_action_source) and overrides. filter searches all fields. Empty "
+            "fitnesse_debug_defined_action_source) and overrides. filter searches the call, note, author "
+            "and page, not the action's body: read that with fitnesse_debug_defined_action_source. Empty "
             "until the page's 'define actions at' tables have run in the session.\n"
             "- 'dynamicVariables': variables set during the test (name, value); include_system adds "
             "the many unchanged Java system properties.\n"
@@ -3695,6 +3872,7 @@ if DEBUG_TOOLSET:
         kind: Annotated[Literal["keywords", "definedActions", "dynamicVariables", "scope", "liveView"], Field(description="What to look at; see the tool description.")],
         filter: Annotated[str | None, Field(description="Only for kind='keywords' or 'definedActions': text to search for (case-insensitive), e.g. 'browser'.")] = None,
         limit: Annotated[int, Field(description="Only for kind='keywords' with filter: maximum number of entries.", ge=1)] = 30,
+        details: Annotated[bool, Field(description="Only for kind='keywords' with filter: also return the help texts (long).")] = False,
         include_system: Annotated[bool, Field(description="Only for kind='dynamicVariables': also list the unchanged Java system properties (many).")] = False,
         timeout_seconds: float | None = Depends(lambda: DEBUG_TIMEOUT_SECONDS),
     ) -> dict:
@@ -3711,34 +3889,21 @@ if DEBUG_TOOLSET:
             data = _session_action(state, action, timeout_seconds=timeout_seconds)
         html = data.get("html") or ""
         if kind == "keywords":
-            return _keywords(html, filter, limit)
+            return _keywords(html, filter, limit, details)
         if kind == "liveView":
-            cells = (_query_rows(html) or [[]])[0]
-            try:
-                browsers = json.loads(cells[3]) if len(cells) > 3 and cells[3] else []
-            except json.JSONDecodeError:
-                browsers = cells[3]
-            return _without_secrets({
-                "hub": cells[1] if len(cells) > 1 else "",
-                "selenium_session": cells[2] if len(cells) > 2 else "",
-                "browsers": browsers,
-                "live_view_url": data.get("liveViewUrl"),
-                "live_view_only": data.get("liveViewOnly"),
-            })
-        records = _query_records(html, kind)
+            return _live_view(data)
         if kind == "dynamicVariables":
-            for record in records:
-                record["system"] = record.get("system", "").lower() == "true"
-            if not include_system:
-                records = [r for r in records if not r["system"]]
-        return {kind: records}
+            return {kind: _variables(html, include_system)}
+        return {kind: _query_records(html, kind)}
 
     @mcp.tool(
         name="fitnesse_debug_end",
         description=(
             "Ends the debug session: the running test's tear down (and, in a suite, the suite tear "
             "down) run, then the test process stops. Returns the tear-down result, the remaining log "
-            "lines and page_totals (counts per page). Call it whenever you are done.\n"
+            "lines (the last max_log_lines of them; log_omitted counts the others: to read the whole "
+            "log, call fitnesse_debug_status before ending) and page_totals (counts per page). Call it "
+            "whenever you are done.\n"
             "abort=true stops the process immediately without tear down; it works even while another "
             "call is still running. Use it when the session hangs or busy stays true."
         ),
@@ -3747,11 +3912,14 @@ if DEBUG_TOOLSET:
     )
     def fitnesse_debug_end(
         abort: Annotated[bool, Field(description="Stop immediately without tear down, even while a call is running.")] = False,
+        max_log_lines: Annotated[int, Field(description="Maximum number of unread log lines to return, the last ones. 0 for none.", ge=0)] = 30,
         timeout_seconds: float | None = Depends(lambda: DEBUG_TIMEOUT_SECONDS),
     ) -> dict:
         """end/abort via responder=debugTest."""
         state = _require_session()
-        form = {"logFrom": state.log_next}
+        total = _log_lines_total(state, 10.0)
+        # logMax (mod #162) lets FitNesse cut the log itself; older forks ignore it
+        form = {"logFrom": _log_from(total, state.log_next, max_log_lines), "logMax": max_log_lines or None}
         if abort:
             data = _session_action(state, "abort", form, timeout_seconds=30.0)
             result: dict = {"ended": data.get("ended", True), "aborted": True}
@@ -3761,8 +3929,16 @@ if DEBUG_TOOLSET:
             result = {"ended": data.get("ended", True)}
             result["teardown"] = _document_result(state, data, state.current_page, include_html=False)
         log = data.get("log")
-        if isinstance(log, dict):
-            result["log"] = _log_lines(log.get("lines"))
+        lines = _log_lines(log.get("lines")) if isinstance(log, dict) else []
+        kept = lines[len(lines) - max_log_lines:] if max_log_lines else []
+        if kept:
+            result["log"] = kept
+        # the unread lines logFrom skipped, those FitNesse left out for logMax, and any cut here
+        start = form["logFrom"] if form["logFrom"] is not None else max(state.log_next, total or 0)
+        skipped = log.get("skipped") if isinstance(log, dict) else None
+        omitted = start - state.log_next + (skipped if isinstance(skipped, int) else 0) + len(lines) - len(kept)
+        if omitted:
+            result["log_omitted"] = omitted
         result["page_totals"] = state.page_counts
         state.reset()
         return _with_images(result)
@@ -3773,7 +3949,7 @@ if DEBUG_TOOLSET:
             "Reads the current wiki of a defined action for editing: finds the page that defines it"
             " via the session's defined actions, reads that page fresh (not what the session loaded)"
             " and cuts out the definition block as FitLibrary reads it: the header table (the page's"
-            " first table or the first after a ---- line) and every table up to the next ----, with"
+            " first table or the first after a ----) and every table up to the next ----, with"
             " the text in between. Forks with definedAction pick the definition as a run would "
             "(keywords, number of arguments, loaded last wins). Result: page, index, last, original, "
             "ready for "

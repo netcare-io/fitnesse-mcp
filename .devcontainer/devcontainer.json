@@ -45,9 +45,14 @@
         "--add-host=host.docker.internal:host-gateway",
         "--env-file=${localWorkspaceFolder}/.env"
     ],
+    // ~/.claude.json is deliberately not bind-mounted: Claude Code replaces it atomically
+    // (new inode), which leaves a single-file bind mount dangling and the container fails
+    // to restart. Instead, CLAUDE_CONFIG_DIR makes the container keep its own .claude.json
+    // inside the mounted ~/.claude dir; credentials there are still shared with the host.
     "mounts": [
-        "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind",
-        // must exist on the host, or Docker creates it as a directory
-        "source=${localEnv:HOME}/.claude.json,target=/home/vscode/.claude.json,type=bind"
-    ]
+        "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind"
+    ],
+    "containerEnv": {
+        "CLAUDE_CONFIG_DIR": "/home/vscode/.claude"
+    }
 }

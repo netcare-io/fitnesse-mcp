@@ -262,11 +262,13 @@ Parameter mapping for `fitnesse_search_properties`:
   stay; CORS headers `access-control-*` are left alone) in the log lines of `fitnesse_debug_status`/`fitnesse_debug_end`, in
   `fitnesse_get_execution_log` and in the `stdout`/`stderr`/`command` of
   `fitnesse_get_page_history`. `raw=true` returns FitNesse's answer unchanged.
-- **Debug log lines are grouped into entries.** A line that comes within a
-  second of the previous one on the same stream and has no log4j/JUL head
-  belongs to it (as in the fork's debug UI): a stack trace or a logged REST
-  request is one entry in `log.lines`, its lines joined by newlines (at most
-  40 per entry). `max_log_lines` of `fitnesse_debug_status` and
+- **Debug log lines are grouped into entries,** as the fork's debug UI does:
+  a line without a log4j/JUL head that comes within a second of the previous
+  one on the same stream joins it if it continues it (any line of a log4j
+  entry up to its first stack frame, stack trace lines, an exception's
+  message). A stack trace or a logged REST request is one entry in
+  `log.lines`, its lines joined by newlines (at most 40 shown per entry);
+  a fixture's output after a stack trace is an entry of its own. `max_log_lines` of `fitnesse_debug_status` and
   `fitnesse_debug_end` counts entries. New on `fitnesse_debug_status`:
   `log_level` (e.g. `WARN`), `log_filter` (text such as `BROWSER_CONSOLE`) and
   `log_newest`; what they leave out is read all the same (`left_out`,

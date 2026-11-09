@@ -2064,6 +2064,27 @@ def test_log_lines_are_grouped_into_entries():
     assert my_server._log_lines(many)[0].endswith("… (11 more lines)")
 
 
+def test_log_lines_after_a_stack_trace_start_a_new_entry():
+    # debug-mode.md (fork 8c89f8e, resources #190): headless lines join a log4j entry only up to
+    # its first stack frame; after it only stack trace lines and an exception's message do
+    t = 1794241563355
+    lines = [
+        _line("[ERROR] d t [main] BrowserFixture - click failed", t),
+        _line("org.openqa.selenium.NoSuchElementException: no such element", t + 1),
+        _line("Build info: version 4.1", t + 2),  # message of the exception, before its first frame
+        _line("\tat a.B.c(B.java:1)", t + 3),
+        _line("Caused by: java.lang.IllegalStateException: gone", t + 4),
+        _line("details of the cause", t + 5),
+        _line("\t... 27 more", t + 6),
+        _line("fixture output", t + 7),  # after the stack trace: an entry of its own
+        _line("more fixture output", t + 8),  # follows no log4j line: an entry of its own as well
+        _line("    indented", t + 9),  # indented: continues it
+    ]
+    assert [len(e["lines"]) for e in my_server._log_entries(lines)] == [7, 1, 2]
+    capped = [_line("[INFO ] d t [main] X - body", t)] + [_line(f"l{i}", t) for i in range(2100)]
+    assert [len(e["lines"]) for e in my_server._log_entries(capped)][:2] == [2000, 1]
+
+
 @pytest.mark.asyncio
 async def test_status_filters_the_log_by_level_and_text_and_shows_the_newest(debug_env):
     await _start()

@@ -3550,7 +3550,7 @@ _WIKI_WORD = re.compile(r"(?<![\w!])[A-Z](?:[a-z0-9]+[A-Z][a-z0-9]*)+(?!\w)")
 _ESCAPED = re.compile(r"(!-.*?-!)", re.S)
 
 
-# Since lib #91 keywordsJson sends syntax this way (no tags, WikiWords in !-...-!); for older forks
+# Since lib #92 keywordsJson sends syntax this way (no tags, WikiWords in !-...-!); for older forks
 # (tcas-ta-ng runs 1.6.3) it is done here, and an already escaped syntax passes unchanged.
 def _escape_wiki_words(wiki: str) -> str:
     """|''execute JavaScript''|%1| -> |''execute !-JavaScript-!''|%1|; text already in !-...-! stays."""
@@ -3923,16 +3923,26 @@ def _readable_times(status: dict) -> dict:
 
 
 # The test process's log (debug-mode.md, Output): raw lines; an entry is a line with its
-# continuation lines, as the debug UI groups them: same stream, at most 1 s apart, no head of
-# its own. Heads: log4j's "[LEVEL] date time [thread] Logger - msg", or java.util.logging's
-# first line "Nov 02, 2026 10:12:47 AM org.example.Class method" (its next line: "LEVEL: msg").
+# continuation lines, as the debug UI groups them (continuedEntry in debugTest.js): same stream,
+# at most 1 s apart, fewer than 2000 lines, no head of its own, and the line continues the entry:
+# any line of a log4j entry up to its first stack frame (a logged REST request's headers and
+# body), else a JUL message line, an indented line, "Caused by:", an exception's first line, or
+# a line of an exception's message up to its first frame. Other lines after a stack trace, e.g. a
+# fixture's output, are entries of their own. Heads: log4j's "[LEVEL] date time [thread] Logger -
+# msg", or java.util.logging's first line "Nov 02, 2026 10:12:47 AM org.example.Class method"
+# (its next line: "LEVEL: msg").
 _LOG4J_HEAD = re.compile(r"^\[(TRACE|DEBUG|INFO|WARN|ERROR|FATAL) *\] \S+ \S+ \[[^\]]*\] (\S+) - ")
 _JUL_HEAD = re.compile(r"^\S+ \d{1,2}, \d{4} \d{1,2}:\d{2}:\d{2} \S+ ([\w$.]+) \S+$")
 _JUL_LEVEL = re.compile(r"^(SEVERE|WARNING|INFO|CONFIG|FINEST|FINER|FINE): ")
 _JUL_LEVELS = {"SEVERE": "ERROR", "WARNING": "WARN", "INFO": "INFO", "CONFIG": "DEBUG",
                "FINE": "DEBUG", "FINER": "TRACE", "FINEST": "TRACE"}
 LOG_LEVELS = ("TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL")
+_CONTINUED_LINE = re.compile(
+    r"^(?:(?:SEVERE|WARNING|INFO|CONFIG|FINEST|FINER|FINE): |\s|Caused by: )|^[\w$.]+(?:Exception|Error)(?::|$)")
+_EXCEPTION_LINE = re.compile(r"^Caused by: |^[\w$.]+(?:Exception|Error)(?::|$)")
+_STACK_FRAME = re.compile(r"^\s+(?:at |\.\.\. \d+ )")
 _ENTRY_MILLIS = 1000
+_ENTRY_MAX_LINES = 2000  # the UI's ENTRY_LINES: a longer entry is output that doesn't stop
 _ENTRY_LINES = 40  # lines shown per entry; a REST body or stack trace can run to hundreds
 
 
@@ -3949,19 +3959,33 @@ def _log_entries(lines) -> list[dict]:
         jul = None if head else _JUL_HEAD.match(text)
         entry = last.get(stream)
         if (entry is not None and head is None and jul is None and isinstance(at, (int, float))
-                and isinstance(entry["end"], (int, float)) and 0 <= at - entry["end"] <= _ENTRY_MILLIS):
+                and isinstance(entry["end"], (int, float)) and 0 <= at - entry["end"] <= _ENTRY_MILLIS
+                and len(entry["lines"]) < _ENTRY_MAX_LINES
+                and ((entry["log4j"] and not entry["framed"]) or entry["message"]
+                     or _CONTINUED_LINE.match(text))):
             if entry["jul"] and len(entry["lines"]) == 1 and (level := _JUL_LEVEL.match(text)):
                 entry["level"] = _JUL_LEVELS[level[1]]
             entry["lines"].append(text)
             entry["end"], entry["last"] = at, n
+            _follow_exception(entry, text)
             continue
         entry = {"time": at, "end": at, "stream": stream, "lines": [text], "first": n, "last": n,
                  "level": head[1] if head else None, "jul": jul is not None,
-                 "logger": head[2] if head else (jul[1].rsplit(".", 1)[-1] if jul else None)}
+                 "logger": head[2] if head else (jul[1].rsplit(".", 1)[-1] if jul else None),
+                 "log4j": head is not None, "framed": False, "message": False}
+        _follow_exception(entry, text)
         entries.append(entry)
         if stream in ("out", "err"):
             last[stream] = entry
     return entries
+
+
+def _follow_exception(entry: dict, text: str) -> None:
+    """An exception's first line opens its message, which ends at the first stack frame."""
+    if _STACK_FRAME.match(text):
+        entry["framed"], entry["message"] = True, False
+    elif _EXCEPTION_LINE.match(text):
+        entry["message"] = True
 
 
 def _log_text(line: str) -> str:
@@ -4935,7 +4959,7 @@ if DEBUG_TOOLSET:
             "class, depth): the table's own, then those of |add global| (level global, newest first), "
             "the selected and select objects, suite, FitLibrary's globals and flow. Several objects of "
             "one class only with |add named|, and only while the class has no global or local object; "
-            "after it, |add global| and local objects of that class fail, and the other way round. A "
+            "after it, |add global| and local objects of that class don't work, and the other way round. A "
             "local object comes before a global one of its class but is gone at the next test.\n"
             "- 'liveView': the open remote browsers (hub, selenium_session, browsers) and "
             "live_view_url, a link where a person can watch the selected browser (per browser in "

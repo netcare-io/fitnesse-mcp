@@ -1,11 +1,12 @@
 # Interactive debug mode
 
-> Copy of the fork's documentation (kdta-devcontainer `main` at 67cbfa1: fitnesse-netcare-mod
+> Copy of the fork's documentation (kdta-devcontainer `main` at 8c89f8e: fitnesse-netcare-mod
 > `origin/master` as of #164, kind `plain` from fitlibrary-netcare-mod #88, merged after 1.6.3,
-> `syntax` as table-ready wiki and `|add global|` objects in `scope` from fitlibrary-netcare-mod
-> #91), taken 2026-11-09. It describes the contract the KDTA debug tools in
-> [server.py](../server.py) build on. `AGENTS.md` and `README.md` below are the fork's files, not
-> this repository's. Don't edit it here: replace it with a new copy when the fork changes.
+> `|add global|` objects in `scope` from fitlibrary-netcare-mod #91, table-ready `syntax` from
+> #92, log grouping from fitnesse-netcare-resources #190), taken 2026-11-09. It describes the
+> contract the KDTA debug tools in [server.py](../server.py) build on. `AGENTS.md` and
+> `README.md` below are the fork's files, not this repository's. Don't edit it here: replace it
+> with a new copy when the fork changes.
 
 How the debug mode of the wiki works: the responders `debugTest` and `debugTable` in fitnesse-netcare-mod, the interactive test runner
 in fitlibrary-netcare-mod, the browser parts in fitlibraryweb-netcare and the UI (`debugTest.js`) in fitnesse-netcare-resources. For
@@ -142,7 +143,7 @@ annotations; a class with `@ShowSelectedActions` gives only its annotated ones.
 Their `syntax` is the annotation's `wiki` with its parameter descriptions as
 placeholders; without an annotation it is the method name, e.g.
 `|create order|%1|%2|`. Every `syntax` (also of `tableItems`, defined actions and
-mappings) is wiki a table row can take over as is (lib #91): without the `<i>`/`<b>`
+mappings) is wiki a table row can take over as is (lib #92): without the `<i>`/`<b>`
 tags (FitNesse would show them as text: `|''excel open file''|%1|`; a cell marked
 only by tags gets `''`), and every WikiWord in `!-…-!`
 (`|''execute !-JavaScript-!''|%1|`: FitNesse would link `JavaScript`, and FitLibrary
@@ -198,8 +199,15 @@ with a checkbox per stream and a dropdown with a checkbox per logger (log4j's
 stack trace lines go with the entry before them). `log` itself gives raw lines: a
 message with line breaks (e.g. the REST logging's headers and bodies) is several
 lines, only the first with the log4j prefix. The UI adds a line to the entry before
-it on the same stream if it comes within 1 s of it (`ENTRY_MILLIS`) and doesn't
-start a log4j or JUL entry (`continuedEntry` in `debugTest.js`). The `info` line
+it on the same stream (`continuedEntry` in `debugTest.js`) if it comes within 1 s of
+it (`ENTRY_MILLIS`), the entry has fewer than 2000 lines (`ENTRY_LINES`), the line
+doesn't start a log4j or JUL entry, and it continues the entry: any line of a log4j
+entry up to its first stack frame (the REST logging's headers and body stay one
+entry), a JUL message line, an indented line (stack frame), `Caused by:`, an
+exception's first line, or a line of an exception's message (up to its first frame).
+Other lines after a stack trace, e.g. a fixture's output, are entries of their own.
+A fixture's output on standard output within 1 s of a log4j line without a stack
+trace goes into that log4j entry. The `info` line
 `Exit code: <n>` after `end` is the test process's: wrong plus exceptions of all
 documents it ran since `start` (FitLibrary's suite counts), also of earlier runs of
 a page run again in the same session; it isn't the result of the last page. The
@@ -234,9 +242,9 @@ the rows as `variables` (mod #163).
 in lookup order (`level` table, global, selected, select, suite, global or flow;
 `name` of a named select object); systems under test follow their object with
 `depth` one more. The first `global` rows are the objects of `|add global|`,
-newest first, on top of the select objects (lib #91): one per class, and a
-global of an earlier page of the suite is missing when the page has its own
-object of that class. The later `global` rows are FitLibrary's own globals.
+newest first, on top of the select objects (lib #91): one per class for the
+suite, none for a class with named objects, and a global is missing while the
+page has its own object of that class. The later `global` rows are FitLibrary's own globals.
 Between tables only the objects that outlive a table are on it.
 
 ## Table editing (`?responder=debugTable`)

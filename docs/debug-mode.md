@@ -1,10 +1,11 @@
 # Interactive debug mode
 
-> Copy of the fork's documentation (kdta-devcontainer `main` at b723ee0: fitnesse-netcare-mod
-> `origin/master` as of #164, kind `plain` from fitlibrary-netcare-mod #88, merged after 1.6.3),
-> taken 2026-11-09. It describes the contract the KDTA debug tools in [server.py](../server.py)
-> build on. `AGENTS.md` and `README.md` below are the fork's files, not this repository's. Don't
-> edit it here: replace it with a new copy when the fork changes.
+> Copy of the fork's documentation (kdta-devcontainer `main` at 67cbfa1: fitnesse-netcare-mod
+> `origin/master` as of #164, kind `plain` from fitlibrary-netcare-mod #88, merged after 1.6.3,
+> `syntax` as table-ready wiki and `|add global|` objects in `scope` from fitlibrary-netcare-mod
+> #91), taken 2026-11-09. It describes the contract the KDTA debug tools in
+> [server.py](../server.py) build on. `AGENTS.md` and `README.md` below are the fork's files, not
+> this repository's. Don't edit it here: replace it with a new copy when the fork changes.
 
 How the debug mode of the wiki works: the responders `debugTest` and `debugTable` in fitnesse-netcare-mod, the interactive test runner
 in fitlibrary-netcare-mod, the browser parts in fitlibraryweb-netcare and the UI (`debugTest.js`) in fitnesse-netcare-resources. For
@@ -138,10 +139,17 @@ under a category named after the class's canonical name (e.g.
 `netcare.fixture.browser.BrowserFixture`): annotated with a FitLibrary or netcare
 keyword annotation or not at all, also the methods of a class without any
 annotations; a class with `@ShowSelectedActions` gives only its annotated ones.
-Their `syntax` is the annotation's `wiki` as written, markup included
-(`|''<i>excel open file</i>''|%1|`), which a wiki table can't use as is (FitNesse
-escapes the `<i>`); without an annotation it is the method name, e.g.
-`|create order|%1|%2|`. The answer
+Their `syntax` is the annotation's `wiki` with its parameter descriptions as
+placeholders; without an annotation it is the method name, e.g.
+`|create order|%1|%2|`. Every `syntax` (also of `tableItems`, defined actions and
+mappings) is wiki a table row can take over as is (lib #91): without the `<i>`/`<b>`
+tags (FitNesse would show them as text: `|''excel open file''|%1|`; a cell marked
+only by tags gets `''`), and every WikiWord in `!-…-!`
+(`|''execute !-JavaScript-!''|%1|`: FitNesse would link `JavaScript`, and FitLibrary
+would look for `executeJavaScriptLeftSquareBracketQuestion…`). WikiWords are as
+FitNesse finds them (`TextMaker.findWikiWordLength`) at the start of a word: not
+`XPath`, `HTML`, `getUrl`; text already in `!-…-!` stays. Clients compare keywords
+without the `!-`/`-!`. The answer
 also has that JSON parsed as `keywordsJson` (`{keywords, special}`), and
 `runTable`/`runWiki` add it after the run with `withKeywordsJson=true` (mod #163;
 `withKeywords=true` adds only the HTML of `keywords`).
@@ -223,9 +231,13 @@ with `withDynamicVariables=true` adds both, the table as `dynamicVariables` and
 the rows as `variables` (mod #163).
 
 `scope` returns a table `scope | level | name | class | depth` of the scope stack
-in lookup order (`level` table, selected, select, suite, global or flow; `name`
-of a named select object); systems under test follow their object with `depth`
-one more. Between tables only the objects that outlive a table are on it.
+in lookup order (`level` table, global, selected, select, suite, global or flow;
+`name` of a named select object); systems under test follow their object with
+`depth` one more. The first `global` rows are the objects of `|add global|`,
+newest first, on top of the select objects (lib #91): one per class, and a
+global of an earlier page of the suite is missing when the page has its own
+object of that class. The later `global` rows are FitLibrary's own globals.
+Between tables only the objects that outlive a table are on it.
 
 ## Table editing (`?responder=debugTable`)
 

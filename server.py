@@ -3550,6 +3550,8 @@ _WIKI_WORD = re.compile(r"(?<![\w!])[A-Z](?:[a-z0-9]+[A-Z][a-z0-9]*)+(?!\w)")
 _ESCAPED = re.compile(r"(!-.*?-!)", re.S)
 
 
+# Since lib #91 keywordsJson sends syntax this way (no tags, WikiWords in !-...-!); for older forks
+# (tcas-ta-ng runs 1.6.3) it is done here, and an already escaped syntax passes unchanged.
 def _escape_wiki_words(wiki: str) -> str:
     """|''execute JavaScript''|%1| -> |''execute !-JavaScript-!''|%1|; text already in !-...-! stays."""
     parts = _ESCAPED.split(wiki)
@@ -4358,7 +4360,7 @@ if DEBUG_TOOLSET:
             "fitnesse_debug_inspect(kind='keywords' or 'definedActions') -> fitnesse_debug_run_wiki or "
             "fitnesse_debug_run_page, repeatedly -> fitnesse_debug_end. Run the SetUp first: defined "
             "actions, the browser and often fixtures only exist once it has run.\n"
-            "One session per page and FitNesse account (forks before mod #159: one per account). If "
+            "One session per page and FitNesse account (older forks: one per account). If "
             "one is already running on this page (possibly a person working in the browser), this "
             + ("fails and says so: then continue it with fitnesse_debug_status(adopt=true, session=...) "
                "or end it. " if ALLOW_ADOPT else
@@ -4468,8 +4470,8 @@ if DEBUG_TOOLSET:
             "log_level, log_filter and log_newest narrow what comes back; left_out counts the unread "
             "entries they dropped, skipped the older ones log_newest passed over: both are read and gone. "
             "These describe this server's session, "
-            "else the account's session on page_path, else its only one. sessions (mod #159) lists "
-            "all running sessions of the account: session, page, currentPage, suite, busy, startedAt (local time).\n"
+            "else the account's session on page_path, else its only one. sessions lists "
+            "all running sessions of the account (not on older forks): session, page, currentPage, suite, busy, startedAt (local time).\n"
             "busy=true means the process is still working on a call that timed out: wait and call "
             "this again until busy is false, or abort with fitnesse_debug_end(abort=true).\n"
             "known_to_this_server=false with running=true means someone else's session (or one from "
@@ -4929,8 +4931,9 @@ if DEBUG_TOOLSET:
             "until the page's 'define actions at' tables have run in the session.\n"
             "- 'dynamicVariables': variables set during the test (name, value); include_system adds "
             "the many unchanged Java system properties.\n"
-            "- 'scope': the objects whose keywords are available, innermost first (level, name, "
-            "class, depth).\n"
+            "- 'scope': the objects whose keywords are available, in lookup order (level, name, "
+            "class, depth): the table's own, then those of |add global| (level global, newest first), "
+            "the selected and select objects, suite, FitLibrary's globals and flow.\n"
             "- 'liveView': the open remote browsers (hub, selenium_session, browsers) and "
             "live_view_url, a link where a person can watch the selected browser (per browser in "
             "'browsers'; password not included). A 'note' says when the link is on localhost."

@@ -15,6 +15,7 @@
             "FITNESSE_RUN_TIMEOUT_SECONDS": "120",
             "FITNESSE_ALLOW_SHUTDOWN": "0",
             "FITNESSE_ALLOW_ACCOUNT_ADMIN": "0",
+            "FITNESSE_ALLOW_ADOPT": "0",
             "FITNESSE_TOOLSETS": "read"
         }
     }

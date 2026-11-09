@@ -511,7 +511,7 @@ async def test_upload_file_exceeding_transfer_limit_rejected(files_env, monkeypa
 
 _TOOLSET_GATES = (
     "FITNESSE_TOOLSETS", "FITNESSE_FILES_ROOT",
-    "FITNESSE_ALLOW_SHUTDOWN", "FITNESSE_ALLOW_ACCOUNT_ADMIN",
+    "FITNESSE_ALLOW_SHUTDOWN", "FITNESSE_ALLOW_ACCOUNT_ADMIN", "FITNESSE_ALLOW_ADOPT",
 )
 _OTHER_GATES_OPEN = {
     "FITNESSE_FILES_ROOT": "files", "FITNESSE_ALLOW_SHUTDOWN": "1",
@@ -557,11 +557,11 @@ def _modes_of(tool) -> set[str]:
 async def test_every_tool_needs_exactly_one_mode(toolsets_env):
     await toolsets_env("all,debug,complete")
     tools = await my_server.mcp.list_tools()
-    assert len(tools) == 66
+    assert len(tools) == 68
     assert {t.name: _modes_of(t) for t in tools if len(_modes_of(t)) != 1} == {}
     debug = {t.name: _modes_of(t).pop() for t in tools if "debug" in t.tags}
     assert debug == {
-        "fitnesse_debug_status": "read", "fitnesse_debug_page_tables": "read",
+        "fitnesse_debug_status": "read", "fitnesse_debug_page_tables": "read", "fitnesse_debug_read_link": "read", "fitnesse_debug_steps": "read",
         "fitnesse_debug_inspect": "read", "fitnesse_table_source": "read",
         "fitnesse_debug_defined_action_source": "read",
         "fitnesse_table_save": "write", "fitnesse_table_insert": "write", "fitnesse_table_delete": "write",
@@ -616,13 +616,13 @@ async def test_toolsets_examples(toolsets_env):
 async def test_toolsets_default_all_and_spelling(toolsets_env):
     default = await toolsets_env("read,write,test,debug")
     assert default == await toolsets_env(" Read , WRITE,test,DEBUG ")
-    assert len(default) == 50  # 66 minus the 16 complete tools
+    assert len(default) == 52  # 68 minus the 16 complete tools
     assert await toolsets_env("all,debug") == default  # all leaves the areas out
     assert await toolsets_env("read,all,debug") == default
-    assert len(await toolsets_env("all")) == 35  # minus 16 complete and 15 debug tools
-    assert len(await toolsets_env("all,debug,complete")) == 66
-    assert len(await toolsets_env("read,write,test,debug,complete")) == 66
-    assert len(await toolsets_env("read,write,test,complete")) == 51  # minus 15 debug tools
+    assert len(await toolsets_env("all")) == 35  # minus 16 complete and 17 debug tools
+    assert len(await toolsets_env("all,debug,complete")) == 68
+    assert len(await toolsets_env("read,write,test,debug,complete")) == 68
+    assert len(await toolsets_env("read,write,test,complete")) == 51  # minus 17 debug tools
 
 
 @pytest.mark.parametrize("value", [None, "", "  "])

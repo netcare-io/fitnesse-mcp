@@ -53,6 +53,9 @@ python scripts/tools_list.py        # regenerate docs/tools.md after changing an
 - **README:** user-facing changes go in the matching section; anything that breaks existing
   configurations also goes under "Breaking changes". Debug workflows:
   [docs/debug-workflows.md](docs/debug-workflows.md).
+- **The fork's debug contract** (actions, fields, error codes of `debugTest`/`debugTable`) is
+  [docs/debug-mode.md](docs/debug-mode.md), a copy from the fork: check changes to the debug
+  tools against it, and replace it with a new copy instead of editing it.
 - Commit messages: imperative summary line, body with the why.
 
 ## Do not

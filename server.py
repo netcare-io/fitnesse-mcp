@@ -2281,6 +2281,9 @@ if _env_flag("FITNESSE_ALLOW_ACCOUNT_ADMIN"):
 # ---------------------------------------------------------------------------
 
 DEBUG_TOOLSET = "debug" in FITNESSE_TOOLSETS
+# Taking over a debug session this server did not start (maybe a person's in the browser).
+# Off by default: the MCP server is meant to have its own FitNesse account and its own sessions.
+ALLOW_ADOPT = _env_flag("FITNESSE_ALLOW_ADOPT")
 # Must exceed the server's debugTest.timeoutMinutes (default 10 min), which answers 504 itself.
 _debug_timeout_env = float(os.getenv("FITNESSE_DEBUG_TIMEOUT_SECONDS", "660"))
 DEBUG_TIMEOUT_SECONDS = _debug_timeout_env if _debug_timeout_env > 0 else None
@@ -2315,15 +2318,35 @@ class _DebugState:
     suite_setup: str | None = None
     suite_teardown: str | None = None
     frame_started: bool = False
+    suite_setup_pending: bool = False  # the SuiteSetUp stopped at a failure; the page has not begun
+    # Whole-page runs of current_page stop after a failing table: where the next one goes on
+    # (index as in fitnesse_debug_page_tables) and how many tables the page had then.
+    next_table: int = 0
+    table_count: int | None = None
+    # Tables of current_page that ran in its test (indices as above), and its TearDown tables as
+    # its last pageHtml showed them: nextPage and end run no TearDown, so _end_test sends the rest.
+    ran_tables: set[int] = field(default_factory=set)
+    teardown_tables: list[int] = field(default_factory=list)
+    # run_wiki calls whose tables all passed, for saving as the test (fitnesse_debug_steps). Kept
+    # by reset (end, a lost session), so they can still be saved; a new start clears them.
+    steps: list[dict] = field(default_factory=list)
+    step_count: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def reset(self) -> None:
         self.session = self.page = self.current_page = self.setup_ran = self.setup_seen = None
         self.suite_setup = self.suite_teardown = None
-        self.frame_started = False
+        self.frame_started = self.suite_setup_pending = False
+        self.next_table, self.table_count = 0, None
+        self.ran_tables, self.teardown_tables = set(), []
         self.suite = False
         self.log_next = 0
         self.page_counts = {}
+
+
+def _page_key(path: str | None) -> str | None:
+    """A page path as this server compares it: FitNesse answers some with a leading dot."""
+    return (path or "").strip().lstrip(".") or None
 
 
 _DEBUG_STATES: dict[tuple[str, str], _DebugState] = {}
@@ -2370,11 +2393,17 @@ _DEBUG_CODE_HINTS = {
                     "actions at| with |from| another root), or its page no longer has it: edit it where it "
                     "is (fitnesse_table_source of its page).",
     "sessionRequired": "Several debug sessions of this account are running and this server knows none of "
-                       "them: fitnesse_debug_status lists them in 'sessions'; continue one with "
-                       "fitnesse_debug_status(adopt=true, session=...) or start one with fitnesse_debug_start.",
-    "tooManySessions": "Too many debug sessions (debugTest.maxSessionsPerUser per account, debugTest.maxSessions "
-                       "on the server). End the ones no longer needed: fitnesse_debug_status lists this "
-                       "account's in 'sessions'.",
+                       "them: fitnesse_debug_status lists them in 'sessions'; "
+                       + ("continue one with fitnesse_debug_status(adopt=true, session=...) or " if ALLOW_ADOPT else "")
+                       + "start one with fitnesse_debug_start.",
+    "tooManySessions": "Too many debug sessions, for this FitNesse account (debugTest.maxSessionsPerUser) or "
+                       "on the whole FitNesse (debugTest.maxSessions). fitnesse_debug_status lists the "
+                       "account's running sessions in 'sessions'; "
+                       + ("take over one that is no longer needed with fitnesse_debug_status(adopt=true, "
+                          "session=...) and end it, or wait: " if ALLOW_ADOPT else
+                          "this server leaves those it did not start alone (e.g. from before a restart): ")
+                       + "they end themselves after their idle time (idleSecondsLeft). If the account has "
+                       "none running, the FitNesse-wide limit is reached: try again later.",
 }
 
 
@@ -2865,21 +2894,113 @@ def _inline_images(document: dict) -> list[dict]:
     return images
 
 
+_IMAGE_SUFFIXES = {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg", ".gif": "gif", ".webp": "webp"}
+
+
+def _files_link(url: str) -> str:
+    """The path of a link into FitNesse's files section (/files/...) from a debug result: a path
+    or a URL on this FitNesse. Anything else is refused: the tools read only FitNesse's files."""
+    link = url.strip()
+    base = _base_url().rstrip("/")
+    if link.startswith(base + "/"):
+        link = link[len(base):]
+    parts = parse.urlsplit(link)
+    if parts.scheme or parts.netloc or parts.query or parts.fragment:
+        raise ToolError(f"Not a link into this FitNesse's files section: {url!r}. Pass the /files/... "
+                        "link from a debug result.")
+    path = parse.unquote(parts.path)
+    if not path.startswith("/files/") or ".." in path.split("/"):
+        raise ToolError(f"Not a link into this FitNesse's files section: {url!r}. Pass the /files/... "
+                        "link from a debug result.")
+    return path
+
+
+def _image_format(path: str) -> str | None:
+    return _IMAGE_SUFFIXES.get(path[path.rfind("."):].lower()) if "." in path else None
+
+
+def _failure_screenshot(html: str) -> list[dict]:
+    """The screenshot KDTA links from the failing (last) table of a run (e.g. 'Screen' ->
+    /files/screenCaptures/....png), fetched for attaching. Best effort: [] if none or unreadable."""
+    tables = _parse_document(html)["tables"]
+    if not tables:
+        return []
+    links = [m["href"] for m in tables[-1]["media"] if "href" in m]
+    for href in reversed(links):
+        try:
+            path = _files_link(href)
+        except ToolError:
+            continue
+        fmt = _image_format(path)
+        if fmt is None:
+            continue
+        got = _request_bytes("GET", path, timeout_seconds=30.0)
+        if not got.get("ok") or got.get("truncated"):
+            logger.info("screenshot %s not attached: %s", path, got.get("error") or "too large")
+            return []
+        return [{"link": path, "format": fmt, "data": got["body"] or None}]
+    return []
+
+
+_HIDDEN_HTML = re.compile(r"<(script|style)\b[^>]*>.*?</\1\s*>|<!--.*?-->", re.S | re.I)
+
+
+def _link_text(body: bytes, content_type: str) -> str:
+    """A linked text file for reading: HTML without scripts, styles and comments; whitespace squeezed."""
+    match = re.search(r"charset=([\w.-]+)", content_type or "")
+    try:
+        text = body.decode(match.group(1) if match else "utf-8", errors="replace")
+    except LookupError:
+        text = body.decode("utf-8", errors="replace")
+    if "html" in (content_type or "").lower() or text.lstrip()[:15].lower().startswith(("<!doctype", "<html")):
+        text = _HIDDEN_HTML.sub(lambda m: f"<{m.group(1)}/>" if m.group(1) else "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _snippets(text: str, needle: str, context: int, limit: int) -> tuple[int, list[dict]]:
+    """Every place text contains needle (case-insensitive), with context around; overlapping
+    places merged. Returns the number of places and at most limit snippets."""
+    low, wanted = text.lower(), needle.lower()
+    spans: list[list[int]] = []
+    places = 0
+    pos = low.find(wanted)
+    while pos != -1:
+        places += 1
+        start, end = max(0, pos - context), min(len(text), pos + len(wanted) + context)
+        if spans and start <= spans[-1][1]:
+            spans[-1][1] = end
+        else:
+            spans.append([start, end])
+        pos = low.find(wanted, pos + len(wanted))
+    return places, [
+        {"at": a, "text": ("…" if a else "") + text[a:b] + ("…" if b < len(text) else "")}
+        for a, b in spans[:limit]
+    ]
+
+
+_IMAGE_PARTS = ("suite_setup", "previous_page_teardown", "teardown", "teardown_tables", "suite_teardown", "end")
+
+
+def _image_parts(part: dict):
+    """The document parts of a result, nested ones first, the result itself last."""
+    for key in _IMAGE_PARTS:
+        if isinstance(part.get(key), dict):
+            yield from _image_parts(part[key])
+    yield part
+
+
 def _with_images(result: dict) -> dict | ToolResult:
     """Attach the inline images of result (and its tear-down parts) as MCP image content.
 
     Each document part lists its images in "images" with the content index they got, or why not.
     """
     attached: list[Image] = []
-    parts = ("suite_setup", "previous_page_teardown", "teardown", "suite_teardown")
-    for part in (*(result.get(k) for k in parts), result):
-        if not isinstance(part, dict):
-            continue
+    for part in _image_parts(result):
         listed = []
         for image in part.pop("_images", []):
-            entry = {"image": image["n"], "format": image["format"]}
+            entry = ({"link": image["link"]} if "link" in image else {"image": image["n"]}) | {"format": image["format"]}
             if image["data"] is None:
-                entry["omitted"] = "invalid base64"
+                entry["omitted"] = "empty" if "link" in image else "invalid base64"
             elif len(attached) >= DEBUG_MAX_IMAGES:
                 entry["omitted"] = f"more than {DEBUG_MAX_IMAGES} images in this result; use include_html"
             else:
@@ -2920,8 +3041,8 @@ def _require_session() -> _DebugState:
     state = _debug_state()
     if not state.session:
         raise ToolError(
-            "This MCP server has no debug session on this FitNesse. Start one with "
-            "fitnesse_debug_start, or continue a running one with fitnesse_debug_status(adopt=true)."
+            "This MCP server has no debug session on this FitNesse. Start one with fitnesse_debug_start"
+            + (", or continue a running one with fitnesse_debug_status(adopt=true)." if ALLOW_ADOPT else ".")
         )
     return state
 
@@ -2932,6 +3053,8 @@ def _session_action(
     form: Mapping[str, str | int | bool | None] | None = None,
     timeout_seconds: float | None = 30.0,
 ) -> dict:
+    if not state.session:  # lost in this call (409): without an id FitNesse picks the account's session
+        raise ToolError("This MCP server's debug session has ended. Start a new one with fitnesse_debug_start.")
     return _debug_post(
         "debugTest",
         state.page or "",
@@ -3004,7 +3127,7 @@ def _with_setup_hint(state: _DebugState, result: dict, timeout_seconds: float | 
     page = state.current_page or state.page
     if not (counts.get("wrong") or counts.get("exceptions")):
         return result
-    if state.suite_setup and not state.frame_started:
+    if state.suite_setup and (not state.frame_started or state.suite_setup_pending):
         return {**result, "hint": (
             f"The SuiteSetUp ({state.suite_setup}) has not run in this session, so the browser, "
             "defined actions and fixtures it provides may be missing: run "
@@ -3027,14 +3150,72 @@ def _with_setup_hint(state: _DebugState, result: dict, timeout_seconds: float | 
     )}
 
 
-def _next_page(state: _DebugState, page: str | None, timeout_seconds: float | None) -> dict:
+class _TearDownFailed(ToolError):
+    """The TearDown tables could not run (not: ran with failures); the session is still there."""
+
+
+def _seen_page(state: _DebugState, parsed: list[dict], ran: list[int]) -> None:
+    """After tables of current_page ran: note them and where its TearDown is (see _end_test)."""
+    state.ran_tables.update(ran)
+    state.teardown_tables = _teardown_indices(parsed)
+
+
+def _run_teardown(state: _DebugState, page: str, timeout_seconds: float | None) -> dict | None:
+    """Run page's TearDown tables that have not run in its test, in one go; their result."""
+    html_page = _page_html(state, page, timeout_seconds)  # fresh: it may have been edited
+    parsed = _parse_tables(html_page)
+    todo = [i for i in _teardown_indices(parsed) if i not in state.ran_tables]
+    if not todo:
+        return None
+    html = "\n".join(html_page[parsed[i]["start"]:parsed[i]["end"]] for i in todo)
+    data = _session_action(state, "runTable", {"html": html}, timeout_seconds=timeout_seconds)
+    state.ran_tables.update(todo)
+    result = _document_result(state, data, page, include_html=False, numbers=todo)
+    del result["page"]
+    return result
+
+
+def _end_test(state: _DebugState, skip_teardown: bool, timeout_seconds: float | None) -> dict:
+    """Before nextPage or end, which run no TearDown tables: the current page's TearDown tables
+    that have not run in its test, as a normal test run would. Only if run_page ran some of the
+    page's tables (not after run_wiki alone). Returns teardown_tables (their result),
+    teardown_skipped and tables_not_run (tables a stop left out), for the report of the test's end."""
+    page = state.current_page
+    report: dict = {}
+    pending = sorted(set(state.teardown_tables) - state.ran_tables)
+    if page and state.ran_tables and pending:
+        if skip_teardown:
+            report["teardown_skipped"] = pending
+        else:
+            try:
+                tables = _run_teardown(state, page, timeout_seconds)
+            except ToolError as exc:
+                if not state.session:  # the session is gone: nothing to skip
+                    raise
+                raise _TearDownFailed(f"The TearDown of {page} could not run: {exc}") from exc
+            if tables is not None:
+                report["teardown_tables"] = tables
+    if state.table_count is not None:  # a whole-page run stopped and was not continued
+        left = [i for i in range(state.next_table, state.table_count) if i not in state.ran_tables]
+        if left:
+            report["tables_not_run"] = len(left)
+    return report
+
+
+def _next_page(
+    state: _DebugState, page: str | None, timeout_seconds: float | None, skip_teardown: bool = False
+) -> dict:
     previous = state.current_page
+    before = _end_test(state, skip_teardown, timeout_seconds)
     data = _session_action(state, "nextPage", {"page": page}, timeout_seconds=timeout_seconds)
     teardown = _document_result(state, data, previous, include_html=False)
     teardown["teardown_of"] = teardown.pop("page")
-    state.current_page = data.get("page") or page or previous
+    teardown.update(before)
+    state.current_page = _page_key(data.get("page")) or _page_key(page) or previous
     state.page_counts.pop(state.current_page, None)
     state.setup_ran = state.setup_seen = None  # a new test begins: its SetUp has not run
+    state.next_table, state.table_count = 0, None
+    state.ran_tables, state.teardown_tables = set(), []
     return teardown
 
 
@@ -3054,7 +3235,7 @@ def _session_list(sessions: list[dict]) -> str:
 
 def _check_start(page_path: str, sessions: list[dict], state: _DebugState, replace: bool) -> None:
     """Refuse a start that would replace a session on this page, or leave this server's own running."""
-    page = page_path.strip().lstrip(".")
+    page = _page_key(page_path)
     here = next((s for s in sessions if s["page"] == page), None)
     own = next((s for s in sessions if state.session and s["session"] == state.session), None)
     if own is not None and own is not here:
@@ -3073,11 +3254,25 @@ def _check_start(page_path: str, sessions: list[dict], state: _DebugState, repla
         raise ToolError(
             f"A debug session started by someone using the same account (maybe in a browser) is "
             f"already running on {page} (session "
-            f"{here['session']}, started {here.get('startedAt')}). Continue it with "
-            f"fitnesse_debug_status(adopt=true, session='{here['session']}'), end it, or pass "
-            "replace=true to kill it without tear down (its browser tab then shows 'replaced'). Sessions "
-            "on other pages are not affected."
+            f"{here['session']}, started {here.get('startedAt')}). " + _foreign_session_advice(here["session"])
+            + " Sessions on other pages are not affected."
         )
+
+
+def _foreign_session_advice(session: str | None) -> str:
+    """What to do about a running session this server did not start."""
+    if ALLOW_ADOPT:
+        which = f", session='{session}'" if session else ""
+        return (
+            f"Continue it with fitnesse_debug_status(adopt=true{which}), end it, or pass replace=true to "
+            "kill it without tear down (its browser tab then shows 'replaced')."
+        )
+    return (
+        "This server does not take over sessions it did not start (FITNESSE_ALLOW_ADOPT is off). Work "
+        "on another page, or wait: it ends itself after its idle time (idleSecondsLeft in "
+        "fitnesse_debug_status). Pass replace=true only when told to: it kills the session without "
+        "tear down (its browser tab then shows 'replaced')."
+    )
 
 
 def _session_to_adopt(status: dict, sessions: list[dict] | None, wanted: str | None) -> dict | None:
@@ -3123,6 +3318,94 @@ def _setup_indices(tables: list[dict]) -> list[int]:
     ]
 
 
+def _teardown_indices(tables: list[dict]) -> list[int]:
+    """The TearDown's tables, as _setup_indices. SuiteTearDown is not in pageHtml (withSuiteSetUp
+    false): this server runs it as a page of its own."""
+    return [
+        i for i, table in enumerate(tables)
+        if (table.get("outer_include") or "").rsplit(".", 1)[-1] == "TearDown"
+    ]
+
+
+def _table_sources(parsed: list[dict], page: str | None) -> list[tuple[str | None, int]]:
+    """Per table of a run: the page it is written on and its index there (fitnesse_table_* tools)."""
+    own: dict[str | None, int] = {}
+    sources = []
+    for table in parsed:
+        source_page = table["include"] or page
+        own[source_page] = own.get(source_page, -1) + 1
+        sources.append((source_page, own[source_page]))
+    return sources
+
+
+_TEXT_BEFORE_CHARS = 600  # page text before a failing table, kept from its end
+_BLOCK_END = re.compile(r"<br\s*/?>|</(?:p|div|h[1-6]|li|tr|pre)\s*>", re.I)
+
+
+def _html_text(fragment: str) -> str:
+    """Rendered wiki HTML as plain text: scripts/styles dropped, tags removed, one line per block."""
+    text = _HIDDEN_HTML.sub("", fragment)
+    text = re.sub(r"<a\b[^>]*class=\"edit\"[^>]*>.*?</a>", "", text, flags=re.S | re.I)  # include titles
+    text = _BLOCK_END.sub("\n", text)
+    text = _unescape_html(re.sub(r"<[^>]+>", " ", text))
+    lines = (" ".join(line.split()) for line in text.splitlines())
+    return "\n".join(line for line in lines if line)
+
+
+def _stop_details(
+    html_page: str, parsed: list[dict], page: str | None, failed: int, timeout_seconds: float | None
+) -> dict:
+    """stopped_at for the failing table: its index, where it is written (source_page,
+    source_index), the page text just before it (text_before, from the rendered page) and its
+    wiki (from debugTable source of source_page, to change and try with run_wiki). Best effort:
+    text_before and wiki are left out when there is none or it can't be read."""
+    source_page, source_index = _table_sources(parsed, page)[failed]
+    details: dict = {"index": failed, "source_page": source_page, "source_index": source_index}
+    start = parsed[failed - 1]["end"] if failed else 0
+    before = _html_text(html_page[start:parsed[failed]["start"]])
+    if before:
+        details["text_before"] = (
+            "…" + before[-_TEXT_BEFORE_CHARS:] if len(before) > _TEXT_BEFORE_CHARS else before)
+    try:
+        source = _debug_post("debugTable", source_page or "", "source", timeout_seconds=timeout_seconds or 30.0)
+        tables = source.get("tables") if isinstance(source, dict) else None
+        if isinstance(tables, list) and source_index < len(tables) and isinstance(tables[source_index], str):
+            details["wiki"] = tables[source_index]
+    except ToolError as exc:
+        logger.info("wiki of %s table %s not read: %s", source_page, source_index, exc)
+    return details
+
+
+def _all_passed(data: dict) -> bool:
+    """A run with at least one table and no [fail]/[error] cell or wrong/exception count."""
+    counts = data.get("counts") if isinstance(data.get("counts"), Mapping) else {}
+    tables = _parse_tables(data.get("html") or "")
+    return bool(tables) and not counts.get("wrong") and not counts.get("exceptions") and not any(map(_failed, tables))
+
+
+def _run_tables_stepwise(
+    state: _DebugState, parts: list[str], chosen: list[int], timeout_seconds: float | None
+) -> tuple[dict, list[int], int | None]:
+    """Run the chosen tables one runTable each, as the browser debugger steps, and stop after the
+    first with a [fail]/[error] cell or a wrong/exception count. Returns the combined answer (html
+    and counts as one runTable would give them), the indices that ran and the failing one."""
+    pieces: list[str] = []
+    counts: dict[str, int] = {}
+    ran: list[int] = []
+    for i in chosen:
+        data = _session_action(state, "runTable", {"html": parts[i]}, timeout_seconds=timeout_seconds)
+        html = data.get("html") or ""
+        pieces.append(html)
+        ran.append(i)
+        step = data.get("counts") if isinstance(data.get("counts"), Mapping) else {}
+        for key, value in step.items():
+            if isinstance(value, int):
+                counts[key] = counts.get(key, 0) + value
+        if step.get("wrong") or step.get("exceptions") or any(_failed(t) for t in _parse_tables(html)):
+            return {"html": "\n".join(pieces), "counts": counts}, ran, i
+    return {"html": "\n".join(pieces), "counts": counts}, ran, None
+
+
 def _page_html(state: _DebugState, page: str, timeout_seconds: float | None) -> str:
     # withSuiteSetUp=false: since mod #164 pageHtml embeds SuiteSetUp/SuiteTearDown for the start
     # page; this server runs them as pages of their own (_run_suite_setup), as ?test does
@@ -3161,7 +3444,38 @@ def _without_help(node):
     return result
 
 
-def _keywords(html: str, filter: str | None, limit: int, details: bool = False) -> dict:
+def _keyword_key(text: str) -> str:
+    """A keyword compared by its words: '%1' placeholders, markup, case and spacing left out."""
+    return " ".join(_plain(re.sub(r"%\d+", " ", text)).lower().split())
+
+
+def _plain_keywords(html: str, known: set[str]) -> list[dict]:
+    """Public methods of classes without keyword annotations, from the session's keywords table
+    (keywordsJson has only annotated ones): rows of kind 'plain' (fitlibrary-netcare-mod #88), or
+    on forks without it of kind 'simple' with neither tooltip nor author whose keyword
+    keywordsJson lacks. Row: kind | wiki
+    (|''<i>name''</i>| Type | Type |) | tooltip | author | class."""
+    found = []
+    for row in _query_rows(html):
+        if not row or row[0] not in ("plain", "simple"):
+            continue
+        wiki, tooltip, author, cls = (row[1:] + [""] * 4)[:4]
+        cells = _wiki_cells(wiki)
+        keyword = " ".join(_plain(c) for c in cells if "''" in c)
+        if not keyword or (row[0] == "simple" and (tooltip or author or _keyword_key(keyword) in known)):
+            continue
+        found.append({
+            "category": "Plain classes / " + cls.rsplit(".", 1)[-1],
+            "special": False,
+            "plain": True,
+            "keyword": keyword,
+            "parameter_types": [_plain(c) for c in cells if "''" not in c and _plain(c)],
+            "class": cls,
+        })
+    return found
+
+
+def _keywords(html: str, filter: str | None, limit: int, details: bool = False, table_html: str = "") -> dict:
     rows = _query_rows(html)
     cells = rows[0] if rows else []
     try:
@@ -3174,6 +3488,7 @@ def _keywords(html: str, filter: str | None, limit: int, details: bool = False) 
         for is_special, source in ((False, keywords), (True, special))
         for path, entry in _walk_keywords(source)
     ]
+    found += _plain_keywords(table_html, {_keyword_key(str(e.get("syntax") or "")) for e in found})
     if filter:
         needle = filter.lower()
         hits = [e for e in found if needle in json.dumps(e, ensure_ascii=False).lower()]
@@ -3506,20 +3821,65 @@ def _read_log(state: _DebugState, max_lines: int, timeout_seconds: float | None)
     return {"lines": _log_lines(lines[:max_lines]), "dropped": dropped, "more": more}
 
 
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def _is_local(url: str) -> bool:
+    return (parse.urlsplit(url).hostname or "") in _LOCAL_HOSTS
+
+
+def _grid_root(hub: str, instance: str) -> str:
+    """The Selenium Grid's address from a hub URL: without /wd/hub and the trailing /. A hub on
+    localhost is the test process's view: a KDTA instance serves its grid at <instance>/grid."""
+    root = hub.strip().rstrip("/").removesuffix("/wd/hub")
+    if root and _is_local(root) and not _is_local(instance):
+        return instance.rstrip("/") + "/grid"
+    return root
+
+
+def _browser_view(template: str | None, hub: str, session: str, instance: str) -> str | None:
+    """Where a person watches one browser: debugTest.liveViewUrl with its {session}/{hub}
+    placeholders filled in (the fork sends it raw), else the Grid UI's page of the session."""
+    if not session:
+        return None
+    root = _grid_root(hub, instance)
+    if template:
+        return template.replace("{session}", session).replace("{hub}", root)
+    return f"{root}/ui/#/session/{session}" if root else None
+
+
 def _live_view(data: dict) -> dict:
-    """An answer of action=liveView (also the liveView extra of a run)."""
-    cells = (_query_rows(data.get("html") or "") or [[]])[0]
-    try:
-        browsers = json.loads(cells[3]) if len(cells) > 3 and cells[3] else []
-    except json.JSONDecodeError:
-        browsers = cells[3]
-    return _without_secrets({
-        "hub": cells[1] if len(cells) > 1 else "",
-        "selenium_session": cells[2] if len(cells) > 2 else "",
-        "browsers": browsers,
-        "live_view_url": data.get("liveViewUrl"),
+    """An answer of action=liveView (also the liveView extra of a run): the fields of mod #163,
+    else the cells of its table (liveView | hub | session | browsers JSON)."""
+    cells = ((_query_rows(data.get("html") or "") or [[]])[0] + [""] * 4)[:4]
+    hub = data.get("hub") if isinstance(data.get("hub"), str) else cells[1]
+    session = data.get("seleniumSession") if isinstance(data.get("seleniumSession"), str) else cells[2]
+    browsers = data.get("browsers")
+    if not isinstance(browsers, list):
+        try:
+            browsers = json.loads(cells[3]) if cells[3] else []
+        except json.JSONDecodeError:
+            browsers = []
+    template = data.get("liveViewUrl") if isinstance(data.get("liveViewUrl"), str) else None
+    instance = _base_url()
+    listed = [
+        {**b, "live_view_url": _browser_view(template, str(b.get("hub") or hub), str(b.get("session") or ""), instance)}
+        for b in browsers if isinstance(b, dict)
+    ]
+    result = {
+        "hub": hub,
+        "selenium_session": session,
+        "live_view_url": _browser_view(template, hub, session, instance),
+        "browsers": listed,
         "live_view_only": data.get("liveViewOnly"),
-    })
+    }
+    if not session:
+        result["hint"] = "No remote browser in this session yet: a table opens one (usually the SetUp)."
+    elif _is_local(result["live_view_url"] or ""):
+        # only when the link itself is local: a configured liveViewUrl usually names the real host
+        result["note"] = ("The link uses the hub's address as the test process sees it (" + hub + "): "
+                          "from elsewhere it may need the host's real name instead.")
+    return _without_secrets(result)
 
 
 def _variables(html: str, include_system: bool = False) -> list[dict]:
@@ -3591,33 +3951,72 @@ def _is_suite(page_path: str) -> tuple[bool, str | None]:
     return suite, None
 
 
-def _run_whole_page(state: _DebugState, page: str, timeout_seconds: float | None) -> dict:
-    """Begin page's test (nextPage) and run all of its tables."""
-    _next_page(state, page, timeout_seconds)
-    html = _page_html(state, page, timeout_seconds)
-    data = _session_action(state, "runTable", {"html": html}, timeout_seconds=timeout_seconds)
-    return _document_result(state, data, page, include_html=False)
-
-
-def _run_suite_setup(state: _DebugState, page: str, timeout_seconds: float | None) -> dict | None:
-    """Run the SuiteSetUp (if any) once per single-page session, before the first page run, as
-    ?test does; then begin page's test again. The first page run starts the frame: from then on
-    end runs the SuiteTearDown (if any), with or without a SuiteSetUp."""
-    if state.suite or state.frame_started:
-        return None
-    state.frame_started = True  # also when the SuiteSetUp fails: a real run goes on as well
-    if not state.suite_setup:
-        return None
-    result = _run_whole_page(state, state.suite_setup, timeout_seconds)
-    _next_page(state, page, timeout_seconds)
+def _continue_page(state: _DebugState, page: str, stop_on_failure: bool, timeout_seconds: float | None) -> dict:
+    """Run the current page (page) on from next_table to its end; with stop_on_failure one table
+    at a time up to the first failing one (stopped_at, next_table), else in one go."""
+    html_page = _page_html(state, page, timeout_seconds)
+    parsed = _parse_tables(html_page)
+    parts = [html_page[t["start"]:t["end"]] for t in parsed]
+    state.table_count = len(parts)
+    chosen = list(range(state.next_table, len(parts)))
+    if not chosen:
+        state.next_table = len(parts)
+        return {"page": page, "page_done": True}
+    if stop_on_failure:
+        data, ran, failed = _run_tables_stepwise(state, parts, chosen, timeout_seconds)
+    else:
+        html = html_page if chosen[0] == 0 else "\n".join(parts[i] for i in chosen)
+        data = _session_action(state, "runTable", {"html": html}, timeout_seconds=timeout_seconds)
+        ran, failed = chosen, None
+    state.next_table = ran[-1] + 1
+    _seen_page(state, parsed, ran)
+    result = _document_result(state, data, page, include_html=False, numbers=ran)
+    if failed is None:
+        result["page_done"] = True
+    else:
+        result["stopped_at"] = _stop_details(html_page, parsed, page, failed, timeout_seconds)
+        result["next_table"] = state.next_table
+        result["_images"] = result.get("_images", []) + _failure_screenshot(data.get("html") or "")
     return result
 
 
-def _run_suite_teardown(state: _DebugState, result: dict, timeout_seconds: float | None) -> None:
-    """Before end: the page's tear down (nextPage) and the SuiteTearDown, if a page run started the
-    frame (see _run_suite_setup)."""
-    if state.suite or not state.suite_teardown or not state.frame_started:
-        return
+def _run_suite_setup(
+    state: _DebugState, page: str, stop_on_failure: bool, timeout_seconds: float | None
+) -> dict | None:
+    """Single-page session: run the SuiteSetUp (if any) before the page's test, as ?test does,
+    then begin page's test again. Like a page, it stops at its first failing table: then the
+    page's test has not begun (suite_setup_pending), and the next run of the page continues the
+    SuiteSetUp first. Returns the SuiteSetUp's result when this call ran some of it.
+    The first page run starts the frame: from then on end runs the SuiteTearDown (if any), with
+    or without a SuiteSetUp."""
+    if state.suite:
+        return None
+    if not state.frame_started:
+        state.frame_started = True
+        if not state.suite_setup:
+            return None
+        _next_page(state, state.suite_setup, timeout_seconds)
+        state.suite_setup_pending = True
+    if not state.suite_setup_pending or page == state.suite_setup:
+        return None  # run_page on the SuiteSetUp itself works on it as on any page
+    result = _continue_page(state, state.suite_setup, stop_on_failure, timeout_seconds)
+    if "stopped_at" not in result:
+        state.suite_setup_pending = False
+        _next_page(state, page, timeout_seconds)
+    return result
+
+
+def _has_suite_teardown(state: _DebugState) -> bool:
+    """Single-page session with a SuiteTearDown, after a page run started the frame (see
+    _run_suite_setup): end runs the SuiteTearDown."""
+    return not state.suite and bool(state.suite_teardown) and state.frame_started
+
+
+def _run_suite_teardown(state: _DebugState, result: dict, timeout_seconds: float | None) -> bool:
+    """Before end: the page's TearDown (_end_test), its storytest's end (nextPage) and the
+    SuiteTearDown, if _has_suite_teardown. Whether it ran."""
+    if not _has_suite_teardown(state):
+        return False
     try:
         result["teardown"] = _next_page(state, state.suite_teardown, timeout_seconds)
         result["teardown"]["page"] = result["teardown"].pop("teardown_of")
@@ -3626,15 +4025,21 @@ def _run_suite_teardown(state: _DebugState, result: dict, timeout_seconds: float
         result["suite_teardown"] = _document_result(state, data, state.suite_teardown, include_html=False)
     except ToolError as exc:
         result["suite_teardown_error"] = str(exc)
+    return True
 
 
 def _run_document(
-    state: _DebugState, page: str | None, restart: bool, timeout_seconds: float | None, run
+    state: _DebugState, page: str | None, restart: bool, timeout_seconds: float | None, run,
+    skip_teardown: bool = False,
 ) -> dict:
-    """Begin page's storytest if needed (nextPage), then run(); report the previous tear down."""
+    """Begin page's storytest if needed (nextPage, after the current page's TearDown), then run();
+    report how the previous test ended."""
     teardown = None
     if (page and page != state.current_page) or restart:
-        teardown = _next_page(state, page, timeout_seconds)
+        try:
+            teardown = _next_page(state, page, timeout_seconds, skip_teardown)
+        except _TearDownFailed as exc:
+            raise ToolError(f"{exc} To go on without it, call this again with skip_teardown=true.") from exc
     result = run()
     if teardown is not None:
         result["previous_page_teardown"] = teardown
@@ -3660,8 +4065,11 @@ if DEBUG_TOOLSET:
             "actions, the browser and often fixtures only exist once it has run.\n"
             "One session per page and FitNesse account (forks before mod #159: one per account). If "
             "one is already running on this page (possibly a person working in the browser), this "
-            "fails and says so: then continue it with fitnesse_debug_status(adopt=true, session=...) "
-            "or end it. Sessions on other pages are not affected. This server works with one session "
+            + ("fails and says so: then continue it with fitnesse_debug_status(adopt=true, session=...) "
+               "or end it. " if ALLOW_ADOPT else
+               "fails and says so: then use another page or wait for it to end; this server does not take "
+               "over sessions it did not start. ")
+            + "Sessions on other pages are not affected. This server works with one session "
             "at a time: end its own before starting another. Use replace=true only when told to: it "
             "kills the running session without tear down, and a browser tab on it then shows 'replaced'.\n"
             "The result says suite (true/false) and lists 'pages' in run order, each with path, kind "
@@ -3702,17 +4110,19 @@ if DEBUG_TOOLSET:
                 raise ToolError(
                     f"A debug session started by {owner} is already running (page "
                     f"{status.get('page')}, current page {status.get('currentPage')}, started "
-                    f"{status.get('startedAt')}); this FitNesse allows one per account. Continue it with "
-                    "fitnesse_debug_status(adopt=true), end it with fitnesse_debug_end, or pass "
-                    "replace=true to kill it without tear down."
+                    f"{status.get('startedAt')}); this FitNesse allows one per account. "
+                    + ("Continue it with fitnesse_debug_status(adopt=true), end it with fitnesse_debug_end, "
+                       "or pass replace=true to kill it without tear down."
+                       if owner == "this MCP server" else _foreign_session_advice(None))
                 )
             state.reset()
+            state.steps, state.step_count = [], 0
             data = _debug_post(
                 "debugTest", page_path, "start", {"suite": True if suite else None},
                 timeout_seconds=timeout_seconds, state=state,
             )
             state.session = str(data.get("session"))
-            state.page = data.get("page") or page_path
+            state.page = _page_key(data.get("page")) or _page_key(page_path)
             state.current_page = state.page
             state.suite = suite
         data["suite"] = suite
@@ -3742,7 +4152,11 @@ if DEBUG_TOOLSET:
                 data["pages_error"] = str(exc)
         return data
 
-    @mcp.tool(
+    _SKIP_TEARDOWN = Annotated[bool, Field(description=(
+        "When this call ends the current page's test: leave out its TearDown tables that have not "
+        "run yet (normally run first), e.g. to look at the data a stop left behind."))]
+
+    _STATUS_TOOL = dict(
         name="fitnesse_debug_status",
         description=(
             "Shows the debug session of this FitNesse account and the new lines of the test process "
@@ -3757,19 +4171,19 @@ if DEBUG_TOOLSET:
             "busy=true means the process is still working on a call that timed out: wait and call "
             "this again until busy is false, or abort with fitnesse_debug_end(abort=true).\n"
             "known_to_this_server=false with running=true means someone else's session (or one from "
-            "before a restart): the other debug tools refuse to touch it until you call this with "
-            "adopt=true (with several sessions: plus session=<id> from 'sessions'). Only adopt a "
-            "session you are meant to continue."
+            "before a restart): the other debug tools refuse to touch it"
+            + (" until you call this with adopt=true (with several sessions: plus session=<id> from "
+               "'sessions'). Only adopt a session you are meant to continue." if ALLOW_ADOPT else
+               ", and this server does not take it over: leave it alone; it ends itself after its idle time.")
         ),
         tags={"fitnesse", "debug", "read"},
         annotations={"readOnlyHint": True},
     )
-    def fitnesse_debug_status(
-        adopt: Annotated[bool, Field(description="Continue the running session of this account with this server's debug tools.")] = False,
-        session: Annotated[str | None, Field(description="With adopt, when several sessions run: the id of the one to continue, from 'sessions'.")] = None,
-        page_path: Annotated[str | None, Field(description="Rarely needed: page used for the permission check; defaults to the session's page, else FrontPage.")] = None,
-        max_log_lines: Annotated[int, Field(description="Maximum number of new log lines to return; the rest follow on the next call. 0 for none.", ge=0)] = 50,
-        timeout_seconds: float = _make_timeout(30.0),
+    _STATUS_PAGE = Annotated[str | None, Field(description="Rarely needed: page used for the permission check; defaults to the session's page, else FrontPage.")]
+    _STATUS_LOG = Annotated[int, Field(description="Maximum number of new log lines to return; the rest follow on the next call. 0 for none.", ge=0)]
+
+    def _debug_status(
+        adopt: bool, session: str | None, page_path: str | None, max_log_lines: int, timeout_seconds: float
     ) -> dict:
         """status (and log) via responder=debugTest."""
         state = _debug_state()
@@ -3785,16 +4199,42 @@ if DEBUG_TOOLSET:
             if chosen is not None:
                 state.reset()
                 state.session = str(chosen.get("session"))
-                state.page = chosen.get("page")
-                state.current_page = chosen.get("currentPage") or state.page
+                state.page = _page_key(chosen.get("page"))
+                state.current_page = _page_key(chosen.get("currentPage")) or state.page
                 state.suite = bool(chosen.get("suite"))
                 known = True
         elif state.session and not known:
             state.reset()
         result = {**status, "known_to_this_server": known}
+        if known and state.table_count is not None:  # where run_page continues the current page
+            result["next_table"] = state.next_table
         if known and max_log_lines:
             result["log"] = _read_log(state, max_log_lines, timeout_seconds)
         return result
+
+    if ALLOW_ADOPT:
+
+        @mcp.tool(**_STATUS_TOOL)
+        def fitnesse_debug_status(
+            adopt: Annotated[bool, Field(description="Continue the running session of this account with this server's debug tools.")] = False,
+            session: Annotated[str | None, Field(description="With adopt, when several sessions run: the id of the one to continue, from 'sessions'.")] = None,
+            page_path: _STATUS_PAGE = None,
+            max_log_lines: _STATUS_LOG = 50,
+            timeout_seconds: float = _make_timeout(30.0),
+        ) -> dict:
+            """status (and log) via responder=debugTest; adopt takes over a running session."""
+            return _debug_status(adopt, session, page_path, max_log_lines, timeout_seconds)
+
+    else:
+
+        @mcp.tool(**_STATUS_TOOL)
+        def fitnesse_debug_status(
+            page_path: _STATUS_PAGE = None,
+            max_log_lines: _STATUS_LOG = 50,
+            timeout_seconds: float = _make_timeout(30.0),
+        ) -> dict:
+            """status (and log) via responder=debugTest."""
+            return _debug_status(False, None, page_path, max_log_lines, timeout_seconds)
 
     @mcp.tool(
         name="fitnesse_debug_run_wiki",
@@ -3822,8 +4262,9 @@ if DEBUG_TOOLSET:
             "element's visibility) before the next step.\n"
             "Find the available keywords and their exact wording with "
             "fitnesse_debug_inspect(kind='keywords') before writing tables.\n"
-            "restart=true first ends the running test (its tear down runs, result in "
-            "previous_page_teardown) and begins it afresh: use it for a clean state."
+            "restart=true first ends the running test (its TearDown tables that have not run yet run,"
+            " unless skip_teardown=true; result in previous_page_teardown) and begins it afresh: use "
+            "it for a clean state."
         ),
         tags={"fitnesse", "debug", "execute"},
         annotations={"destructiveHint": False},
@@ -3831,6 +4272,8 @@ if DEBUG_TOOLSET:
     def fitnesse_debug_run_wiki(
         wiki: Annotated[str, Field(description="Wiki markup: one or more tables of '|cell|cell|' rows, tables separated by an empty line.")],
         restart: Annotated[bool, Field(description="First end the running test (tear down) and begin it afresh, for a clean state.")] = False,
+        skip_teardown: _SKIP_TEARDOWN = False,
+        record: Annotated[bool, Field(description="Note the wiki as a step when all its tables pass (step in the result; fitnesse_debug_steps lists them for saving). false for tables that only look around and don't belong in the test.")] = True,
         include_html: Annotated[bool, Field(description="Also return the raw result HTML (large; normally not needed).")] = False,
         with_variables: Annotated[bool, Field(description="Also return the dynamic variables after the run (as fitnesse_debug_inspect(kind='dynamicVariables')), in the same call.")] = False,
         with_live_view: Annotated[bool, Field(description="Also return the live view after the run (as fitnesse_debug_inspect(kind='liveView')), in the same call.")] = False,
@@ -3842,10 +4285,46 @@ if DEBUG_TOOLSET:
             data = _session_action(state, "runWiki", _run_form({"wiki": wiki}, with_variables, with_live_view),
                                    timeout_seconds=timeout_seconds)
             result = _with_setup_hint(state, _document_result(state, data, state.current_page, include_html), timeout_seconds)
+            if record and _all_passed(data):
+                state.step_count += 1
+                state.steps.append({"step": state.step_count, "page": state.current_page, "wiki": wiki.strip("\n") + "\n"})
+                result["step"] = state.step_count
             return _with_extras(state, data, result, with_variables, with_live_view, timeout_seconds)
 
         with _document(state):
-            return _with_images(_run_document(state, None, restart, timeout_seconds, run))
+            return _with_images(_run_document(state, None, restart, timeout_seconds, run, skip_teardown))
+
+    @mcp.tool(
+        name="fitnesse_debug_steps",
+        description=(
+            "Lists the steps noted while building a test: every fitnesse_debug_run_wiki call whose "
+            "tables all passed (unless run with record=false), in order: step, page (current page "
+            "then), wiki. 'wiki' joins the kept steps, ready to save as the test's tables with "
+            "fitnesse_table_insert or fitnesse_table_save_text (read fitnesse_table_source first). "
+            "drop leaves steps out for good (e.g. tries that don't belong in the test), clear=true "
+            "forgets all, e.g. after saving. Kept after fitnesse_debug_end; a new "
+            "fitnesse_debug_start clears them."
+        ),
+        tags={"fitnesse", "debug", "read"},
+        annotations={"readOnlyHint": False, "destructiveHint": False},
+    )
+    def fitnesse_debug_steps(
+        drop: Annotated[list[int] | None, Field(description="Numbers of steps to forget.")] = None,
+        clear: Annotated[bool, Field(description="Forget all steps (after returning them).")] = False,
+    ) -> dict:
+        """The steps noted in this server's memory; no request to FitNesse."""
+        state = _debug_state()  # no session lock: it is held while a table runs
+        if drop:
+            state.steps = [s for s in state.steps if s["step"] not in set(drop)]
+        steps = list(state.steps)
+        if clear:
+            state.steps = []
+        result: dict = {"steps": steps, "wiki": "\n".join(s["wiki"] for s in steps)}
+        if not steps:
+            result["hint"] = "No steps noted: fitnesse_debug_run_wiki notes the calls whose tables all pass."
+        elif clear:
+            result["cleared"] = True
+        return result
 
     @mcp.tool(
         name="fitnesse_debug_page_tables",
@@ -3853,7 +4332,8 @@ if DEBUG_TOOLSET:
             "Lists the tables that running a page executes, in order, including those of its "
             "SetUp/TearDown and included pages: index, number of rows and the first row. Use the "
             "indices to run only some of them with fitnesse_debug_run_page(tables=[...]); setup_tables "
-            "are those of the SetUp (what run_page(setup_only=true) runs). These indices "
+            "are those of the SetUp (what run_page(setup_only=true) runs), teardown_tables those of the "
+            "TearDown (run when the test ends, if they have not run). These indices "
             "differ from fitnesse_table_source's, which counts only the page's own tables: to edit a "
             "table, use its source_page and source_index with the fitnesse_table_* tools. A table of an"
             " included page (included=true, e.g. SetUp) is edited on that page, which changes it for "
@@ -3869,96 +4349,221 @@ if DEBUG_TOOLSET:
     ) -> dict:
         """pageHtml via responder=debugTest, split into top-level tables."""
         state = _require_session()
-        page = page_path or state.current_page or state.page
+        page = _page_key(page_path) or state.current_page or state.page
         tables = []
-        own: dict[str, int] = {}
         parsed = _parse_tables(_page_html(state, page, timeout_seconds))
-        for i, table in enumerate(parsed):
+        for i, (table, (source_page, source_index)) in enumerate(zip(parsed, _table_sources(parsed, page))):
             first = " | ".join(_squash(c["text"], 200) for c in (table["rows"][0] if table["rows"] else []))
-            source_page = table["include"] or page
-            source_index = own[source_page] = own.get(source_page, -1) + 1
             entry = {"index": i, "rows": len(table["rows"]), "first_row": first,
                      "source_page": source_page, "source_index": source_index}
             if table["include"]:
                 entry["included"] = True
             tables.append(entry)
-        return {"page": page, "setup_tables": _setup_indices(parsed), "tables": tables}
+        return {"page": page, "setup_tables": _setup_indices(parsed), "teardown_tables": _teardown_indices(parsed),
+                "tables": tables}
+
+    @mcp.tool(
+        name="fitnesse_debug_read_link",
+        description=(
+            "Reads a file a debug result links to, such as the screenshot ('Screen', "
+            "/files/screenCaptures/...) or the page source at the failure ('HTML', "
+            "/files/htmlSource/...) that KDTA links from a table. An image comes back as image "
+            "content. HTML and text: scripts, styles and comments are left out and whitespace is "
+            "squeezed; with filter only the places that contain it (context_chars around each), to "
+            "check a locator against the page as it was (an id, a class, a visible text); without "
+            "filter the beginning (max_chars) and the length. Only links into this FitNesse's files "
+            "section; needs no session."
+        ),
+        tags={"fitnesse", "debug", "read"},
+        annotations={"readOnlyHint": True},
+    )
+    def fitnesse_debug_read_link(
+        url: Annotated[str, Field(description="The /files/... link from a debug result, e.g. '/files/htmlSource/2026/11/07/03_06_12_683.html'.")],
+        filter: Annotated[str | None, Field(description="HTML/text only: return only the places that contain this text (case-insensitive), e.g. 'v-detail-model-value'.")] = None,
+        context_chars: Annotated[int, Field(description="With filter: characters shown before and after each place.", ge=0, le=5000)] = 300,
+        max_matches: Annotated[int, Field(description="With filter: maximum number of places returned.", ge=1)] = 20,
+        max_chars: Annotated[int, Field(description="Without filter: maximum number of characters returned from the start.", ge=500)] = 20000,
+        timeout_seconds: float = _make_timeout(60.0),
+    ) -> dict | ToolResult:
+        """GET /files/... (Basic Auth as for every request)."""
+        path = _files_link(url)
+        got = _request_bytes("GET", path, timeout_seconds=timeout_seconds)
+        if not got.get("ok"):
+            raise ToolError(f"Could not read {path}: HTTP {got.get('status')} {got.get('error') or ''}".strip()
+                            + ". Files from older runs may have been cleaned up.")
+        body: bytes = got["body"]
+        fmt = _image_format(path) or (got.get("content_type", "").split("/", 1)[1].split(";")[0]
+                                      if got.get("content_type", "").startswith("image/") else None)
+        if fmt:
+            if got.get("truncated"):
+                raise ToolError(f"{path} is larger than FITNESSE_FILES_MAX_TRANSFER_BYTES.")
+            meta = {"link": path, "format": fmt, "bytes": len(body)}
+            return ToolResult(
+                content=[TextContent(type="text", text=json.dumps(meta)), Image(data=body, format=fmt).to_image_content()],
+                structured_content=meta,
+            )
+        text = _link_text(body, got.get("content_type", ""))
+        result: dict = {"link": path, "length": len(text)}
+        if got.get("truncated"):
+            result["truncated"] = True  # only the start of the file was read
+        if filter:
+            places, snippets = _snippets(text, filter, context_chars, max_matches)
+            result.update({"filter": filter, "places": places, "snippets": snippets})
+            if not places:
+                result["hint"] = "Not found: the element was not on the page then, or try a shorter or other text."
+            return result
+        result["text"] = text[:max_chars]
+        if len(text) > max_chars:
+            result["cut"] = len(text) - max_chars
+            result["hint"] = "Pass filter (an id, a class, a text) to see the places you need."
+        return result
 
     @mcp.tool(
         name="fitnesse_debug_run_page",
         description=(
             "Runs the tables of a test page in the debug session, exactly as a normal test run would "
-            "send them (SetUp, TearDown and included pages included): all of them, or only the "
-            "indices given in 'tables' (see fitnesse_debug_page_tables), in the order given. Result "
-            "as for fitnesse_debug_run_wiki.\n"
+            "send them (SetUp, TearDown and included pages included), and stops after the first "
+            "table with a [fail] or [error] cell, like a debugger: the rest of the page, its TearDown "
+            "included, has not run, so the browser and state are as the failure left them. The result"
+            " then has stopped_at (index, source_page, source_index, text_before: the page text "
+            "just before the table, wiki: the table's wiki to change) and next_table. Like the console "
+            "in the browser debugger, try corrected versions of the table with "
+            "fitnesse_debug_run_wiki (runs in the session, saves nothing) until one passes, save "
+            "that one once (fitnesse_table_save on source_page/source_index). If no version passes "
+            "(e.g. the application is wrong, not the test), report that instead. Either way, then "
+            "call this again without tables to continue at next_table. page_done=true: all tables "
+            "ran. When it stops, the failing table's screenshot (KDTA's 'Screen' link) comes as an "
+            "image; read its 'HTML' link, the page source then, with "
+            "fitnesse_debug_read_link(url, filter=...). Result tables as for fitnesse_debug_run_wiki.\n"
+            "tables=[...] runs only those indices (see fitnesse_debug_page_tables), in that order, "
+            "and does not move next_table. from_table continues the page at that index instead.\n"
             "If page_path is not the page currently being tested, the current page's test is ended "
-            "first (its tear-down result comes back as previous_page_teardown) and the new page's "
-            "test begins. Calling it again for the same page continues that page's test, so you can "
-            "run its tables in several steps; restart=true begins it afresh.\n"
+            "first: its TearDown tables that have not run yet (e.g. after a stop) run now, unless "
+            "skip_teardown=true. previous_page_teardown reports that end (teardown_tables, and "
+            "tables_not_run if it had stopped). Then the new page's test begins; restart=true ends "
+            "and begins the current page's test the same way.\n"
             "setup_only=true runs just the SetUp (the tables of the included SetUp page): do this "
             "right after fitnesse_debug_start, before fitnesse_debug_run_wiki or inspect. Outside a suite "
-            "session the first call runs the SuiteSetUp before (result suite_setup), once per session. A later call "
-            "without tables then leaves the SetUp out (skipped_setup lists its indices) instead of "
-            "running it twice; restart=true or another page runs it again.\n"
-            "only_failures=true still runs the tables as usual and returns only those with a [fail] "
-            "or [error] cell, for long pages.\n"
+            "session the first call runs the SuiteSetUp before (result suite_setup), once per "
+            "session; it stops at a failure as well, and the page's test begins only once it ran "
+            "to the end. A later call without tables then leaves the SetUp out "
+            "(skipped_setup lists its indices) instead of running it twice.\n"
             "In a suite session, call it for each page with runnable=true from fitnesse_debug_start's"
-            " 'pages', in that order."
+            " 'pages', in that order, and move on once page_done is true."
         ),
         tags={"fitnesse", "debug", "execute"},
         annotations={"destructiveHint": False},
     )
     def fitnesse_debug_run_page(
         page_path: DebugPath = None,
-        tables: Annotated[list[int] | None, Field(description="Indices from fitnesse_debug_page_tables to run, in this order (the result numbers the tables the same way); omit to run the whole page. Including all setup_tables counts as running the SetUp.")] = None,
+        tables: Annotated[list[int] | None, Field(description="Indices from fitnesse_debug_page_tables to run, in this order (the result numbers the tables the same way); omit to run (or continue) the whole page. Including all setup_tables counts as running the SetUp.")] = None,
         restart: Annotated[bool, Field(description="Begin the page's test afresh even if it is already the current page.")] = False,
+        skip_teardown: _SKIP_TEARDOWN = False,
         setup_only: Annotated[bool, Field(description="Run only the SetUp tables (setup_tables of fitnesse_debug_page_tables). Not together with tables.")] = False,
-        only_failures: Annotated[bool, Field(description="Return only the tables with a [fail] or [error] cell (counts as usual; tables_without_failures says how many were left out). For long pages where you look for what went wrong.")] = False,
+        from_table: Annotated[int | None, Field(description="Continue the page at this index instead of next_table, e.g. after tables before it were inserted or deleted. Not together with tables or setup_only.", ge=0)] = None,
+        stop_on_failure: Annotated[bool, Field(description="Stop after the first table with a [fail] or [error] cell. false runs all chosen tables in one go.")] = True,
+        only_failures: Annotated[bool, Field(description="Return only the tables with a [fail] or [error] cell (counts as usual; tables_without_failures says how many were left out). For long runs with stop_on_failure=false.")] = False,
         include_html: Annotated[bool, Field(description="Also return the raw result HTML (large; normally not needed).")] = False,
         with_variables: Annotated[bool, Field(description="Also return the dynamic variables after the run (as fitnesse_debug_inspect(kind='dynamicVariables')), in the same call.")] = False,
         with_live_view: Annotated[bool, Field(description="Also return the live view after the run (as fitnesse_debug_inspect(kind='liveView')), in the same call.")] = False,
         timeout_seconds: float | None = Depends(lambda: DEBUG_TIMEOUT_SECONDS),
     ) -> dict:
-        """(nextPage +) pageHtml + runTable via responder=debugTest."""
+        """(nextPage +) pageHtml + runTable (one per table until a failure) via responder=debugTest."""
         if setup_only and tables is not None:
             raise ToolError("Pass either setup_only=true or tables, not both.")
+        if from_table is not None and (setup_only or tables is not None):
+            raise ToolError("from_table continues the whole page: pass it without tables and setup_only.")
         state = _require_session()
-        page = page_path or state.current_page or state.page
+        current = state.current_page
+        if not state.suite and current and current == state.suite_setup:
+            current = state.page  # single page: the SuiteSetUp only leads to the page
+        page = _page_key(page_path) or current or state.page
 
         def run() -> dict:
-            html = html_page = _page_html(state, page, timeout_seconds)
-            chosen = tables
+            html_page = _page_html(state, page, timeout_seconds)
+            parsed = _parse_tables(html_page)
+            parts = [html_page[t["start"]:t["end"]] for t in parsed]
+            whole = tables is None and not setup_only
+            if whole:
+                state.table_count = len(parts)
             skipped: list[int] = []
             if setup_only:
-                chosen = _setup_indices(_parse_tables(html))
+                chosen = _setup_indices(parsed)
                 if not chosen:
                     return {"page": page, "setup_tables": [], "hint": "The page has no SetUp tables; nothing was run."}
-            elif tables is None and state.setup_ran == page:  # SetUp already ran in this test
-                parsed = _parse_tables(html)
-                skipped = _setup_indices(parsed)
-                chosen = [i for i in range(len(parsed)) if i not in skipped]
-                if not chosen:
-                    return {"page": page, "skipped_setup": skipped, "hint": "Only SetUp tables, which already ran; nothing was run."}
-            if chosen is not None:
-                parts = _split_tables(html)
-                bad = [i for i in chosen if not 0 <= i < len(parts)]
+            elif tables is not None:
+                bad = [i for i in tables if not 0 <= i < len(parts)]
                 if bad:
                     raise ToolError(f"Table indices {bad} out of range: the page has {len(parts)} tables.")
-                html = "\n".join(parts[i] for i in chosen)
-            data = _session_action(state, "runTable", _run_form({"html": html}, with_variables, with_live_view),
-                                   timeout_seconds=timeout_seconds)
-            if setup_only or (tables is not None and _covers_setup(html_page, tables)):
+                chosen = list(tables)
+            else:
+                first = state.next_table if from_table is None else from_table
+                if first > len(parts):
+                    raise ToolError(f"from_table {first} out of range: the page has {len(parts)} tables.")
+                if state.setup_ran == page:  # SetUp already ran in this test
+                    skipped = [i for i in _setup_indices(parsed) if i >= first]
+                chosen = [i for i in range(first, len(parts)) if i not in skipped]
+                if not chosen:
+                    state.next_table = len(parts)
+                    result = {"page": page, "page_done": True, "hint": (
+                        "All tables of this page have run. Go on with the next page (suite), "
+                        "restart=true to run it again, or fitnesse_debug_end.")}
+                    return {**result, "skipped_setup": skipped} if skipped else result
+            if stop_on_failure:
+                data, ran, failed = _run_tables_stepwise(state, parts, chosen, timeout_seconds)
+            else:
+                html = "\n".join(parts[i] for i in chosen) if chosen != list(range(len(parts))) else html_page
+                data = _session_action(state, "runTable", _run_form({"html": html}, with_variables, with_live_view),
+                                       timeout_seconds=timeout_seconds)
+                ran, failed = chosen, None
+            complete = failed is None or failed == chosen[-1]
+            _seen_page(state, parsed, ran)
+            if (setup_only and complete) or (tables is not None and _covers_setup(html_page, ran)):
                 state.setup_ran = page  # SetUp ran in this test: a later whole-page run skips it
-            if state.setup_ran == page or tables is None:
+            if state.setup_ran == page or whole:
                 state.setup_seen = page
-            result = _document_result(state, data, page, include_html, only_failures, chosen)
+            if whole:
+                state.next_table = ran[-1] + 1
+            elif setup_only and failed is not None:  # continue after it, through the rest of the SetUp
+                state.next_table, state.table_count = failed + 1, len(parts)
+            result = _document_result(state, data, page, include_html, only_failures, ran)
             if skipped:
                 result["skipped_setup"] = skipped
+            if failed is not None:
+                result["stopped_at"] = _stop_details(html_page, parsed, page, failed, timeout_seconds)
+                if stop_on_failure:  # the failing table is the last: its screenshot, as an image
+                    result["_images"] = result.get("_images", []) + _failure_screenshot(data.get("html") or "")
+                rest = len(chosen) - len(ran)
+                if whole or setup_only:
+                    result["next_table"] = state.next_table
+                    result["hint"] = (
+                        f"Stopped after table {failed} failed; the rest of the page (TearDown included) "
+                        "has not run. Try corrected versions of stopped_at.wiki with "
+                        "fitnesse_debug_run_wiki (saves nothing) "
+                        "until one passes and save that one once with fitnesse_table_save (stopped_at's "
+                        "source_page/source_index), or report that there is no fix; then call this "
+                        f"without tables to continue at table {state.next_table}.")
+                elif rest:
+                    result["tables_not_run"] = chosen[len(ran):]
+            elif whole:
+                result["page_done"] = True
             return _with_extras(state, data, result, with_variables, with_live_view, timeout_seconds)
 
         with _document(state):
-            suite_setup = _run_suite_setup(state, page, timeout_seconds)
-            result = _run_document(state, page, restart and suite_setup is None, timeout_seconds, run)
+            suite_setup = _run_suite_setup(state, page, stop_on_failure, timeout_seconds)
+            if suite_setup is not None and "stopped_at" in suite_setup:
+                failed, setup_page = suite_setup["stopped_at"]["index"], state.suite_setup
+                return _with_images({"page": page, "suite_setup": suite_setup, "hint": (
+                    f"The SuiteSetUp {setup_page} stopped after its table {failed} failed; the test of "
+                    f"{page} has not begun. Try corrected versions of stopped_at.wiki with "
+                    "fitnesse_debug_run_wiki (saves "
+                    "nothing) until one passes and save that one once with fitnesse_table_save "
+                    "(stopped_at's source_page/source_index), or report that there is no fix; then "
+                    "call this again: it continues the "
+                    f"SuiteSetUp at table {suite_setup['next_table']}, then runs {page}.")})
+            result = _run_document(state, page, restart and suite_setup is None, timeout_seconds, run, skip_teardown)
+            if page == state.suite_setup and result.get("page_done"):
+                state.suite_setup_pending = False
             if suite_setup is not None:
                 result = {"suite_setup": suite_setup, **result}
             return _with_images(result)
@@ -3973,7 +4578,11 @@ if DEBUG_TOOLSET:
             "matching entries: syntax, where %1, %2 are the cells for parameters (e.g. 'click %1' -> "
             "'|click|//button|'), parameters (label, allowed options), returnType and tableItems (the "
             "rows a keyword expects in the rest of its table; mandatory=true marks required rows). "
-            "details=true adds the help texts. Defined actions are not in it: see 'definedActions'.\n"
+            "details=true adds the help texts. plain=true marks a public method of a class without "
+            "keyword annotations (keyword, parameter_types, class; category 'Plain classes / <class>'): "
+            "keyword and argument cells alternate, with several arguments its words spread over the "
+            "keyword cells (|order exists|4711|, |user|fred|creates room|lotr|). Defined actions are "
+            "not in it: see 'definedActions'.\n"
             "- 'definedActions': the defined actions loaded in this session by |define actions at| "
             "(usually from SetUp): action (call syntax, parameters as cells), parameters, note, "
             "deprecated, author, page (where it is defined; edit it with "
@@ -3984,8 +4593,9 @@ if DEBUG_TOOLSET:
             "the many unchanged Java system properties.\n"
             "- 'scope': the objects whose keywords are available, innermost first (level, name, "
             "class, depth).\n"
-            "- 'liveView': the Selenium grid session of the open browser and live_view_url, a link "
-            "where a person can watch the browser (password not included)."
+            "- 'liveView': the open remote browsers (hub, selenium_session, browsers) and "
+            "live_view_url, a link where a person can watch the selected browser (per browser in "
+            "'browsers'; password not included). A 'note' says when the link is on localhost."
         ),
         tags={"fitnesse", "debug", "read"},
         annotations={"destructiveHint": False},
@@ -4007,11 +4617,17 @@ if DEBUG_TOOLSET:
             hits = [a for a in actions if _matches_action(json.dumps(a, ensure_ascii=False), filter)]
             return {"count": len(actions), "matches": len(hits), "definedActions": hits[:limit]}
         action = {"keywords": "keywordsJson"}.get(kind, kind)
+        table = ""
         with _document(state):
             data = _session_action(state, action, timeout_seconds=timeout_seconds)
+            if kind == "keywords":  # methods of classes without annotations are only in this table
+                try:
+                    table = _session_action(state, "keywords", timeout_seconds=timeout_seconds).get("html") or ""
+                except ToolError as exc:
+                    logger.info("keywords table not read, plain classes left out: %s", exc)
         html = data.get("html") or ""
         if kind == "keywords":
-            return _keywords(html, filter, limit, details)
+            return _keywords(html, filter, limit, details, table)
         if kind == "liveView":
             return _live_view(data)
         if kind == "dynamicVariables":
@@ -4021,8 +4637,10 @@ if DEBUG_TOOLSET:
     @mcp.tool(
         name="fitnesse_debug_end",
         description=(
-            "Ends the debug session: the running test's tear down (and the SuiteTearDown, if "
-            "fitnesse_debug_run_page ran: suite_teardown) run, then the test process stops. Returns the tear-down result, the remaining log "
+            "Ends the debug session as a normal test run ends: first the current page's TearDown "
+            "tables that have not run yet (e.g. after a stop; teardown.teardown_tables) and, outside a "
+            "suite session once fitnesse_debug_run_page ran, the SuiteTearDown (suite_teardown); then "
+            "the test process stops. skip_teardown=true leaves both out. Returns the tear-down result, the remaining log "
             "lines (the last max_log_lines of them; log_omitted counts the others: to read the whole "
             "log, call fitnesse_debug_status before ending) and page_totals (counts per page). Call it "
             "whenever you are done.\n"
@@ -4034,15 +4652,23 @@ if DEBUG_TOOLSET:
     )
     def fitnesse_debug_end(
         abort: Annotated[bool, Field(description="Stop immediately without tear down, even while a call is running.")] = False,
+        skip_teardown: Annotated[bool, Field(description="Leave out the TearDown tables that have not run yet and the SuiteTearDown, e.g. to keep the data a stop left behind; the process still ends.")] = False,
         max_log_lines: Annotated[int, Field(description="Maximum number of unread log lines to return, the last ones. 0 for none.", ge=0)] = 30,
         timeout_seconds: float | None = Depends(lambda: DEBUG_TIMEOUT_SECONDS),
     ) -> dict:
         """end/abort via responder=debugTest."""
         state = _require_session()
         frame: dict = {}
+        before: dict = {}  # the current page's TearDown, when no SuiteTearDown frame ended it
         if not abort:
             with _document(state):
-                _run_suite_teardown(state, frame, timeout_seconds)
+                if skip_teardown and _has_suite_teardown(state):
+                    frame["suite_teardown_skipped"] = state.suite_teardown
+                if skip_teardown or not _run_suite_teardown(state, frame, timeout_seconds):
+                    try:
+                        before = _end_test(state, skip_teardown, timeout_seconds)
+                    except _TearDownFailed as exc:
+                        before = {"teardown_error": str(exc)}
         total = _log_lines_total(state, 10.0)
         # logMax (mod #162) lets FitNesse cut the log itself; older forks ignore it
         form = {"logFrom": _log_from(total, state.log_next, max_log_lines), "logMax": max_log_lines or None}
@@ -4054,9 +4680,11 @@ if DEBUG_TOOLSET:
                 data = _session_action(state, "end", form, timeout_seconds=timeout_seconds)
             result = {"ended": data.get("ended", True)}
             ended = _document_result(state, data, state.current_page, include_html=False)
+            result.update(frame)
             if "suite_teardown" in frame:
                 frame["suite_teardown"]["end"] = ended  # the SuiteTearDown's own storytest end
-            result.update(frame or {"teardown": ended})
+            elif "teardown" not in frame:
+                result["teardown"] = {**ended, **before}
         log = data.get("log")
         lines = _log_lines(log.get("lines")) if isinstance(log, dict) else []
         kept = lines[len(lines) - max_log_lines:] if max_log_lines else []
@@ -4308,9 +4936,9 @@ for _mode in set(MODES) - FITNESSE_TOOLSETS:
 # Sent to the client at initialize; agents see it, the README they do not.
 DEBUG_INSTRUCTIONS = """\
 KDTA debug tools - how they depend on each other:
-- Session first: fitnesse_debug_start (or fitnesse_debug_status(adopt=true) for a running \
-session) must succeed before fitnesse_debug_run_wiki, _run_page, _page_tables, _inspect, \
-_defined_action_source and _end work. fitnesse_debug_status without adopt and the fitnesse_table_* tools need no session.
+- Session first: fitnesse_debug_start{adopt_start} must succeed before fitnesse_debug_run_wiki, \
+_run_page, _page_tables, _inspect, _defined_action_source and _end work. fitnesse_debug_status\
+{adopt_status} and the fitnesse_table_* tools need no session.{adopt_none}
 - Typical flow: start -> run_page(setup_only=true) -> inspect(kind='keywords' / 'definedActions') \
 -> run_wiki / run_page, repeatedly -> end. Run the SetUp first: defined actions, the browser and \
 often fixtures come from it, so without it inspect shows no defined actions and run_wiki fails. \
@@ -4318,17 +4946,35 @@ Always call fitnesse_debug_end when done; the session holds server resources.
 - Write run_wiki tables with the exact keyword wording from inspect(kind='keywords'). Defined \
 actions are listed separately by inspect(kind='definedActions'), once the page's |define actions \
 at| tables (usually in SetUp) have run in the session.
+- run_page stops after the first table with a [fail] or [error] cell (stopped_at with the \
+table's wiki and the page text before it; next_table), \
+before the rest of the page and its TearDown. Find the cause with inspect, try corrected \
+versions of the table with run_wiki (saves nothing, like the console in the browser) \
+until one passes and save that one once with the table edit tools, or report that there is no \
+fix; then run_page() continues at next_table. Go on to the next page only when page_done is true. \
+The failing table's screenshot comes with the stop as an image; its 'HTML' link (the page source \
+then) is read with fitnesse_debug_read_link(url, filter=<id, class or text>).
 - State (open browser, scope, variables) carries over between run_wiki and run_page calls on \
-the same page. run_page on another page, or restart=true, first ends the current page's test \
-(tear down in previous_page_teardown).
+the same page. run_page on another page, or restart=true, first ends the current page's test as \
+a normal run would: its TearDown tables that have not run yet run then (previous_page_teardown), \
+as with fitnesse_debug_end; skip_teardown=true leaves them out.
+- Building a test (or a SetUp): run_wiki notes each call whose tables all pass as a step \
+(record=false for tables that only look around); fitnesse_debug_steps returns them with their \
+wiki joined, to save on the page in one go. A new start clears them.
 - run_wiki adds no SetUp/TearDown: run_page(setup_only=true) runs the SetUp; other tables with \
 run_page(tables=[...]), indices from fitnesse_debug_page_tables.
 - fitnesse_debug_start decides by the page's type: a suite page starts a suite session (call \
 run_page for each page with runnable=true from 'pages', in that order), a test page a session on \
-that page (its SuiteSetUp and SuiteTearDown run by themselves).
+that page (its SuiteSetUp and SuiteTearDown run by themselves; a failing SuiteSetUp table stops \
+run_page as well, result suite_setup.stopped_at, before the page begins).
 - busy=true in fitnesse_debug_status: wait and poll status, or fitnesse_debug_end(abort=true); \
 a run_wiki/run_page call fails at once while busy.
-"""
+""".format(
+    adopt_start=" (or fitnesse_debug_status(adopt=true) for a running session)" if ALLOW_ADOPT else "",
+    adopt_status=" without adopt" if ALLOW_ADOPT else "",
+    adopt_none="" if ALLOW_ADOPT else " Sessions this server did not start (someone else's, or "
+    "from before a restart) are never taken over: leave them alone.",
+)
 
 # fitnesse_table_source needs debug and read, like the base part.
 DEBUG_TABLE_SOURCE_INSTRUCTIONS = """\

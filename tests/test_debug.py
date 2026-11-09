@@ -17,7 +17,7 @@ from fastmcp.exceptions import ToolError
 
 import server as my_server
 
-GATES = ("FITNESSE_TOOLSETS",)
+GATES = ("FITNESSE_TOOLSETS", "FITNESSE_ALLOW_ADOPT")
 
 
 def _reload(**env):
@@ -42,6 +42,12 @@ def debug_env():
             else:
                 os.environ[key] = value
         importlib.reload(my_server)
+
+
+@pytest.fixture
+def adopt_env(debug_env):
+    _reload(FITNESSE_TOOLSETS="all,debug", FITNESSE_ALLOW_ADOPT="1")
+    yield  # debug_env restores the environment and reloads
 
 
 class _Resp:
@@ -251,7 +257,8 @@ async def test_debug_tools_hidden_by_default():
             names = {t.name for t in await c.list_tools()}
         assert not any(n.startswith(("fitnesse_debug_", "fitnesse_table_")) for n in names)
         debug = {"read": {"fitnesse_debug_status", "fitnesse_debug_page_tables", "fitnesse_debug_inspect",
-                          "fitnesse_debug_defined_action_source", "fitnesse_table_source"},
+                          "fitnesse_debug_defined_action_source", "fitnesse_table_source",
+                          "fitnesse_debug_read_link", "fitnesse_debug_steps"},
                  "write": {"fitnesse_table_save", "fitnesse_table_insert", "fitnesse_table_delete",
                            "fitnesse_table_move", "fitnesse_table_save_text", "fitnesse_table_move_text"},
                  "test": {"fitnesse_debug_start", "fitnesse_debug_run_wiki", "fitnesse_debug_run_page",
@@ -281,6 +288,38 @@ async def test_start_refuses_running_session(debug_env):
             "fitnesse_debug_start", {"suite": False, "page_path": "FrontPage.T"},
             (200, {"running": True, "session": "browser", "page": "X", "currentPage": "X"}),
         )
+
+
+@pytest.mark.asyncio
+async def test_adopt_is_off_by_default(debug_env):
+    tool = await my_server.mcp.get_tool("fitnesse_debug_status")
+    assert not {"adopt", "session"} & set(tool.parameters["properties"])
+    texts = [tool.description, (await my_server.mcp.get_tool("fitnesse_debug_start")).description,
+             my_server.DEBUG_INSTRUCTIONS, my_server._DEBUG_CODE_HINTS["sessionRequired"]]
+    assert not any("adopt" in t for t in texts)
+    with pytest.raises(ToolError) as err:
+        await _call("fitnesse_debug_status", {"adopt": True}, (200, {"running": False}))
+    assert "adopt" in str(err.value)  # an unexpected argument, not silently ignored
+    with pytest.raises(ToolError, match=r"no debug session on this FitNesse\. Start one with fitnesse_debug_start\.$"):
+        await _call("fitnesse_debug_run_wiki", {"wiki": "|x|"})
+    # older fork, one session per account: a foreign one is not offered for taking over
+    with pytest.raises(ToolError, match="someone using the same account.*does not take over.*idleSecondsLeft"):
+        await _call("fitnesse_debug_start", {"suite": False, "page_path": "FrontPage.T"},
+                    (200, {"running": True, "session": "browser", "page": "X", "currentPage": "X"}))
+
+
+@pytest.mark.asyncio
+async def test_adopt_allowed_offers_taking_over(adopt_env):
+    tool = await my_server.mcp.get_tool("fitnesse_debug_status")
+    assert {"adopt", "session"} <= set(tool.parameters["properties"])
+    assert "adopt=true" in tool.description and "adopt=true" in my_server.DEBUG_INSTRUCTIONS
+    with pytest.raises(ToolError, match=r"Continue it with fitnesse_debug_status\(adopt=true\)"):
+        await _call("fitnesse_debug_start", {"suite": False, "page_path": "FrontPage.T"},
+                    (200, {"running": True, "session": "browser", "page": "X", "currentPage": "X"}))
+    browser = _entry("b1", "Other.Page")
+    with pytest.raises(ToolError, match=r"already running on Other.Page.*adopt=true, session='b1'"):
+        await _call("fitnesse_debug_start", {"suite": False, "page_path": "Other.Page"},
+                    (200, {"running": True, "sessions": [browser], **browser}))
 
 
 @pytest.mark.asyncio
@@ -333,10 +372,11 @@ async def test_start_with_several_sessions_per_account(debug_env):
                     (200, {"running": False, "sessions": [browser, _entry("s1", "FrontPage.T")]}))
     await _call("fitnesse_debug_end", {}, (200, {"lines": [], "next": 0}), (200, {"ended": True, "html": "", "counts": {}}))
 
-    # someone's session on the same page: refused, with how to adopt it
-    with pytest.raises(ToolError, match=r"already running on Other.Page.*adopt=true, session='b1'"):
+    # someone's session on the same page: refused; not taken over without FITNESSE_ALLOW_ADOPT
+    with pytest.raises(ToolError, match=r"already running on Other.Page.*does not take over.*another page") as err:
         await _call("fitnesse_debug_start", {"suite": False, "page_path": "Other.Page"},
                     (200, {"running": True, "sessions": [browser], **browser}))
+    assert "adopt" not in str(err.value)
     _, fake = await _call(
         "fitnesse_debug_start", {"suite": False, "page_path": "Other.Page", "replace": True},
         (200, {"running": True, "sessions": [browser], **browser}),
@@ -347,7 +387,7 @@ async def test_start_with_several_sessions_per_account(debug_env):
 
 
 @pytest.mark.asyncio
-async def test_status_lists_and_adopts_one_of_several_sessions(debug_env):
+async def test_status_lists_and_adopts_one_of_several_sessions(adopt_env):
     sessions = [_entry("b1", "A"), _entry("b2", "B", suite=True)]
     data, _ = await _call("fitnesse_debug_status", {"max_log_lines": 0}, (200, {"running": False, "sessions": sessions}))
     assert data["known_to_this_server"] is False and [s["session"] for s in data["sessions"]] == ["b1", "b2"]
@@ -372,10 +412,12 @@ async def test_session_codes_of_mod_159_have_hints(debug_env):
     with pytest.raises(ToolError, match="sessionRequired.*fitnesse_debug_status lists them"):
         await _call("fitnesse_debug_inspect", {"kind": "scope"},
                     (409, {"code": "sessionRequired", "error": "Several debug sessions are running"}))
-    with pytest.raises(ToolError, match="tooManySessions.*maxSessionsPerUser"):
+    with pytest.raises(ToolError, match="tooManySessions.*maxSessionsPerUser") as caught:
         await _call("fitnesse_debug_start", {"suite": False, "page_path": "P", "replace": True},
                     (200, {"running": False, "sessions": []}),
                     (429, {"code": "tooManySessions", "error": "Too many debug sessions"}))
+    assert "leaves those it did not start alone" in str(caught.value) and "FitNesse-wide limit" in str(caught.value)
+    assert "adopt" not in str(caught.value)  # FITNESSE_ALLOW_ADOPT is off
 
 
 @pytest.mark.asyncio
@@ -487,6 +529,51 @@ async def test_state_queries_parsed(debug_env):
     assert "secret" not in json.dumps(data)
 
 
+@pytest.mark.asyncio
+async def test_live_view_fills_in_the_url_per_browser(debug_env, monkeypatch):
+    monkeypatch.setenv("FITNESSE_BASE_URL", "http://localhost:8080")
+    await _start()
+    answer = {
+        "html": "", "counts": {}, "hub": "http://grid:4444/wd/hub/", "seleniumSession": "s-2",
+        "browsers": [{"name": "", "hub": "http://grid:4444/wd/hub", "session": "s-1"},
+                     {"name": "second", "hub": "http://grid:4444/wd/hub/", "session": "s-2"}],
+        "liveViewUrl": "{hub}/ui/#/session/{session}?from={hub}&s={session}", "liveViewPassword": "pw", "liveViewOnly": True,
+    }
+    data, _ = await _call("fitnesse_debug_inspect", {"kind": "liveView"}, (200, answer))
+    assert data["live_view_url"] == "http://grid:4444/ui/#/session/s-2?from=http://grid:4444&s=s-2"
+    assert [b["live_view_url"] for b in data["browsers"]] == [
+        "http://grid:4444/ui/#/session/s-1?from=http://grid:4444&s=s-1",
+        "http://grid:4444/ui/#/session/s-2?from=http://grid:4444&s=s-2"]
+    assert data["live_view_only"] is True and "pw" not in json.dumps(data) and "note" not in data
+
+    # no liveViewUrl configured: the Grid UI; a hub on localhost (with a local FitNesse) gets a note
+    answer = {**answer, "liveViewUrl": None, "hub": "http://localhost:4444/wd/hub",
+              "browsers": [{"name": "", "hub": "http://localhost:4444/wd/hub", "session": "s-2"}]}
+    data, _ = await _call("fitnesse_debug_inspect", {"kind": "liveView"}, (200, answer))
+    assert data["live_view_url"] == "http://localhost:4444/ui/#/session/s-2"
+    assert data["browsers"][0]["live_view_url"] == data["live_view_url"] and "localhost" in data["note"]
+
+    # a liveViewUrl naming the real host: no note, although the hub is localhost
+    data, _ = await _call("fitnesse_debug_inspect", {"kind": "liveView"},
+                          (200, {**answer, "liveViewUrl": "https://grid.example/ui/#/session/{session}"}))
+    assert data["live_view_url"] == "https://grid.example/ui/#/session/s-2" and "note" not in data
+
+    # a KDTA instance serves its grid at <instance>/grid: a localhost hub's links go there
+    monkeypatch.setenv("FITNESSE_BASE_URL", "https://kdta.example/")
+    await _start()  # debug state is per instance
+    data, _ = await _call("fitnesse_debug_inspect", {"kind": "liveView"},
+                          (200, {**answer, "liveViewUrl": "{hub}/ui/#/session/{session}"}))
+    assert data["live_view_url"] == "https://kdta.example/grid/ui/#/session/s-2" and "note" not in data
+    data, _ = await _call("fitnesse_debug_inspect", {"kind": "liveView"}, (200, answer))
+    assert data["browsers"][0]["live_view_url"] == "https://kdta.example/grid/ui/#/session/s-2"
+
+    # no browser yet
+    data, _ = await _call("fitnesse_debug_inspect", {"kind": "liveView"}, (200, {
+        "html": "<table><tr><td>liveView</td><td></td><td></td><td>[]</td></tr></table>", "counts": {},
+        "liveViewUrl": "{hub}/ui/#/session/{session}"}))
+    assert data["live_view_url"] is None and data["browsers"] == [] and "No remote browser" in data["hint"]
+
+
 VARIABLES_HTML = (
     "<table><tr><td>dynamicVariables</td><td>name</td><td>value</td><td>system</td></tr>"
     "<tr><td></td><td>user</td><td>bob</td><td>false</td></tr></table>"
@@ -508,7 +595,7 @@ async def test_run_extras_come_with_the_run(debug_env):
     assert fake.actions == ["runWiki"]
     assert fake.requests[0]["form"]["withDynamicVariables"] == "true" and fake.requests[0]["form"]["withLiveView"] == "true"
     assert data["dynamicVariables"] == [{"name": "user", "value": "bob", "system": False}]
-    assert data["liveView"]["selenium_session"] == "abc" and data["liveView"]["live_view_url"] == "http://hub/ui"
+    assert data["liveView"]["selenium_session"] == "abc" and data["liveView"]["live_view_url"] == "http://hub/ui"  # no placeholders
     assert "secret" not in json.dumps(data)
 
     data, fake = await _call("fitnesse_debug_run_wiki", {"wiki": "|ok|"}, (200, {"html": PASS_HTML, "counts": {"right": 1}}))
@@ -543,7 +630,7 @@ FAILING_HTML = (
 async def test_run_page_only_failures(debug_env):
     await _start()
     data, _ = await _call(
-        "fitnesse_debug_run_page", {"only_failures": True},
+        "fitnesse_debug_run_page", {"only_failures": True, "stop_on_failure": False},
         (200, {"page": "FrontPage.T", "html": FAILING_HTML}),
         (200, {"html": FAILING_HTML, "counts": {"right": 2, "wrong": 1, "exceptions": 1}}),
     )
@@ -551,7 +638,8 @@ async def test_run_page_only_failures(debug_env):
     assert "Table 0:" not in data["tables"] and "Table 2:" not in data["tables"]
     assert data["tables_without_failures"] == 2 and data["counts"]["wrong"] == 1
     data, _ = await _call(
-        "fitnesse_debug_run_page", {},
+        "fitnesse_debug_run_page", {"restart": True, "stop_on_failure": False},
+        (200, {"page": "FrontPage.T", "html": "", "counts": {}}),
         (200, {"page": "FrontPage.T", "html": FAILING_HTML}),
         (200, {"html": FAILING_HTML, "counts": {}}),
     )
@@ -566,10 +654,61 @@ async def test_keywords_filter(debug_env):
         {"syntax": "click %1", "parameters": [{"label": "locator"}]},
     ]}]
     html = "<table><tr><td>keywordsJson</td><td>" + json.dumps(kw).replace("&", "&amp;").replace("<", "&lt;") + "</td><td>[]</td></tr></table>"
-    data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords"}, (200, {"html": html, "counts": {}}))
+    data, fake = await _call("fitnesse_debug_inspect", {"kind": "keywords"}, (200, {"html": html, "counts": {}}), NO_TABLE)
+    assert fake.actions == ["keywordsJson", "keywords"]
     assert data["count"] == 2 and data["categories"] == {"Browser": 2} and "filter" in data["hint"]
-    data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords", "filter": "LOCATOR"}, (200, {"html": html, "counts": {}}))
+    data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords", "filter": "LOCATOR"}, (200, {"html": html, "counts": {}}), NO_TABLE)
     assert data["matches"] == 1 and data["keywords"][0]["syntax"] == "click %1"
+
+
+NO_TABLE = (200, {"html": "", "counts": {}})
+# from the fork team: InteractiveTables.plainKeywordRows of master with a sample class, as a session sends it
+PLAIN_ROWS = (
+    '<tr><td>simple</td><td>|\'\'&lt;i&gt;create order\'\'&lt;/i&gt;| String | int |</td><td></td><td></td>'
+    '<td>fitlibrary.suite.KeywordsProbe$OrderFixture</td></tr>'
+    '<tr><td>simple</td><td>|\'\'&lt;i&gt;order exists\'\'&lt;/i&gt;| String |</td><td></td><td></td>'
+    '<td>fitlibrary.suite.KeywordsProbe$OrderFixture</td></tr>'
+    '<tr><td>simple</td><td>|\'\'&lt;i&gt;last order id\'\'&lt;/i&gt;|</td><td></td><td></td>'
+    '<td>fitlibrary.suite.KeywordsProbe$OrderFixture</td></tr>'
+)
+KEYWORDS_TABLE = (
+    '<table border="1" cellspacing="0"><tr><td>keywords</td><td>wiki</td><td>tooltip</td><td>author</td>'
+    '<td>class</td><td>overrides</td></tr>' + PLAIN_ROWS
+    # annotated rows: one keywordsJson has (without tooltip), one with a tooltip; a defined action
+    + '<tr><td>simple</td><td>|\'\'&lt;i&gt;click&lt;/i&gt;\'\'| |</td><td></td><td></td><td>kdta.Web</td></tr>'
+    + '<tr><td>simple</td><td>|\'\'&lt;i&gt;wait&lt;/i&gt;\'\'| |</td><td>waits</td><td>kdta</td><td>kdta.Web</td></tr>'
+    + '<tr><td>defined</td><td>|\'\'greet\'\'|name|</td><td></td><td></td><td>.Lib.Defs</td><td></td></tr>'
+    + "</table>"
+)
+
+
+@pytest.mark.asyncio
+async def test_keywords_include_methods_of_classes_without_annotations(debug_env):
+    await _start()
+    kw = [{"name": "Web", "children": [{"syntax": "click %1"}]}]
+    json_html = "<table><tr><td>keywordsJson</td><td>" + json.dumps(kw) + "</td><td>[]</td></tr></table>"
+    data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords"},
+                          (200, {"html": json_html, "counts": {}}), (200, {"html": KEYWORDS_TABLE, "counts": {}}))
+    assert data["categories"] == {"Web": 1, "Plain classes / KeywordsProbe$OrderFixture": 3}
+    data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords", "filter": "order"},
+                          (200, {"html": json_html, "counts": {}}), (200, {"html": KEYWORDS_TABLE, "counts": {}}))
+    assert data["matches"] == 3
+    assert data["keywords"][0] == {
+        "category": "Plain classes / KeywordsProbe$OrderFixture", "special": False, "plain": True,
+        "keyword": "create order", "parameter_types": ["String", "int"],
+        "class": "fitlibrary.suite.KeywordsProbe$OrderFixture"}
+    assert data["keywords"][2]["keyword"] == "last order id" and data["keywords"][2]["parameter_types"] == []
+
+    # kind 'plain' (fitlibrary-netcare-mod #88) counts whatever else the row says
+    table = KEYWORDS_TABLE.replace("<td>simple</td><td>|''&lt;i&gt;wait", "<td>plain</td><td>|''&lt;i&gt;wait")
+    data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords", "filter": "wait"},
+                          (200, {"html": json_html, "counts": {}}), (200, {"html": table, "counts": {}}))
+    assert [k["keyword"] for k in data["keywords"]] == ["wait"]
+
+    # the keywords table can't be read: the annotated keywords all the same
+    data, fake = await _call("fitnesse_debug_inspect", {"kind": "keywords"},
+                             (200, {"html": json_html, "counts": {}}), (500, {"error": "boom"}))
+    assert data["categories"] == {"Web": 1}
 
 
 @pytest.mark.asyncio
@@ -584,13 +723,13 @@ async def test_keywords_filter_leaves_out_help_texts(debug_env):
     ]}]
     html = "<table><tr><td>keywordsJson</td><td>" + json.dumps(kw).replace("&", "&amp;").replace("<", "&lt;") + "</td><td>[]</td></tr></table>"
     data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords", "filter": "clicks", "limit": 1},
-                          (200, {"html": html, "counts": {}}))
+                          (200, {"html": html, "counts": {}}), NO_TABLE)
     assert data["matches"] == 2 and len(data["keywords"]) == 1  # the filter still searches help texts
     entry = data["keywords"][0]
     assert "helpText" not in entry
     assert entry["tableItems"] == [{"syntax": "with %1", "mandatory": True}, {"syntax": "or %1"}]
     data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords", "filter": "clicks", "details": True},
-                          (200, {"html": html, "counts": {}}))
+                          (200, {"html": html, "counts": {}}), NO_TABLE)
     assert data["keywords"][0]["helpText"] == "clicks"
     assert data["keywords"][0]["tableItems"][0]["helpText"] == "This statement is mandatory."
 
@@ -604,19 +743,22 @@ async def test_run_page_changes_page_and_selects_tables(debug_env):
         (200, {"html": "", "counts": {}, "page": "FrontPage.Suite.A"}),
         (200, {"page": "FrontPage.Suite.A", "html": page_html}),
         (200, {"html": "<table><tr><td class=\"pass\">t2</td></tr></table>", "counts": {"right": 1}}),
+        (200, {"html": "<table><tr><td class=\"pass\">setup</td></tr></table>", "counts": {"right": 1}}),
     )
-    assert fake.actions == ["nextPage", "pageHtml", "runTable"]
-    assert fake.requests[2]["form"]["html"] == "<table><tr><td>t2</td></tr></table>\n<table><tr><td>setup</td></tr></table>"
+    assert fake.actions == ["nextPage", "pageHtml", "runTable", "runTable"]  # one table at a time
+    assert [r["form"]["html"] for r in fake.requests[2:]] == ["<table><tr><td>t2</td></tr></table>",
+                                                              "<table><tr><td>setup</td></tr></table>"]
+    assert data["tables"].startswith("Table 2:") and "Table 0:" in data["tables"]
     assert data["previous_page_teardown"]["teardown_of"] == "FrontPage.Suite"
     assert data["page"] == "FrontPage.Suite.A"
 
-    # same page again: no nextPage
-    _, fake = await _call(
+    # same page again: no nextPage; tables= did not move where the whole page goes on
+    data, fake = await _call(
         "fitnesse_debug_run_page", {},
         (200, {"page": "FrontPage.Suite.A", "html": page_html}),
-        (200, {"html": "", "counts": {}}),
+        *[(200, {"html": "", "counts": {}})] * 3,
     )
-    assert fake.actions == ["pageHtml", "runTable"]
+    assert fake.actions == ["pageHtml", "runTable", "runTable", "runTable"] and data["page_done"] is True
 
 
 @pytest.mark.asyncio
@@ -667,7 +809,7 @@ async def test_end_returns_only_the_last_log_lines(debug_env):
 
 
 @pytest.mark.asyncio
-async def test_status_adopts_running_session(debug_env):
+async def test_status_adopts_running_session(adopt_env):
     data, fake = await _call(
         "fitnesse_debug_status", {"adopt": True, "max_log_lines": 0},
         (200, {"running": True, "session": "browser", "page": "P", "currentPage": "P.A", "suite": True}),
@@ -1050,7 +1192,9 @@ async def test_page_tables_name_the_page_a_table_is_edited_on(debug_env):
         ("after include", "Lib.SetUp", 1, True), ("own 0", "FrontPage.T", 0, False), ("own 1", "FrontPage.T", 1, False),
     ]
     assert my_server._tables_text(INCLUDE_PAGE_HTML).count("after:") == 0  # includes are no folding areas
-    assert data["setup_tables"] == [0, 1, 2]
+    assert data["setup_tables"] == [0, 1, 2] and data["teardown_tables"] == []
+    data, _ = await _call("fitnesse_debug_page_tables", {}, (200, {"html": SETUP_NESTED_HTML}))
+    assert data["setup_tables"] == [0, 1] and data["teardown_tables"] == [4]
 
 
 TEARDOWN_HTML = (
@@ -1116,12 +1260,14 @@ async def test_run_page_with_tables_that_include_the_setup_counts_as_setup(debug
     page = (200, {"page": "FrontPage.T", "html": TEARDOWN_HTML})
     ran = (200, {"html": "<table><tr><td class=\"pass\">setup</td></tr></table>"
                          "<table><tr><td class=\"fail\">own</td></tr></table>", "counts": {"right": 1, "wrong": 1}})
-    data, _ = await _call("fitnesse_debug_run_page", {"tables": [0, 1]}, page, ran)
+    data, _ = await _call("fitnesse_debug_run_page", {"tables": [0, 1], "stop_on_failure": False}, page, ran)
     wrong = (200, {"html": "<table><tr><td class=\"error\">greet</td></tr></table>", "counts": {"exceptions": 1}})
     data, fake = await _call("fitnesse_debug_run_wiki", {"wiki": "|greet|"}, wrong)
     assert fake.actions == ["runWiki"] and "hint" not in data  # SetUp ran with tables=[0, 1]
-    data, fake = await _call("fitnesse_debug_run_page", {}, page, (200, {"html": "", "counts": {}}))
+    data, fake = await _call("fitnesse_debug_run_page", {}, page, *[(200, {"html": "", "counts": {}})] * 2)
     assert data["skipped_setup"] == [0]  # and a whole-page run leaves it out
+    assert [r["form"]["html"] for r in fake.requests[1:]] == ["<table><tr><td>own</td></tr></table>",
+                                                              "<table><tr><td>teardown</td></tr></table>"]
 
 
 @pytest.mark.asyncio
@@ -1130,10 +1276,19 @@ async def test_run_page_with_tables_numbers_them_as_on_the_page(debug_env):
     page = (200, {"page": "FrontPage.T", "html": TEARDOWN_HTML})
     ran = (200, {"html": "<table><tr><td class=\"fail\">teardown</td></tr></table>"
                          "<table><tr><td class=\"pass\">own</td></tr></table>", "counts": {"right": 1, "wrong": 1}})
-    data, _ = await _call("fitnesse_debug_run_page", {"tables": [2, 1]}, page, ran)
+    args = {"tables": [2, 1], "stop_on_failure": False}
+    data, _ = await _call("fitnesse_debug_run_page", args, page, ran)
     assert data["tables"].startswith("Table 2:\n| [fail] teardown |") and "Table 1:\n| [pass] own |" in data["tables"]
-    data, _ = await _call("fitnesse_debug_run_page", {"tables": [2, 1], "only_failures": True}, page, ran)
+    data, _ = await _call("fitnesse_debug_run_page", {**args, "only_failures": True}, page, ran)
     assert data["tables"].startswith("Table 2:") and "Table 1" not in data["tables"]
+    # one by one, as by default: stops after the failing table 2, table 1 is left out
+    data, fake = await _call("fitnesse_debug_run_page", {"tables": [2, 1]}, page,
+                             (200, {"html": "<table><tr><td class=\"fail\">teardown</td></tr></table>", "counts": {"wrong": 1}}),
+                             (200, {"tables": ["|teardown|\n"], "texts": ["", ""], "page": "Lib.TearDown"}))
+    assert data["tables"].startswith("Table 2:")
+    assert data["stopped_at"] == {"index": 2, "source_page": "Lib.TearDown", "source_index": 0, "wiki": "|teardown|\n"}
+    assert fake.actions == ["pageHtml", "runTable", "source"]
+    assert data["tables_not_run"] == [1] and "next_table" not in data
 
 
 @pytest.mark.asyncio
@@ -1238,15 +1393,15 @@ async def test_run_page_after_setup_only_leaves_the_setup_out_until_restart(debu
     await _start()
     page = (200, {"page": "FrontPage.T", "html": SETUP_NESTED_HTML})
     ran = (200, {"html": "", "counts": {}})
-    _, fake = await _call("fitnesse_debug_run_page", {"setup_only": True}, page, ran)
-    assert fake.requests[1]["form"]["html"] == _t("open browser") + "\n" + _t("define actions at")
+    _, fake = await _call("fitnesse_debug_run_page", {"setup_only": True}, page, ran, ran)
+    assert [r["form"]["html"] for r in fake.requests[1:]] == [_t("open browser"), _t("define actions at")]
 
-    data, fake = await _call("fitnesse_debug_run_page", {}, page, ran)
-    assert fake.actions == ["pageHtml", "runTable"]
+    data, fake = await _call("fitnesse_debug_run_page", {}, page, ran, ran, ran)
+    assert fake.actions == ["pageHtml", "runTable", "runTable", "runTable"]
     assert data["skipped_setup"] == [0, 1]
-    assert fake.requests[1]["form"]["html"] == "\n".join([_t("login"), _t("own"), _t("close")])
+    assert [r["form"]["html"] for r in fake.requests[1:]] == [_t("login"), _t("own"), _t("close")]
 
-    data, fake = await _call("fitnesse_debug_run_page", {"restart": True},
+    data, fake = await _call("fitnesse_debug_run_page", {"restart": True, "stop_on_failure": False},
                              (200, {"html": "", "counts": {}, "page": "FrontPage.T"}), page, ran)
     assert fake.actions == ["nextPage", "pageHtml", "runTable"]
     assert "skipped_setup" not in data
@@ -1339,8 +1494,8 @@ async def test_older_fork_without_suite_pages_for_a_single_page(debug_env):
     )
     assert data["started"] and "suite_setup" not in data
     assert data["pages"] == [{"path": "S.T", "kind": "test", "runnable": True}]
-    _, fake = await _call("fitnesse_debug_run_page", {}, (200, {"page": "S.T", "html": ""}), (200, {"html": "", "counts": {}}))
-    assert fake.actions == ["pageHtml", "runTable"]
+    data, fake = await _call("fitnesse_debug_run_page", {}, (200, {"page": "S.T", "html": ""}))
+    assert fake.actions == ["pageHtml"] and data["page_done"] is True  # no tables: nothing to run
 
 
 @pytest.mark.asyncio
@@ -1422,3 +1577,333 @@ async def test_single_page_with_or_without_suite_setup_and_teardown(debug_env, h
         assert "end" in data["suite_teardown"]["end"]["tables"]
     else:
         assert "suite_teardown" not in data and "end" in data["teardown"]["tables"]
+
+
+STEP_PAGE_HTML = (
+    _include("Lib.SetUp", _t("open browser"))
+    + _t("step 1") + _t("step 2") + _t("step 3")
+    + _include("Lib.TearDown", _t("close"), "collapsible teardown")
+)
+
+
+def _ran(text, status="pass"):
+    counts = {"pass": {"right": 1}, "fail": {"wrong": 1}, "error": {"exceptions": 1}}[status]
+    return (200, {"html": f"<table><tr><td class=\"{status}\">{text}</td></tr></table>", "counts": counts})
+
+
+@pytest.mark.asyncio
+async def test_run_page_stops_at_the_first_failure_and_continues_after_it(debug_env):
+    await _start()
+    page = (200, {"page": "FrontPage.T", "html": STEP_PAGE_HTML})
+    data, fake = await _call("fitnesse_debug_run_page", {}, page,
+                             _ran("open browser"), _ran("step 1"), _ran("step 2", "fail"),
+                             (200, {"tables": ["|step 1|\n", "|step 2|\n", "|step 3|\n"], "texts": ["", "", "", ""]}))
+    assert fake.actions == ["pageHtml", "runTable", "runTable", "runTable", "source"]  # step 3 and TearDown not run
+    assert "debugTable" in str(fake.requests[-1]) and "FrontPage.T" in fake.requests[-1]["url"]
+    assert data["stopped_at"] == {"index": 2, "source_page": "FrontPage.T", "source_index": 1, "wiki": "|step 2|\n"}
+    assert data["next_table"] == 3 and "page_done" not in data and "fitnesse_debug_run_wiki" in data["hint"]
+    assert data["counts"] == {"right": 2, "wrong": 1} and data["page_totals"]["wrong"] == 1
+    assert "Table 2:\n| [fail] step 2 |" in data["tables"]
+
+    status, _ = await _call("fitnesse_debug_status", {"max_log_lines": 0},
+                            (200, {"running": True, "session": "s1", "page": "FrontPage.T"}))
+    assert status["next_table"] == 3
+
+    # fixed and run again on its own: does not move where the page goes on
+    data, fake = await _call("fitnesse_debug_run_page", {"tables": [2]}, page, _ran("step 2"))
+    assert "stopped_at" not in data and "next_table" not in data
+
+    data, fake = await _call("fitnesse_debug_run_page", {}, page, _ran("step 3"), _ran("close"))
+    assert [r["form"]["html"] for r in fake.requests[1:]] == [_t("step 3"), _t("close")]
+    assert data["page_done"] is True and "stopped_at" not in data and "Table 3:" in data["tables"]
+
+    data, fake = await _call("fitnesse_debug_run_page", {}, page)
+    assert fake.actions == ["pageHtml"] and data["page_done"] is True
+
+    # from_table goes back to a table of the running test
+    data, fake = await _call("fitnesse_debug_run_page", {"from_table": 4}, page, _ran("close"))
+    assert [r["form"]["html"] for r in fake.requests[1:]] == [_t("close")] and data["page_done"] is True
+    with pytest.raises(ToolError, match="out of range"):
+        await _call("fitnesse_debug_run_page", {"from_table": 6}, page)
+    with pytest.raises(ToolError, match="from_table continues"):
+        await _call("fitnesse_debug_run_page", {"from_table": 1, "tables": [1]})
+
+
+@pytest.mark.asyncio
+async def test_run_page_on_another_page_reports_the_tables_a_stop_left_out(debug_env):
+    await _start("FrontPage.Suite", suite=True)
+    page_a = (200, {"page": "FrontPage.Suite.A", "html": STEP_PAGE_HTML})
+    data, _ = await _call("fitnesse_debug_run_page", {"page_path": "FrontPage.Suite.A"},
+                          (200, {"html": "", "counts": {}, "page": "FrontPage.Suite.A"}), page_a,
+                          _ran("open browser"), _ran("step 1", "error"), (404, {"error": "notFound"}))
+    assert data["stopped_at"]["index"] == 1 and data["next_table"] == 2
+    assert "wiki" not in data["stopped_at"]  # the source can't be read: the stop is reported all the same
+    # the next page: A's TearDown (table 4) runs first, as in a normal run; 2 and 3 stay left out
+    data, fake = await _call("fitnesse_debug_run_page", {"page_path": ".FrontPage.Suite.B"},
+                             page_a, _ran("close"),
+                             (200, {"html": "", "counts": {}, "page": ".FrontPage.Suite.B"}),
+                             (200, {"page": "FrontPage.Suite.B", "html": _t("b")}), _ran("b"))
+    assert fake.actions == ["pageHtml", "runTable", "nextPage", "pageHtml", "runTable"]
+    assert fake.requests[1]["form"]["html"] == _t("close") and "FrontPage.Suite.A" in fake.requests[0]["form"]["page"]
+    teardown = data["previous_page_teardown"]
+    assert teardown["teardown_of"] == "FrontPage.Suite.A" and teardown["tables_not_run"] == 2
+    assert teardown["teardown_tables"]["tables"].startswith("Table 4:\n| [pass] close |")
+    assert teardown["page_totals"] == {"right": 2, "wrong": 0, "ignores": 0, "exceptions": 1}  # TearDown counted
+    assert data["page_done"] is True and data["tables"].startswith("Table 0:")
+
+    # the answer's leading dot doesn't make B another page
+    data, fake = await _call("fitnesse_debug_run_page", {"page_path": "FrontPage.Suite.B"},
+                             (200, {"page": "FrontPage.Suite.B", "html": _t("b")}))
+    assert fake.actions == ["pageHtml"] and data["page_done"] is True
+    # A's TearDown ran: restarting A runs nothing before nextPage
+    await _call("fitnesse_debug_run_page", {"page_path": "FrontPage.Suite.A", "tables": [4]},
+                (200, {"html": "", "counts": {}, "page": "FrontPage.Suite.A"}), page_a, _ran("close"))
+    data, fake = await _call("fitnesse_debug_run_page", {"restart": True, "tables": [1]},
+                             (200, {"html": "", "counts": {}, "page": "FrontPage.Suite.A"}), page_a, _ran("step 1"))
+    assert fake.actions == ["nextPage", "pageHtml", "runTable"]
+    assert "teardown_tables" not in data["previous_page_teardown"]
+
+
+def test_images_of_nested_parts_are_attached():
+    image = {"n": 1, "format": "png", "data": PNG}
+    result = {"teardown": {"teardown_tables": {"tables": "", "_images": [image]}},
+              "suite_teardown": {"end": {"_images": [image]}}, "_images": [image]}
+    attached = my_server._with_images(result)
+    assert [c.type for c in attached.content] == ["text", "image", "image", "image"]
+    data = attached.structured_content
+    assert data["teardown"]["teardown_tables"]["images"] == [{"image": 1, "format": "png", "content": 1}]
+    assert data["suite_teardown"]["end"]["images"][0]["content"] == 2 and data["images"][0]["content"] == 3
+    assert "_images" not in json.dumps(data)
+
+
+@pytest.mark.asyncio
+async def test_skip_teardown_ends_a_stopped_test_without_its_teardown(debug_env):
+    await _start()
+    page = (200, {"page": "FrontPage.T", "html": STEP_PAGE_HTML})
+    await _call("fitnesse_debug_run_page", {}, page, _ran("open browser"), _ran("step 1", "fail"),
+                (200, {"tables": ["|step 1|\n"], "texts": ["", ""]}))
+    data, fake = await _call("fitnesse_debug_run_wiki", {"wiki": "|x|", "restart": True, "skip_teardown": True},
+                             (200, {"html": "", "counts": {}, "page": "FrontPage.T"}), _ran("x"))
+    assert fake.actions == ["nextPage", "runWiki"]
+    teardown = data["previous_page_teardown"]
+    assert teardown["teardown_skipped"] == [4] and teardown["tables_not_run"] == 3  # 2, 3 and the TearDown
+
+    # the new test has run no table of the page: run_wiki alone ends without TearDown
+    data, fake = await _call("fitnesse_debug_run_wiki", {"wiki": "|x|", "restart": True},
+                             (200, {"html": "", "counts": {}, "page": "FrontPage.T"}), _ran("x"))
+    assert fake.actions == ["nextPage", "runWiki"] and "teardown_skipped" not in data["previous_page_teardown"]
+
+
+@pytest.mark.asyncio
+async def test_end_runs_the_teardown_a_stop_left_out(debug_env):
+    await _start()
+    page = (200, {"page": "FrontPage.T", "html": STEP_PAGE_HTML})
+    await _call("fitnesse_debug_run_page", {"setup_only": True}, page, _ran("open browser"))
+    data, fake = await _call("fitnesse_debug_end", {}, page, _ran("close"), (200, {"lines": [], "next": 0}),
+                             (200, {"ended": True, "html": "", "counts": {}}))
+    assert fake.actions == ["pageHtml", "runTable", "log", "end"]
+    assert "[pass] close" in data["teardown"]["teardown_tables"]["tables"]
+    assert data["page_totals"]["FrontPage.T"]["right"] == 2
+
+    # skip_teardown: straight to end, the left-out tables reported
+    await _start()
+    await _call("fitnesse_debug_run_page", {"setup_only": True}, page, _ran("open browser"))
+    data, fake = await _call("fitnesse_debug_end", {"skip_teardown": True}, (200, {"lines": [], "next": 0}),
+                             (200, {"ended": True, "html": "", "counts": {}}))
+    assert fake.actions == ["log", "end"] and data["teardown"]["teardown_skipped"] == [4]
+
+    # the TearDown can't run (the process is busy): the session ends all the same
+    await _start()
+    await _call("fitnesse_debug_run_page", {"setup_only": True}, page, _ran("open browser"))
+    data, fake = await _call("fitnesse_debug_end", {}, page, (504, {"error": "timeout"}), (200, {"lines": [], "next": 0}),
+                             (200, {"ended": True, "html": "", "counts": {}}))
+    assert fake.actions == ["pageHtml", "runTable", "log", "end"]
+    assert "TearDown of FrontPage.T could not run" in data["teardown"]["teardown_error"]
+
+
+@pytest.mark.asyncio
+async def test_page_switch_whose_teardown_cannot_run_says_how_to_go_on(debug_env):
+    await _start("FrontPage.Suite", suite=True)
+    page_a = (200, {"page": "FrontPage.Suite.A", "html": STEP_PAGE_HTML})
+    await _call("fitnesse_debug_run_page", {"page_path": "FrontPage.Suite.A", "setup_only": True},
+                (200, {"html": "", "counts": {}, "page": "FrontPage.Suite.A"}), page_a, _ran("open browser"))
+    with pytest.raises(ToolError, match="TearDown of FrontPage.Suite.A could not run.*skip_teardown=true"):
+        await _call("fitnesse_debug_run_page", {"page_path": "FrontPage.Suite.B"}, page_a, (504, {"error": "timeout"}))
+    # the session is lost meanwhile: no advice to skip, the session is forgotten
+    with pytest.raises(ToolError, match="No debug session is running") as caught:
+        await _call("fitnesse_debug_run_page", {"page_path": "FrontPage.Suite.B"}, page_a,
+                    (409, {"error": "no session", "code": "noSession"}))
+    assert "skip_teardown" not in str(caught.value)
+    assert my_server._debug_state().session is None
+
+
+@pytest.mark.asyncio
+async def test_run_page_setup_only_stopped_by_a_failure_continues_through_the_setup(debug_env):
+    await _start()
+    page = (200, {"page": "FrontPage.T", "html": SETUP_NESTED_HTML})  # SetUp: tables 0 and 1
+    data, fake = await _call("fitnesse_debug_run_page", {"setup_only": True}, page, _ran("open browser", "error"),
+                             (200, {"tables": ["|open browser|\n"], "texts": ["", ""]}))
+    assert fake.actions == ["pageHtml", "runTable", "source"] and data["stopped_at"]["index"] == 0
+    assert "Lib.SetUp" in fake.requests[-1]["url"] and data["stopped_at"]["wiki"] == "|open browser|\n"
+    assert data["stopped_at"]["source_page"] == "Lib.SetUp" and data["next_table"] == 1
+    data, fake = await _call("fitnesse_debug_run_page", {}, page, *[_ran(t) for t in ("defs", "login", "own", "close")])
+    assert "skipped_setup" not in data and data["page_done"] is True  # the SetUp did not count as run
+    assert [r["form"]["html"] for r in fake.requests[1:]] == [_t("define actions at"), _t("login"), _t("own"), _t("close")]
+
+
+SUITE_SETUP_HTML = _t("start browser") + _t("login") + _t("accept cookies")
+
+
+@pytest.mark.asyncio
+async def test_single_page_suite_setup_stops_at_a_failure_and_continues_into_the_page(debug_env):
+    await _start_with_frame()
+    setup_page = (200, {"page": "S.SuiteSetUp", "html": SUITE_SETUP_HTML})
+    data, fake = await _call(
+        "fitnesse_debug_run_page", {},
+        (200, {"page": "S.SuiteSetUp", "html": "", "counts": {}}),  # nextPage
+        setup_page, _ran("start browser"), _ran("login", "fail"),
+        (200, {"tables": ["|start browser|\n", "|login|\n", "|accept cookies|\n"], "texts": ["", "", "", ""]}),
+    )
+    assert fake.actions == ["nextPage", "pageHtml", "runTable", "runTable", "source"]  # the page has not begun
+    assert data["suite_setup"]["stopped_at"] == {"index": 1, "source_page": "S.SuiteSetUp", "source_index": 1,
+                                                 "wiki": "|login|\n"}
+    assert "stopped_at.wiki" in data["hint"]
+    assert data["suite_setup"]["next_table"] == 2 and "tables" not in data
+    assert "fitnesse_debug_run_wiki" in data["hint"] and "table 2, then runs S.T" in data["hint"]
+
+    # fixed and run again on its own: the SuiteSetUp is the current page, no nextPage
+    data, fake = await _call("fitnesse_debug_run_page", {"page_path": "S.SuiteSetUp", "tables": [1]},
+                             setup_page, _ran("login"))
+    assert fake.actions == ["pageHtml", "runTable"] and "stopped_at" not in data
+
+    # continue: the rest of the SuiteSetUp, then the page
+    data, fake = await _call(
+        "fitnesse_debug_run_page", {},
+        setup_page, _ran("accept cookies"),
+        (200, {"page": "S.T", "html": "", "counts": {}}),  # nextPage to the page
+        (200, {"page": "S.T", "html": _t("own")}), _ran("own"),
+    )
+    assert fake.actions == ["pageHtml", "runTable", "nextPage", "pageHtml", "runTable"]
+    assert fake.requests[1]["form"]["html"] == _t("accept cookies")
+    assert data["suite_setup"]["page_done"] is True and data["page"] == "S.T" and data["page_done"] is True
+
+    # the SuiteSetUp ran once: the next call stays on the page
+    data, fake = await _call("fitnesse_debug_run_page", {}, (200, {"page": "S.T", "html": _t("own")}))
+    assert fake.actions == ["pageHtml"] and "suite_setup" not in data
+
+
+@pytest.mark.asyncio
+async def test_single_page_suite_setup_continued_by_its_own_name_then_the_page(debug_env):
+    await _start_with_frame()
+    setup_page = (200, {"page": "S.SuiteSetUp", "html": SUITE_SETUP_HTML})
+    await _call("fitnesse_debug_run_page", {"setup_only": True},
+                (200, {"page": "S.SuiteSetUp", "html": "", "counts": {}}), setup_page, _ran("start browser", "error"),
+                (200, {"tables": ["|start browser|\n"], "texts": ["", ""]}))
+    data, fake = await _call("fitnesse_debug_run_page", {"page_path": "S.SuiteSetUp"},
+                             setup_page, _ran("login"), _ran("accept cookies"))
+    assert fake.actions == ["pageHtml", "runTable", "runTable"] and data["page_done"] is True
+    data, fake = await _call("fitnesse_debug_run_page", {"setup_only": True},
+                             (200, {"page": "S.T", "html": "", "counts": {}}),
+                             (200, {"page": "S.T", "html": TEARDOWN_HTML}), _ran("setup"))
+    assert fake.actions == ["nextPage", "pageHtml", "runTable"]  # straight to the page
+    assert "suite_setup" not in data and data["previous_page_teardown"]["teardown_of"] == "S.SuiteSetUp"
+
+
+KDTA_FAIL_HTML = (
+    '<table><tr><td>text of</td><td>//*[@id=\'v-detail-model-value\']</td><td>contains</td>'
+    '<td class="fail">@{IHModel} <span class="fit_label">expected</span><hr>Actros <span class="fit_label">actual</span></td>'
+    '<td><span class="note"><i>35</i> ms</span></td>'
+    '<td><span class="note"><a target="_blank" href="/files/screenCaptures/2026/11/07/03_06_12_479.png">Screen</a></span></td>'
+    '<td><span class="note"><a target="_blank" href="/files/htmlSource/2026/11/07/03_06_12_683.html">HTML</a></span></td>'
+    "</tr></table>"
+)
+
+
+@pytest.mark.asyncio
+async def test_run_page_stopped_attaches_the_failing_tables_screenshot(debug_env):
+    await _start()
+    page = (200, {"page": "FrontPage.T", "html": _t("open") + "<h3>Modell pr&uuml;fen</h3><p>Das Modell &amp; die<br>Marke</p>"
+                  "<script>x()</script>" + _t("check")})
+    source = (200, {"tables": ["|open|\n", "|text of|//*[@id='v-detail-model-value']|contains|@{IHModel}|\n"],
+                    "texts": ["", "!3 Modell prüfen\n", ""]})
+    result = await _call_content("fitnesse_debug_run_page", {}, page, _ran("open"),
+                                 (200, {"html": KDTA_FAIL_HTML, "counts": {"wrong": 1}}), source, (200, PNG, "image/png"))
+    assert [c.type for c in result.content] == ["text", "image"]
+    assert __import__("base64").b64decode(result.content[1].data) == PNG
+    data = result.structured_content
+    assert data["stopped_at"]["index"] == 1
+    assert data["stopped_at"]["text_before"] == "Modell prüfen\nDas Modell & die\nMarke"
+    assert data["stopped_at"]["wiki"] == "|text of|//*[@id='v-detail-model-value']|contains|@{IHModel}|\n"
+    assert data["images"] == [{"link": "/files/screenCaptures/2026/11/07/03_06_12_479.png", "format": "png", "content": 1}]
+    assert "-> /files/htmlSource/2026/11/07/03_06_12_683.html" in data["tables"]  # the HTML link stays a link
+
+    # the screenshot can't be read: the stop is reported all the same, without image
+    result = await _call_content("fitnesse_debug_run_page", {"restart": True},
+                                 (200, {"page": "FrontPage.T", "html": "", "counts": {}}), page, _ran("open"),
+                                 (200, {"html": KDTA_FAIL_HTML, "counts": {"wrong": 1}}), source, (404, {"error": "gone"}))
+    assert [c.type for c in result.content] == ["text"] and result.structured_content["stopped_at"]["index"] == 1
+
+
+HTML_SOURCE = (
+    b"<!DOCTYPE html><html><head><script>var x = 'v-detail-model-value';</script><style>.a{}</style></head>"
+    b"<body><!-- v-detail-model-value -->\n  <div id='v-detail-model-value'>Actros</div>"
+    + b"<p>filler</p>" * 400 + b"<span class='v-detail-model-value-2'>x</span></body></html>"
+)
+
+
+@pytest.mark.asyncio
+async def test_read_link_filters_the_html_source_and_returns_images(debug_env):
+    link = "/files/htmlSource/2026/11/07/03_06_12_683.html"
+    data, fake = await _call("fitnesse_debug_read_link", {"url": link, "filter": "V-DETAIL-model-value", "context_chars": 20},
+                             (200, HTML_SOURCE, "text/html; charset=utf-8"))
+    assert fake.requests[0]["url"] == my_server._base_url().rstrip("/") + link
+    assert data["places"] == 2  # script, style and comment left out
+    assert "<div id='v-detail-model-value'>Actros</div>" in data["snippets"][0]["text"]
+    assert data["snippets"][1]["text"].startswith("…") and "v-detail-model-value-2" in data["snippets"][1]["text"]
+
+    data, _ = await _call("fitnesse_debug_read_link", {"url": my_server._base_url().rstrip("/") + link, "max_chars": 500},
+                          (200, HTML_SOURCE, "text/html"))
+    assert len(data["text"]) == 500 and data["cut"] == data["length"] - 500 and "filter" in data["hint"]
+    assert "<script/>" in data["text"] and "var x" not in data["text"]
+
+    data, _ = await _call("fitnesse_debug_read_link", {"url": link, "filter": "nowhere"}, (200, HTML_SOURCE, "text/html"))
+    assert data["places"] == 0 and data["snippets"] == [] and "Not found" in data["hint"]
+
+    result = await _call_content("fitnesse_debug_read_link", {"url": "/files/screenCaptures/s.png"}, (200, PNG, "image/png"))
+    assert [c.type for c in result.content] == ["text", "image"] and result.structured_content["bytes"] == len(PNG)
+
+    for bad in ("http://evil.example/files/x.html", "/FrontPage?edit", "/files/../secret", "/files/x.html?a=b"):
+        with pytest.raises(ToolError, match="files section"):
+            await _call("fitnesse_debug_read_link", {"url": bad})
+    with pytest.raises(ToolError, match="cleaned up"):
+        await _call("fitnesse_debug_read_link", {"url": link}, (404, {"error": "not found"}))
+
+
+@pytest.mark.asyncio
+async def test_run_wiki_notes_passing_steps_for_saving(debug_env):
+    await _start()
+    data, _ = await _call("fitnesse_debug_run_wiki", {"wiki": "|open|url|\n"}, _ran("open"))
+    assert data["step"] == 1
+    data, _ = await _call("fitnesse_debug_run_wiki", {"wiki": "|click|//bad|"}, _ran("click", "fail"),
+                          (200, {"html": _t("own")}))  # failing: not noted (pageHtml for the SetUp hint)
+    assert "step" not in data
+    data, _ = await _call("fitnesse_debug_run_wiki", {"wiki": "|show|x|", "record": False}, _ran("show"))
+    assert "step" not in data
+    data, _ = await _call("fitnesse_debug_run_wiki", {"wiki": "|try|a|"}, _ran("try"))
+    data, _ = await _call("fitnesse_debug_run_wiki", {"wiki": "|click|//good|"}, _ran("click"))
+    assert data["step"] == 3
+
+    data, fake = await _call("fitnesse_debug_steps", {"drop": [2]})
+    assert fake.requests == []  # from memory, no request
+    assert [s["step"] for s in data["steps"]] == [1, 3] and data["steps"][0]["page"] == "FrontPage.T"
+    assert data["wiki"] == "|open|url|\n\n|click|//good|\n"
+
+    await _call("fitnesse_debug_end", {}, (200, {"lines": [], "next": 0}), (200, {"ended": True, "html": "", "counts": {}}))
+    data, _ = await _call("fitnesse_debug_steps", {"clear": True})
+    assert len(data["steps"]) == 2 and data["cleared"] is True  # kept after the end
+    data, _ = await _call("fitnesse_debug_steps")
+    assert data["steps"] == [] and "No steps" in data["hint"]
+
+    await _start()
+    data, _ = await _call("fitnesse_debug_steps")
+    assert data["steps"] == []

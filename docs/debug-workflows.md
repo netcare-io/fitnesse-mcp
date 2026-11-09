@@ -10,8 +10,8 @@ pages. Every tool and its full description: [tools.md](tools.md).
 | Group | Tools | Mode |
 |---|---|---|
 | Session | `fitnesse_debug_start`, `fitnesse_debug_end`, `fitnesse_debug_status` | test (status: read) |
-| Run | `fitnesse_debug_run_page` (whole page, chosen tables, `setup_only`, `only_failures`), `fitnesse_debug_run_wiki` (any tables); both with `with_variables`/`with_live_view` | test |
-| Look | `fitnesse_debug_inspect` (`keywords`, `definedActions`, `dynamicVariables`, `scope`, `liveView`), `fitnesse_debug_page_tables` | read |
+| Run | `fitnesse_debug_run_page` (whole page up to the first failure and on from there, chosen tables, `setup_only`, `only_failures`), `fitnesse_debug_run_wiki` (any tables); both with `with_variables`/`with_live_view` | test |
+| Look | `fitnesse_debug_inspect` (`keywords`, `definedActions`, `dynamicVariables`, `scope`, `liveView`), `fitnesse_debug_page_tables`, `fitnesse_debug_read_link` (screenshot, page source of a result), `fitnesse_debug_steps` (the passed `run_wiki` steps, for saving) | read |
 | Source | `fitnesse_table_source`, `fitnesse_debug_defined_action_source` | read |
 | Edit | `fitnesse_table_save`, `_insert`, `_delete`, `_move`, `_save_text`, `_move_text` | write |
 | Find the failure | `fitnesse_get_suite_overview`, `fitnesse_get_page_history`, `fitnesse_run_test` (not debug tools) | read / test |
@@ -35,6 +35,11 @@ What to keep in mind:
   only some ran. Inline screenshots come back as images.
 - **The SetUp counts as run** after `run_page(setup_only=true)`, a whole-page run, or `tables`
   that include all `setup_tables`.
+- **A test ends with its TearDown.** Moving to another page, `restart=true` and
+  `fitnesse_debug_end` first run the page's TearDown tables that have not run yet (after a stop,
+  or when only some tables ran; `teardown_tables` in the result), as a normal run would. Not
+  after `run_wiki` alone. `skip_teardown=true` leaves them out, e.g. to look at the data a stop
+  left behind.
 - **A `[pass]` on a click only means the call returned.** See [Experiments and browser
   state](#experiments-and-browser-state).
 - **One session per page and account** (mod #159; older forks: per account). This server works
@@ -48,18 +53,34 @@ The most common case: a test fails and the cause is unclear.
 fitnesse_get_suite_overview(suite)              failed_pages with result_date
 fitnesse_get_page_history(page, result_date)    the failing tables of that run
 fitnesse_debug_start(page)
-fitnesse_debug_page_tables                      once per page: indices; the failing table is k
-fitnesse_debug_run_page(tables=[0..k-1])        SetUp and everything before the failure in one call
+fitnesse_debug_run_page                         runs up to the first failing table k and stops:
+                                                stopped_at (index k, source_page, source_index,
+                                                text_before: the page text before it, wiki: the
+                                                table's wiki), next_table; TearDown not run
+                                                yet, browser stays
+fitnesse_debug_read_link(html_link, filter=…)   page source at the failure ('HTML' link of the
+                                                table): is the locator's id/class/text there?
+                                                (the screenshot came with the stop as an image)
 fitnesse_debug_inspect(kind='liveView')         optional: link for a person to watch
-fitnesse_debug_run_page(tables=[k])             reproduce: read [fail]/[error], screenshot
 fitnesse_debug_run_wiki('|…variant…|')          try hypotheses: other locator, a wait
 fitnesse_debug_inspect(kind='dynamicVariables') check values (or with_variables=true on the run)
+fitnesse_debug_run_wiki(<stopped_at.wiki, corrected>, record=false)
+                                                the console: saves nothing; until it passes
+fitnesse_table_save(…)                          save the version that passed, once (flow 3);
+                                                no version passes: report it, save nothing
+fitnesse_debug_run_page                         continue at next_table, up to the next failure
+...                                             until page_done=true
 fitnesse_debug_end
 ```
 
-Reuse the indices of `page_tables`; after an edit take them from `result.source` (flow 3). Before
-each new variant, bring the browser back to the state before table k (see below). If the test
-itself is wrong, continue with flow 3 or 4 before ending the session.
+This is the debugger in the browser: run to the failure, try fixes in the console, continue.
+Don't save every attempt and run it with `run_page(tables=[k])`: that changes the real page each
+time. After `run_wiki` passed, the step has happened in the session, so continue without running
+the saved table again. `tables=[k]` does not move `next_table`; `from_table` continues elsewhere (e.g. after tables before it were inserted or
+deleted). A test page's SuiteSetUp stops the same way: then the result has
+`suite_setup.stopped_at` and the page has not begun; fix the table the same way, and the next
+`run_page()` finishes the SuiteSetUp and goes on with the page. Before each new variant, bring the browser back to the state before
+table k (see below). `stop_on_failure=false` runs the whole page in one go, as a normal run.
 
 ## 2. Build a new test step by step
 
@@ -69,11 +90,19 @@ fitnesse_debug_run_page(setup_only=true)
 fitnesse_debug_inspect(kind='keywords')                  categories only
 fitnesse_debug_inspect(kind='keywords', filter='click')  exact syntax, required rows
 fitnesse_debug_inspect(kind='definedActions')
-repeat: fitnesse_debug_run_wiki(step)                    keep the steps that pass
-fitnesse_table_source(page) -> fitnesse_table_insert(…)  save the steps that passed
+repeat: fitnesse_debug_run_wiki(step)                    passing calls are noted as steps
+        fitnesse_debug_run_wiki(look, record=false)      looking around: not noted
+fitnesse_debug_steps(drop=[…])                           the noted steps; drop tries that don't belong
+fitnesse_table_source(page) -> fitnesse_table_insert(…, wiki=steps.wiki)
+                                                         save them in one go
+fitnesse_debug_steps(clear=true)
 fitnesse_debug_run_page(restart=true)                    one clean run of the whole page
 fitnesse_debug_end
 ```
+
+`run_wiki` notes every call whose tables all pass (`step` in its result); failing tries are not
+noted. The steps stay after `fitnesse_debug_end`, so they can still be saved; a new
+`fitnesse_debug_start` clears them. Create only pages meant for the new test.
 
 ## 3. Fix a table of the page
 
@@ -83,7 +112,8 @@ fitnesse_table_source(source_page)
 fitnesse_table_save(index, original=tables[i], wiki=<new>)
                                                 result.source is the page after the change:
                                                 take the next original and indices from it
-fitnesse_debug_run_page(tables=[k])             run it again in the same session
+fitnesse_debug_run_page(tables=[k])             only if not tried with run_wiki before: it
+                                                runs the step again in the session
 ```
 
 A table of an included page (SetUp, includes) is edited on that page and changes every page
@@ -116,14 +146,42 @@ nor does `----` inside `!-…-!`, `{{{…}}}` or a `#` comment line.
 ```
 fitnesse_debug_start(suite_page)                suite=true, pages: run order, kind, runnable
 for each page with runnable=true:
-    fitnesse_debug_run_page(page, only_failures=true)
+    fitnesse_debug_run_page(page)               stops at a failure: flow 1 on it,
+                                                run_page() again until page_done=true
 fitnesse_debug_end                              page_totals per page
 ```
 
 The page's type decides between a suite and a test session; `suite=true`/`false` overrides it.
-`only_failures` runs the whole page as usual, SetUp included, and only leaves the tables without
-`[fail]`/`[error]` out of the result. Moving to the next page ends the previous page's test; its
-tear down comes back as `previous_page_teardown`. For a failing page, continue with flow 1 on it.
+Moving to the next page ends the previous page's test: its TearDown tables that have not run
+yet run first. `previous_page_teardown` reports that end (`teardown_tables`), with
+`tables_not_run` if it had stopped and was not continued. For a
+quick overview without stopping, `run_page(page, stop_on_failure=false, only_failures=true)`
+runs the whole page and returns only the tables with `[fail]`/`[error]`.
+
+## 6. Build a SetUp
+
+A SetUp page is included by every test page below it. Build it like a test (flow 2), then save
+the steps on the SetUp page instead of the test page.
+
+```
+fitnesse_add_child_page(suite, 'SetUp', page_type='Static')   Static: a Test page would run as a test
+fitnesse_debug_start(suite.SomeTest)                           a test page below it
+repeat: fitnesse_debug_run_wiki(step)                          open browser, |define actions at|, login
+fitnesse_debug_steps -> fitnesse_table_insert(suite.SetUp, …)  save the passed steps on the SetUp page
+fitnesse_debug_run_page(restart=true, setup_only=true)         the SetUp as saved, in a fresh test
+fitnesse_debug_run_page(restart=true)                          the whole page with it
+fitnesse_debug_end
+```
+
+- **`restart=true` before `setup_only`.** A second `setup_only` in the same test runs the SetUp
+  again (a second browser, for example); `restart=true` ends the test first, with the TearDown
+  tables that have not run yet.
+- **Defined actions** changed in the SetUp load again with the `|define actions at|` tables:
+  `restart=true` plus `setup_only`, or `run_wiki` of that table; `inspect(kind='definedActions')`
+  then shows the new version.
+- **A SuiteSetUp created during a session** is unknown to it: a session remembers its SuiteSetUp
+  and SuiteTearDown (single page) or its pages (suite) at the start. End it and start again.
+- **Shared SetUps** affect every page below them: change only a SetUp created for the task.
 
 ## Experiments and browser state
 
@@ -146,12 +204,12 @@ tear down comes back as `previous_page_teardown`. For a failing page, continue w
 - **Mobile browsers** (Appium) can end after about a minute without a command: don't leave such a
   session idle for long; if the browser is gone, `restart=true`.
 
-## 6. When something goes wrong
+## 7. When something goes wrong
 
 | Situation | What to do |
 |---|---|
 | A call timed out | `fitnesse_debug_status` until `busy` is false; else `fitnesse_debug_end(abort=true)` |
-| Start refused: a session runs on this page | `fitnesse_debug_status` shows it; `adopt=true, session=<id>` only if you are meant to continue it, else ask |
+| Start refused: a session runs on this page | `fitnesse_debug_status` shows it; it is not yours: use another page or wait for its idle timeout. Only with `FITNESSE_ALLOW_ADOPT`: `adopt=true, session=<id>` if you are meant to continue it, else ask |
 | Start refused: this server's session runs elsewhere | continue it, or `fitnesse_debug_end` first |
 | `replaced` or `noSession` | the session is gone: a start on the same page with the same login replaced it (e.g. a person in the wiki's debug UI), idle timeout, restart. Start again and run the SetUp |
 | `tooManySessions` (429) | end sessions of the account listed in `sessions`, or try later |
@@ -161,4 +219,5 @@ tear down comes back as `previous_page_teardown`. For a failing page, continue w
 | A table shows `[fail]` without a message | `fitnesse_debug_status`: the log of the test process often has the cause (e.g. `command not found`); long lines are cut at 500 characters |
 
 Without a FitNesse login the session belongs to a cookie that this server keeps in memory: after a
-restart of the MCP server its old session cannot be adopted and ends after the idle timeout.
+restart of the MCP server its old session cannot be adopted (even with `FITNESSE_ALLOW_ADOPT`) and
+ends after the idle timeout.

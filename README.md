@@ -103,6 +103,7 @@ Three further notes:
 | `FITNESSE_TOOLSETS` | **required** | Comma-separated toolsets. `all` = `read,write,test` (every mode, no area); `all,debug,complete` grants everything. **Modes** `read`, `write`, `test` (named after FitNesse's `secure-read`/`-write`/`-test`) filter every tool: `read` reads pages, history, and files; `write` changes pages and files (also `fitnesse_shutdown` / `fitnesse_save_account`, which still need their own flag); `test` runs and stops tests. **Areas** `debug` (KDTA debug tools, `fitnesse_debug_*` / `fitnesse_table_*`; needs netcare's FitNesse fork with the `debugTest`/`debugTable` responders) and `complete` (16 lower-traffic tools, marked below) add tools, which are still filtered by the modes: `read,debug` shows only the reading debug tools. A missing or empty value, an area without a mode, or an unknown value stops the server at startup |
 | `FITNESSE_ALLOW_SHUTDOWN` | `false` | `1`/`true`/`yes`/`on` exposes `fitnesse_shutdown` |
 | `FITNESSE_ALLOW_ACCOUNT_ADMIN` | `false` | `1`/`true`/`yes`/`on` exposes `fitnesse_save_account` |
+| `FITNESSE_ALLOW_ADOPT` | `false` | With `debug`: `1`/`true`/`yes`/`on` adds `adopt`/`session` to `fitnesse_debug_status`, so the MCP server can take over a debug session it did not start (maybe a person's in the browser). Off, it only works with its own sessions and the tool texts never suggest taking one over; give it its own FitNesse account |
 | `FITNESSE_FILES_ROOT` | _(none — files tools disabled)_ | Resource root of the files section on the FitNesse instance (e.g. `files`); enables `fitnesse_list_files`, `fitnesse_create_dir`, `fitnesse_upload_file`, `fitnesse_download_file`, `fitnesse_delete_file`, and `fitnesse_rename_file` |
 | `FITNESSE_MAX_RESPONSE_BYTES` | `1048576` (1 MB) | Responses above this are truncated and flagged `"truncated": true` |
 | `FITNESSE_FILES_MAX_TRANSFER_BYTES` | `10485760` (10 MB) | Uploads above this are rejected; downloads above this are truncated and rejected |
@@ -213,6 +214,31 @@ Parameter mapping for `fitnesse_search_properties`:
   `fitnesse_debug_start` asks for `suitePages` also without `suite`. Each of
   the two runs only if the page has it; the SuiteTearDown also without a
   SuiteSetUp, once a `fitnesse_debug_run_page` ran.
+- **`fitnesse_debug_run_page` stops at the first failing table**, as the
+  debugger in the browser does: it sends the tables one `runTable` each and
+  stops after the first with a `[fail]` or `[error]` cell (`stopped_at`,
+  `next_table`); the rest of the page, its TearDown included, has not run. The
+  next call without `tables` continues at `next_table` (`from_table` at another
+  index), `page_done=true` once all tables ran. Before, it ran all tables in
+  one go. `stop_on_failure=false` does that as before. In a suite, moving to
+  the next page before `page_done` leaves the rest out
+  (`previous_page_teardown.tables_not_run`). The SuiteSetUp of a single page
+  stops the same way (`suite_setup.stopped_at`); the page's test begins only
+  once it ran to the end.
+- **Ending a test runs the TearDown tables that have not run yet.** Moving
+  to another page, `restart=true` and `fitnesse_debug_end` used to send only
+  `nextPage`/`end`, which run no TearDown tables, so after a stop the test's
+  clean-up (logout, test data) never ran. Now the MCP server sends the
+  remaining TearDown tables first (`teardown_tables` in
+  `previous_page_teardown` or in `end`'s `teardown`); `skip_teardown=true`
+  keeps the old behaviour. `tables_not_run` no longer counts them.
+- **`fitnesse_debug_inspect(kind='liveView')` returns working links.**
+  `live_view_url` used to be `debugTest.liveViewUrl` with its `{session}` and
+  `{hub}` placeholders unfilled (or empty without it); now they are filled in,
+  per browser in `browsers[].live_view_url`, with the Grid UI as fallback.
+- **`fitnesse_debug_inspect(kind='keywords')` also lists methods of classes
+  without keyword annotations** (`plain: true`, categories `Plain classes /
+  <class>`), from a second request (`keywords`) after `keywordsJson`.
 - **`fitnesse_debug_start` decides by the page's type.** `suite` is optional:
   left out, the page's properties decide (Suite: a suite session, Test: a
   session on the page; both: a suite, with a `note`). A page that is neither
@@ -221,6 +247,11 @@ Parameter mapping for `fitnesse_search_properties`:
   The result always has `suite` and `pages` (for a test page: its
   SuiteSetUp, the page, its SuiteTearDown); filters on a test page are ignored
   (`filters_ignored`).
+- **Taking over debug sessions needs `FITNESSE_ALLOW_ADOPT`.**
+  `fitnesse_debug_status` has `adopt` and `session` only with
+  `FITNESSE_ALLOW_ADOPT=1`; without it a call that passes them is refused,
+  and refusals for a running session suggest another page or waiting for its
+  idle timeout instead. Set the variable to keep the old behaviour.
 
 ### Changed tool set
 
@@ -256,20 +287,20 @@ resource root on your FitNesse instance to also expose `fitnesse_list_files`,
 `fitnesse_create_dir`, `fitnesse_upload_file`, `fitnesse_download_file`,
 `fitnesse_delete_file`, and `fitnesse_rename_file` (33 total), add `complete`
 to `FITNESSE_TOOLSETS` for 16 additional lower-traffic tools (49), `debug` for
-the 15 KDTA debug tools (64), `FITNESSE_ALLOW_SHUTDOWN=1` for
+the 17 KDTA debug tools (66), `FITNESSE_ALLOW_SHUTDOWN=1` for
 `fitnesse_shutdown`, and `FITNESSE_ALLOW_ACCOUNT_ADMIN=1` for
-`fitnesse_save_account` (66). The modes in `FITNESSE_TOOLSETS` filter all of
+`fitnesse_save_account` (68). The modes in `FITNESSE_TOOLSETS` filter all of
 these. Visible tools:
 
 | `FITNESSE_TOOLSETS` | no flags | + `FITNESSE_FILES_ROOT` | + `FITNESSE_FILES_ROOT`, `,complete` | + `,complete`, all flags |
 |---|---|---|---|---|
 | `read` | 12 | 14 | 29 | 29 |
-| `read,debug` | 17 | 19 | 34 | 34 |
+| `read,debug` | 19 | 21 | 36 | 36 |
 | `read,test` | 15 | 17 | 32 | 32 |
-| `read,test,debug` | 24 | 26 | 41 | 41 |
+| `read,test,debug` | 26 | 28 | 43 | 43 |
 | `read,write` | 24 | 30 | 46 | 48 |
 | `all` (= `read,write,test`) | 27 | 33 | 49 | 51 |
-| `all,debug` | 42 | 48 | 64 | 66 |
+| `all,debug` | 44 | 50 | 66 | 68 |
 
 `write` or `test` without `read` work too, but leave the model blind to what
 it changes or runs.
@@ -415,13 +446,15 @@ All need `debug` in `FITNESSE_TOOLSETS`, plus the listed mode.
 | Tool | Action | Mode |
 |---|---|---|
 | `fitnesse_debug_start` | without `suite`: `properties` (Suite/Test decide; neither: refused); `status`, then `start`; refuses if a session of the account runs on the same page (forks before mod #159: anywhere), unless `replace`, and while this server's own session still runs. Then `suitePages`: with `suite` the suite's pages, without it the page's SuiteSetUp/SuiteTearDown (`suite_setup`/`suite_teardown`, each only if present). The result has `suite` and `pages` | test |
-| `fitnesse_debug_status` | `status` plus new `log` lines (each cut at 500 characters); `sessions` lists all of the account's (mod #159); `adopt` continues a running session, with several the one named by `session` | read |
-| `fitnesse_debug_run_wiki` | `runWiki` — wiki tables in the context of the current page, no SetUp/TearDown; `restart` runs `nextPage` first. Failing before the SetUp ran in this test, on a page that has one, the result gets a `hint` to run `setup_only` (one `pageHtml` per test to check). `with_variables`/`with_live_view` send `withDynamicVariables`/`withLiveView` (mod v1.5.0/v1.6.0) and return `dynamicVariables`/`liveView` with the result; older forks: the separate actions afterwards | test |
+| `fitnesse_debug_status` | `status` plus new `log` lines (each cut at 500 characters); `sessions` lists all of the account's (mod #159); with `FITNESSE_ALLOW_ADOPT`: `adopt` continues a running session, with several the one named by `session` | read |
+| `fitnesse_debug_run_wiki` | `runWiki` — wiki tables in the context of the current page, no SetUp/TearDown; `restart` ends the current test first (its TearDown tables not run yet, then `nextPage`; `skip_teardown` leaves the TearDown out). Failing before the SetUp ran in this test, on a page that has one, the result gets a `hint` to run `setup_only` (one `pageHtml` per test to check). `with_variables`/`with_live_view` send `withDynamicVariables`/`withLiveView` (mod v1.5.0/v1.6.0) and return `dynamicVariables`/`liveView` with the result; older forks: the separate actions afterwards | test |
+| `fitnesse_debug_read_link` | `GET` of a `/files/...` link from a debug result (Basic Auth as usual; other links refused): an image as image content; HTML/text without scripts, styles, comments, with `filter` only the places that contain it (`context_chars` around), else the start (`max_chars`). For KDTA's `Screen`/`HTML` links of a table | read |
+| `fitnesse_debug_steps` | none (this server's memory): the `run_wiki` calls whose tables all passed (`record=true`, the default), with `wiki` joined for saving; `drop`, `clear`. Kept after `end`, cleared by `start` | read |
 | `fitnesse_debug_page_tables` | `pageHtml`, split into tables; each with `source_page`/`source_index` for editing (tables of included pages live on that page) | read |
-| `fitnesse_debug_run_page` | `nextPage` (on page change or `restart`), `pageHtml`, `runTable`. Outside a suite session the first call runs the SuiteSetUp first (`nextPage`, `pageHtml`, `runTable`, `nextPage` back; result `suite_setup`). `setup_only` (or `tables` that include all SetUp tables) runs the SetUp; a later call without `tables` skips it (`skipped_setup`). With `tables`, the result numbers the tables as on the page. `only_failures` returns only tables with `[fail]`/`[error]`. `with_variables`/`with_live_view` as for `run_wiki` | test |
-| `fitnesse_debug_inspect` | `keywordsJson` (without filter only the categories with their number of keywords; with filter the matching keywords without help texts unless `details=true`), `definedActions` (the defined actions loaded by `define actions at`: `debugTest definedActions` as JSON, on older forks parsed from `keywords`; filterable), `dynamicVariables`, `scope`, `liveView` (VNC password removed) | read |
+| `fitnesse_debug_run_page` | on page change or `restart` the current page's TearDown tables not run yet (`pageHtml`, `runTable`; not with `skip_teardown`), then `nextPage`; `pageHtml`, `runTable` per table until the first with `[fail]`/`[error]` (`stopped_at`, `next_table`; the next call without `tables` continues there, `from_table` elsewhere; `page_done` at the end; `stop_on_failure=false`: one `runTable` for all). Outside a suite session the first call runs the SuiteSetUp first (`nextPage`, `pageHtml`, `runTable`, `nextPage` back; result `suite_setup`). `setup_only` (or `tables` that include all SetUp tables) runs the SetUp; a later call without `tables` skips it (`skipped_setup`). With `tables`, the result numbers the tables as on the page. `only_failures` returns only tables with `[fail]`/`[error]`. `with_variables`/`with_live_view` as for `run_wiki` | test |
+| `fitnesse_debug_inspect` | `keywordsJson` plus the `keywords` table for classes without annotations (without filter only the categories with their number of keywords; with filter the matching keywords without help texts unless `details=true`), `definedActions` (the defined actions loaded by `define actions at`: `debugTest definedActions` as JSON, on older forks parsed from `keywords`; filterable), `dynamicVariables`, `scope`, `liveView` (`live_view_url` per browser: `debugTest.liveViewUrl` with `{session}`/`{hub}` filled in, else the Grid UI `<hub without /wd/hub>/ui/#/session/<id>`; VNC password removed) | read |
 | `fitnesse_debug_defined_action_source` | `debugTable definedAction` (with the session, or `page=` without one). Forks without it: page of the defined action from `keywords`, then `debugTable source` of that page, cut to the definition block as FitLibrary reads it (header first or after `----`, exactly four dashes anywhere between two tables, up to the next one; `-----` and dashes inside `!-…-!`, `{{{…}}}` or `#` comments don't separate; refuses a header found twice) | read |
-| `fitnesse_debug_end` | single page with a SuiteTearDown, after a `fitnesse_debug_run_page`: `nextPage` to the SuiteTearDown and run it (`suite_teardown`); `log` (number of lines), then `end` or `abort` with `logFrom` and `logMax` (mod #162; older forks send all lines from `logFrom`, cut here): the last unread log lines | test |
+| `fitnesse_debug_end` | the current page's TearDown tables not run yet (`pageHtml`, `runTable`; `teardown.teardown_tables`); single page with a SuiteTearDown, after a `fitnesse_debug_run_page`: `nextPage` to the SuiteTearDown and run it (`suite_teardown`); `skip_teardown` leaves both out; `log` (number of lines), then `end` or `abort` with `logFrom` and `logMax` (mod #162; older forks send all lines from `logFrom`, cut here): the last unread log lines | test |
 | `fitnesse_table_source` | `debugTable source` | read |
 | `fitnesse_table_save`, `fitnesse_table_insert`, `fitnesse_table_delete`, `fitnesse_table_move`, `fitnesse_table_save_text`, `fitnesse_table_move_text` | `debugTable save`/`saveBlock`, `insert`, `delete`, `move`, `saveText`, `moveText` — saves the wiki page, refused with 409 if it changed since it was read. The result's `source` is the page after the change (from the answer since mod #157, else read again). With `reload_defined_actions=true` every `fitnesse_table_*` edit sends `reload=true` with the session, so the fork reloads the page's defined actions; forks that don't answer `reloaded` get `\|define actions at\|.<page>\|` via `runWiki` instead | write |
 
@@ -431,7 +464,7 @@ Dependencies between the tools (the same rules go to MCP clients as server
 with `write` as well):
 
 ```
-fitnesse_debug_start ──or── fitnesse_debug_status(adopt=true)      opens / takes over the session
+fitnesse_debug_start                                                opens the session
         │
         ├─ fitnesse_debug_run_page(setup_only=true)                   SetUp first: browser, defined actions
         ├─ fitnesse_debug_inspect(kind='keywords')                    categories; with filter: exact wording
@@ -448,13 +481,27 @@ fitnesse_table_source ──> fitnesse_table_save / _insert / _delete / _move / 
 ```
 
 - **Session required:** `run_wiki`, `run_page`, `page_tables`, `inspect`,
-  `defined_action_source` (unless given `page_path`) and `end` fail until `fitnesse_debug_start` or `fitnesse_debug_status(adopt=true)`
-  has run on this MCP server. `fitnesse_debug_status` (without `adopt`) and the
+  `defined_action_source` (unless given `page_path`) and `end` fail until `fitnesse_debug_start`
+  (with `FITNESSE_ALLOW_ADOPT` also `fitnesse_debug_status(adopt=true)`) has run on
+  this MCP server. `fitnesse_debug_status` (without `adopt`) and the
   `fitnesse_table_*` tools work without a session.
 - **State carries over** between `run_wiki` and `run_page` calls of the same
   page (open browser, scope, variables). `run_page` with a different page, or
-  `restart=true` on either tool, first ends the current page's test (its tear
-  down comes back as `previous_page_teardown`).
+  `restart=true` on either tool, first ends the current page's test (reported
+  as `previous_page_teardown`).
+- **A test ends as in a normal run, TearDown included.** FitNesse's `nextPage`
+  and `end` run no tables of the TearDown page, only FitLibrary's tear down of
+  the objects in scope. So before moving to another page, `restart=true` and
+  `fitnesse_debug_end`, the MCP server runs the current page's TearDown tables
+  that have not run in its test yet (`teardown_tables`), e.g. after a stop:
+  they log out, close dialogs or delete test data. Only if `run_page` ran some
+  of the page's tables (a test built with `run_wiki` after `setup_only` counts;
+  `run_wiki` alone does not). TearDown tables are those whose outermost include
+  is a page named `TearDown`. `skip_teardown=true` leaves them out
+  (`teardown_skipped`), e.g. to look at what a stop left behind;
+  `fitnesse_debug_end(skip_teardown=true)` also leaves out the SuiteTearDown.
+  If the TearDown can't run (e.g. a timeout), switching pages fails with a hint
+  to `skip_teardown`, while `end` ends all the same (`teardown_error`).
 - **SetUp first.** `run_wiki` does not run SetUp/TearDown. Right after
   `fitnesse_debug_start`, run `fitnesse_debug_run_page(setup_only=true)`: the
   SetUp opens the browser and loads the defined actions, so `inspect` and
@@ -470,9 +517,44 @@ fitnesse_table_source ──> fitnesse_table_save / _insert / _delete / _move / 
   `restart=true` or another page runs them again. If `run_wiki` fails
   before the SetUp or the SuiteSetUp ran, its result has a `hint` saying so
   (only on pages that have one).
+- **Stops at the first failure.** `run_page` runs the tables one at a time and
+  stops after the first with a `[fail]` or `[error]` cell, before the rest of
+  the page and its TearDown, so the browser stays where the failure left it.
+  `stopped_at` gives its `index`, `source_page` and `source_index` (for the
+  `fitnesse_table_*` tools), `text_before` (the page text just before the
+  table, e.g. a heading or comment, from the page already loaded) and `wiki`
+  (the table's wiki, from `debugTable` `source` of `source_page`; left out if
+  it can't be read). As with the console of the browser debugger, try
+  corrected versions of the table with `run_wiki`, which runs them in the
+  session and saves nothing, until one passes; save that one once with
+  `fitnesse_table_save`. If none passes (the application is wrong, not the
+  test), report that instead. Either way `run_page()` then continues at `next_table` (also in `fitnesse_debug_status`);
+  `page_done=true` when all tables ran. Outside a suite session the same goes
+  for the SuiteSetUp: if it stops, the result has `suite_setup.stopped_at` and
+  the page has not begun; fix the table the same way, and the next `run_page()`
+  finishes the SuiteSetUp, then runs the page. `tables=[...]` also stops at a failure
+  (`tables_not_run`) but does not move `next_table`. `stop_on_failure=false`
+  runs everything in one `runTable`. Moving on before `page_done` leaves the
+  rest out (`previous_page_teardown.tables_not_run`), except the TearDown (see
+  above).
+- **Building a test: passed steps are noted.** Every `run_wiki` call whose
+  tables all pass is noted as a step (`step` in its result; `record=false`
+  for tables that only look around). `fitnesse_debug_steps` lists them with
+  their wiki joined, ready for `fitnesse_table_insert`; `drop` leaves tries
+  out, `clear=true` forgets them after saving. They stay after
+  `fitnesse_debug_end`; a new `fitnesse_debug_start` clears them. A SetUp is
+  built the same way and saved on the SetUp page (see
+  [docs/debug-workflows.md](docs/debug-workflows.md), flow 6).
+- **What the page looked like at the failure.** KDTA links a screenshot
+  (`Screen`, `/files/screenCaptures/…`) and the page source (`HTML`,
+  `/files/htmlSource/…`) from a table. When `run_page` stops, the failing
+  table's screenshot is fetched and attached as an image (`images` names its
+  `link`; a screenshot that can't be read is left out). The page source stays a
+  link: `fitnesse_debug_read_link(url, filter=…)` returns only the places that
+  contain an id, class or text, to check a locator against the page as it was.
 - **Suite sessions:** `fitnesse_debug_start` on a suite page (or with `suite=true`) returns `pages`;
   call `fitnesse_debug_run_page` for each page with `runnable=true` in that
-  order.
+  order, going on to the next page once `page_done` is true.
 - **Results:** `run_wiki`, `run_page` and `end` return every table as text,
   one row per line, cells prefixed with `[pass]`, `[fail]`, `[error]` or
   `[ignore]`. Below each table follow what belongs to it: folding areas after
@@ -480,7 +562,7 @@ fitnesse_table_source ──> fitnesse_table_save / _insert / _delete / _move / 
   (`link in row R, column C: text -> url`) and images. Inline screenshots
   (`[image N]` in a cell) come back as MCP image content, at most 4 per call;
   `images` says which one is where or why one was left out.
-  `run_page(only_failures=true)` returns only the tables with a `[fail]` or
+  `run_page(only_failures=true)` (useful with `stop_on_failure=false`) returns only the tables with a `[fail]` or
   `[error]` cell, under their usual numbers (`tables_without_failures` counts
   the others).
   Cells of nested tables keep their prefix inline, and a `[fail]` inside one
@@ -492,6 +574,14 @@ fitnesse_table_source ──> fitnesse_table_save / _insert / _delete / _move / 
   categories with their number of keywords (the full list runs to tens of
   kilobytes); pass a word or a category such as `Web / Browser` as `filter`
   for syntax, parameters and table rows (`details=true` adds the help texts).
+  `keywordsJson` only has keywords from KDTA's annotations; public methods of
+  fixture classes without any (plain FitLibrary fixtures) come from the
+  session's `keywords` table, as `plain: true` with `keyword`,
+  `parameter_types` and `class`, in categories `Plain classes / <class>`.
+  They are rows of kind `plain`; forks without it mark them `simple`, like
+  annotated ones, so the MCP server takes `simple` rows with neither tooltip
+  nor author whose keyword `keywordsJson` lacks. They are called as FitLibrary
+  reads a row: keyword and argument cells alternate (`|order exists|4711|`).
   `filter` on `definedActions` searches the call, note, author and page, not
   the body of the action.
 - **Table edits:** `save`/`insert`/`delete`/`move`/`save_text`/`move_text`
@@ -535,28 +625,47 @@ fitnesse_table_source ──> fitnesse_table_save / _insert / _delete / _move / 
   `with_variables=true` or `with_live_view=true` return the dynamic variables
   (without system properties) or the live view along with the result, which
   saves a `fitnesse_debug_inspect` call.
+- **Live view links:** the fork sends `debugTest.liveViewUrl` from
+  `plugins.properties` as it is configured; the MCP server fills in `{session}`
+  and `{hub}` (the hub without `/wd/hub`) for every open browser
+  (`browsers[].live_view_url`, the selected one as `live_view_url`). Without
+  it, the link goes to the Grid UI. The hub is the address the test process
+  uses, often `localhost`: then the links (`{hub}` too) go to the grid a KDTA
+  instance serves at `<FITNESSE_BASE_URL>/grid` (e.g.
+  `https://kdta.example/grid/ui/#/session/<id>`), unless FitNesse itself runs
+  on `localhost`. A link still on `localhost` gets a `note` that it may need
+  the host's real name.
 
 Notes:
 
-- **One debug session per page and FitNesse account** (mod #159; up to
-  `debugTest.maxSessionsPerUser`, default 5, and `debugTest.maxSessions`,
-  default 20, on the server; 429 `tooManySessions` beyond). Starting one on
-  a page kills the account's running session on that page without tear
+- **Give the MCP server a FitNesse account of its own** (a technical user in
+  `FITNESSE_USERNAME`/`FITNESSE_PASSWORD`), not a person's: debug sessions
+  belong to the account. It needs the rights to read and test the pages it
+  debugs, and to edit them for the `fitnesse_table_*` tools.
+- **One debug session per page and FitNesse account** (mod #159). Starting one
+  on a page kills the account's running session on that page without tear
   down, so `fitnesse_debug_start` refuses unless told otherwise; sessions on
   other pages, e.g. a person's in the browser, keep running. The MCP server
   itself works with one session at a time. Every later action sends the
   session id; if someone replaced the session, the server answers 409
   `replaced` and the MCP server forgets it. Older forks allow **one session
   per account**: there a person in the browser and the MCP server with the
-  same account replace each other, so give the MCP server its own FitNesse
-  account.
+  same account replace each other. Sessions it did not start (someone else's
+  with the same account, or its own from before a restart) it leaves alone
+  unless `FITNESSE_ALLOW_ADOPT` is set; they end after their idle time.
+- **Session limits** are set per FitNesse instance: `debugTest.maxSessionsPerUser`
+  (default 5) per account and `debugTest.maxSessions` (default 20) on the
+  server; beyond them `start` answers 429 `tooManySessions`. The error says
+  where to look: `fitnesse_debug_status` lists the account's sessions; if it
+  has none, the server-wide limit is reached.
 - Use Basic Auth (`FITNESSE_USERNAME`/`FITNESSE_PASSWORD`): it bypasses the
   SSO proxy. A non-JSON answer is reported as a login problem. Without a
   login (a FitNesse without authenticator) the session belongs to the
   `debugTestSession` cookie that `start` sets; the MCP server sends it with
   every session call. It keeps the cookie only in memory: after a restart of
   the MCP server its old session cannot be adopted and ends after the idle
-  timeout (30 min). With an account adopt works after a restart.
+  timeout (30 min). With an account and `FITNESSE_ALLOW_ADOPT` adopt works
+  after a restart.
 - `debug` without `read` or `test` in `FITNESSE_TOOLSETS` leaves the debug
   mode half usable (no session, or no inspecting); the server logs a warning
   at startup naming the hidden tools.

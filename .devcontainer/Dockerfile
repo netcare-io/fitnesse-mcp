@@ -45,16 +45,21 @@ RUN apt-get update \
 	&& apt-get clean \
 	&& rm -rf /var/lib/apt/lists/*
 
-# cwd is captured at runtime so the script works from any project directory.
+# cwd is captured at runtime so the script works from any project directory (it reads fastmcp.json
+# there). The sed hides the harmless keyring/DBus chatter of root devcontainer sessions.
 RUN cat <<'EOF' > /usr/local/bin/fastmcp-inspector && chmod +x /usr/local/bin/fastmcp-inspector
 #!/usr/bin/env bash
 set -euo pipefail
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR" || true
 
 _PROJECT_DIR="$(pwd)"
 dbus-run-session -- bash -lc "
   cd \"$_PROJECT_DIR\"
   HOST=127.0.0.1 fastmcp dev inspector --ui-port 6274 --server-port 6277
-"
+" 2>&1 | sed -E '/org\.freedesktop\.secrets|keyring(\/control)?|discover_other_daemon|^\*\* Message:/d'
 EOF
 
 CMD ["bash"]
@@ -72,4 +77,5 @@ COPY --chown=app:app . .
 USER app
 EXPOSE 8000
 
-CMD ["fastmcp", "run", "server.py:mcp"]
+# stdio by default; FASTMCP_TRANSPORT=http (plus FASTMCP_HOST / FASTMCP_PORT) serves HTTP.
+CMD ["fitnesse-mcp"]

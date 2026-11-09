@@ -13,7 +13,7 @@ pages. Every tool and its full description: [tools.md](tools.md).
 | Run | `fitnesse_debug_run_page` (whole page up to the first failure and on from there, chosen tables, `setup_only`, `only_failures`), `fitnesse_debug_run_wiki` (any tables); both with `with_variables`/`with_live_view` | test |
 | Look | `fitnesse_debug_inspect` (`keywords`, `definedActions`, `dynamicVariables`, `scope`, `liveView`), `fitnesse_debug_page_tables`, `fitnesse_debug_read_link` (screenshot, page source of a result), `fitnesse_debug_steps` (the passed `run_wiki` steps, for saving) | read |
 | Source | `fitnesse_table_source`, `fitnesse_debug_defined_action_source` | read |
-| Edit | `fitnesse_table_save`, `_insert`, `_delete`, `_move`, `_save_text`, `_move_text` | write |
+| Edit | `fitnesse_table_edit` (tables: save, insert, delete, move), `fitnesse_table_edit_text` (text between tables: save, move) | write |
 | Find the failure | `fitnesse_get_suite_overview`, `fitnesse_get_page_history`, `fitnesse_run_test` (not debug tools) | read / test |
 
 What to keep in mind:
@@ -72,7 +72,7 @@ fitnesse_debug_run_wiki('|…variant…|')          try hypotheses: other locato
 fitnesse_debug_inspect(kind='dynamicVariables') check values (or with_variables=true on the run)
 fitnesse_debug_run_wiki(<stopped_at.wiki, corrected>, record=false)
                                                 the console: saves nothing; until it passes
-fitnesse_table_save(…)                          save the version that passed, once (flow 3);
+fitnesse_table_edit('save', …)                  save the version that passed, once (flow 3);
                                                 no version passes: report it, save nothing
 fitnesse_debug_run_page                         continue at next_table, up to the next failure
 ...                                             until page_done=true
@@ -107,7 +107,7 @@ fitnesse_debug_inspect(kind='definedActions')
 repeat: fitnesse_debug_run_wiki(step)                    passing calls are noted as steps
         fitnesse_debug_run_wiki(look, record=false)      looking around: not noted
 fitnesse_debug_steps(drop=[…])                           the noted steps; drop tries that don't belong
-fitnesse_table_source(page) -> fitnesse_table_insert(…, wiki=steps.wiki)
+fitnesse_table_source(page) -> fitnesse_table_edit('insert', …, wiki=steps.wiki)
                                                          save them in one go
 fitnesse_debug_steps(clear=true)
 fitnesse_debug_run_page(restart=true)                    one clean run of the whole page
@@ -123,7 +123,7 @@ noted. The steps stay after `fitnesse_debug_end`, so they can still be saved; a 
 ```
 fitnesse_debug_page_tables                      source_page / source_index of the table
 fitnesse_table_source(source_page)
-fitnesse_table_save(index, original=tables[i], wiki=<new>)
+fitnesse_table_edit('save', index, original=tables[i], wiki=<new>)
                                                 result.source is the page after the change:
                                                 take the next original and indices from it
 fitnesse_debug_run_page(tables=[k])             only if not tried with run_wiki before: it
@@ -138,7 +138,7 @@ that includes it.
 ```
 fitnesse_debug_inspect(kind='definedActions', filter=…)
 fitnesse_debug_defined_action_source(action)    page, index, last, original
-fitnesse_table_save(page, index, last, original, wiki=<new>, reload_defined_actions=true)
+fitnesse_table_edit('save', page, index, last, original, wiki=<new>, reload_defined_actions=true)
                                                 check reload.reloaded: false means the
                                                 session still runs the old version
 fitnesse_debug_run_wiki('|action|arg|')         try the new version at once
@@ -181,7 +181,7 @@ the steps on the SetUp page instead of the test page.
 fitnesse_add_child_page(suite, 'SetUp', page_type='Static')   Static: a Test page would run as a test
 fitnesse_debug_start(suite.SomeTest)                           a test page below it
 repeat: fitnesse_debug_run_wiki(step)                          open browser, |define actions at|, login
-fitnesse_debug_steps -> fitnesse_table_insert(suite.SetUp, …)  save the passed steps on the SetUp page
+fitnesse_debug_steps -> fitnesse_table_edit('insert', suite.SetUp, …)  save the passed steps on the SetUp page
 fitnesse_debug_run_page(restart=true, setup_only=true)         the SetUp as saved, in a fresh test
 fitnesse_debug_run_page(restart=true)                          the whole page with it
 fitnesse_debug_end

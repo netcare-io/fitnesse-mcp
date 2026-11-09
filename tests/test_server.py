@@ -79,7 +79,7 @@ def clean_env():
 async def test_tool_count_full(clean_env):
     async with Client(my_server.mcp) as c:
         tools = await c.list_tools()
-    assert len(tools) == 27
+    assert len(tools) == 19
     assert "fitnesse_search" in {t.name for t in tools}
 
 
@@ -231,11 +231,14 @@ async def test_run_flags_forwarded(tool):
         async with Client(my_server.mcp) as c:
             await c.call_tool(
                 tool,
-                {"page_path": "FrontPage", "debug": True, "remote_debug": True, "nochunk": True},
+                {"page_path": "FrontPage", "debug": True, "nochunk": True},
             )
+            # remote_debug is gone: it makes the test process wait for a Java debugger to attach
+            with pytest.raises(ToolError, match="remote_debug"):
+                await c.call_tool(tool, {"page_path": "FrontPage", "remote_debug": True})
 
     query = captured["url"].split("?", 1)[1].split("&")
-    assert {"debug", "remote_debug", "nochunk"} <= set(query)
+    assert {"debug", "nochunk"} <= set(query)
 
 
 # ---------------------------------------------------------------------------
@@ -557,15 +560,14 @@ def _modes_of(tool) -> set[str]:
 async def test_every_tool_needs_exactly_one_mode(toolsets_env):
     await toolsets_env("all,debug,complete")
     tools = await my_server.mcp.list_tools()
-    assert len(tools) == 68
+    assert len(tools) == 61
     assert {t.name: _modes_of(t) for t in tools if len(_modes_of(t)) != 1} == {}
     debug = {t.name: _modes_of(t).pop() for t in tools if "debug" in t.tags}
     assert debug == {
         "fitnesse_debug_status": "read", "fitnesse_debug_page_tables": "read", "fitnesse_debug_read_link": "read", "fitnesse_debug_steps": "read",
         "fitnesse_debug_inspect": "read", "fitnesse_table_source": "read",
         "fitnesse_debug_defined_action_source": "read",
-        "fitnesse_table_save": "write", "fitnesse_table_insert": "write", "fitnesse_table_delete": "write",
-        "fitnesse_table_move": "write", "fitnesse_table_save_text": "write", "fitnesse_table_move_text": "write",
+        "fitnesse_table_edit": "write", "fitnesse_table_edit_text": "write",
         "fitnesse_debug_start": "test", "fitnesse_debug_run_wiki": "test",
         "fitnesse_debug_run_page": "test", "fitnesse_debug_end": "test",
     }
@@ -602,27 +604,27 @@ async def test_toolsets_examples(toolsets_env):
     assert "fitnesse_get_raw" in await toolsets_env("read,complete")
     debug_read = await toolsets_env("read,debug")
     assert {"fitnesse_debug_status", "fitnesse_debug_inspect", "fitnesse_table_source"} <= debug_read
-    assert not {"fitnesse_debug_start", "fitnesse_table_save", "fitnesse_run_test"} & debug_read
+    assert not {"fitnesse_debug_start", "fitnesse_table_edit", "fitnesse_run_test"} & debug_read
     debug_test = await toolsets_env("test,debug")
     assert {"fitnesse_debug_start", "fitnesse_debug_run_wiki", "fitnesse_run_suite"} <= debug_test
     assert not {"fitnesse_debug_status", "fitnesse_table_source"} & debug_test
     write = await toolsets_env("read,write")
     assert {"fitnesse_shutdown", "fitnesse_save_account"} <= write
-    assert not {"fitnesse_table_save", "fitnesse_run_test"} & write
-    assert "fitnesse_table_save" in await toolsets_env("write,debug")
+    assert not {"fitnesse_table_edit", "fitnesse_run_test"} & write
+    assert "fitnesse_table_edit" in await toolsets_env("write,debug")
 
 
 @pytest.mark.asyncio
 async def test_toolsets_default_all_and_spelling(toolsets_env):
     default = await toolsets_env("read,write,test,debug")
     assert default == await toolsets_env(" Read , WRITE,test,DEBUG ")
-    assert len(default) == 52  # 68 minus the 16 complete tools
+    assert len(default) == 40  # 61 minus the 21 complete tools
     assert await toolsets_env("all,debug") == default  # all leaves the areas out
     assert await toolsets_env("read,all,debug") == default
-    assert len(await toolsets_env("all")) == 35  # minus 16 complete and 17 debug tools
-    assert len(await toolsets_env("all,debug,complete")) == 68
-    assert len(await toolsets_env("read,write,test,debug,complete")) == 68
-    assert len(await toolsets_env("read,write,test,complete")) == 51  # minus 17 debug tools
+    assert len(await toolsets_env("all")) == 27  # minus 21 complete and 13 debug tools
+    assert len(await toolsets_env("all,debug,complete")) == 61
+    assert len(await toolsets_env("read,write,test,debug,complete")) == 61
+    assert len(await toolsets_env("read,write,test,complete")) == 48  # minus 13 debug tools
 
 
 @pytest.mark.parametrize("value", [None, "", "  "])
@@ -683,6 +685,8 @@ async def test_complete_toolset_hidden_by_default():
         tools = {t.name for t in await c.list_tools()}
     assert "fitnesse_get_page" not in tools
     assert "fitnesse_get_raw" not in tools
+    assert not {"fitnesse_get_rss", "fitnesse_import_pages", "fitnesse_import_and_view",
+                "fitnesse_manage_symlink", "fitnesse_purge_history"} & tools
 
 
 @pytest.mark.asyncio
@@ -695,7 +699,9 @@ async def test_complete_toolset_exposed_when_flagged(clean_env):
     assert "fitnesse_get_page" in names
     assert "fitnesse_get_raw" in names
     assert "fitnesse_publish" in names
-    assert len(tools) == 43
+    assert {"fitnesse_get_rss", "fitnesse_import_pages", "fitnesse_import_and_view",
+            "fitnesse_manage_symlink", "fitnesse_purge_history"} <= names
+    assert len(tools) == 40
 
 
 @pytest.mark.asyncio
@@ -712,7 +718,7 @@ async def test_files_root_adds_files_tools(files_env):
         "fitnesse_rename_file",
         "fitnesse_create_dir",
     } <= names
-    assert len(tools) == 49
+    assert len(tools) == 46
 
 
 # ---------------------------------------------------------------------------
@@ -1085,6 +1091,35 @@ async def test_search_scope_and_method_search():
         {"search_string": "|click|x|", "method_search": True, "search_scope": "root"},
     )
     assert {"responder=search", "searchType=content", "isMethodSearch", "searchScope=root"} <= set(q)
+    assert "isTextSearch" not in q
+
+
+@pytest.mark.asyncio
+async def test_search_asks_for_the_results_not_the_form():
+    q = await _query("fitnesse_search", {"search_string": "x", "search_type": "title"})
+    assert {"searchType=title", "isTextSearch"} <= set(q)
+
+
+_SEARCH_HTML = (
+    '<table id="searchResultsTable"><thead><tr><th>Type</th></tr></thead><tbody>'
+    '<tr><td><a href="A.T">Test</a></td><td><a href="A.T">A.T</a></td><td><label>x, y</label></td><td>2026-01-02</td></tr>'
+    '<tr><td></td><td><a href="A.S">A.S</a></td><td></td><td>2026-01-03</td></tr>'
+    '</tbody></table>'
+)
+
+
+def test_search_matches_are_parsed():
+    out = my_server._search_matches({"ok": True, "status": 200, "body": _SEARCH_HTML})
+    assert out["count"] == 2
+    assert out["matches"][0]["page"] == "A.T" and out["matches"][0]["type"] == "Test"
+    assert out["matches"][1]["page"] == "A.S"
+
+
+def test_search_without_results_says_so_and_unknown_html_passes_through():
+    none = '<table id="searchResultsTable"><tbody></tbody></table>'
+    assert my_server._search_matches({"ok": True, "status": 200, "body": none})["count"] == 0
+    odd = {"ok": True, "status": 200, "body": "<html>no table</html>"}
+    assert my_server._search_matches(odd) == odd
 
 
 @pytest.mark.asyncio
@@ -1125,17 +1160,56 @@ async def test_run_test_nohistory_and_text_format():
     assert {"nohistory", "format=text"} <= set(q)
 
 
+@pytest.mark.asyncio
+async def test_add_child_page_posts_the_form_like_the_browser():
+    calls, p = _spy_requests()
+    long = "line\n" * 5000
+    with p:
+        async with Client(my_server.mcp) as c:
+            await c.call_tool("fitnesse_add_child_page", {
+                "parent_page_path": "A", "page_name": "B", "page_content": long,
+                "help_text": "h", "suites": "t", "page_template": ".T.P"})
+    method, url, form = calls[-1]
+    assert method == "POST" and url.endswith("/A") and "pageContent" not in url
+    assert form["responder"] == "addChild" and form["pageName"] == "B"
+    assert form["pageContent"] == long.rstrip("\n") + "\n" or form["pageContent"].startswith("line")
+    assert (form["helpText"], form["suites"], form["pageTemplate"]) == ("h", "t", ".T.P")
+
+
+@pytest.mark.asyncio
+async def test_page_changes_answer_short():
+    big = {"ok": True, "status": 200, "url": "u", "body": "<html>" + "x" * 50000 + "</html>"}
+    with patch.object(my_server, "_request", return_value=big):
+        async with Client(my_server.mcp) as c:
+            for tool, args in [
+                ("fitnesse_add_child_page", {"parent_page_path": "A", "page_name": "B"}),
+                ("fitnesse_delete_page", {"page_path": "A.B"}),
+                ("fitnesse_rename_page", {"page_path": "A.B", "new_name": "C"}),
+                ("fitnesse_move_page", {"page_path": "A.B", "new_location": "D"}),
+            ]:
+                d = (await c.call_tool(tool, args)).data
+                assert d["ok"] and "body" not in d and len(str(d)) < 300, tool
+    failed = {"ok": False, "status": 404, "error": "HTTP error: Not Found",
+              "body": "<html><title>Not Found</title><body><script>var a=1</script>No such page</body></html>"}
+    with patch.object(my_server, "_request", return_value=failed):
+        async with Client(my_server.mcp) as c:
+            d = (await c.call_tool("fitnesse_delete_page", {"page_path": "Z"})).data
+    assert d["status"] == 404 and "No such page" in d["message"] and "var a" not in d["message"]
+
+
 @pytest.mark.parametrize(
     "tool,args,expected",
     [
         ("fitnesse_move_page", {"page_path": "A.B", "new_location": "C", "refactor_references": True}, {"refactorReferences"}),
         ("fitnesse_rename_page", {"page_path": "A.B", "new_name": "D", "refactor_references": True}, {"refactorReferences"}),
-        ("fitnesse_purge_history", {"days": 7, "purge_global": True}, {"purgeGlobal=true"}),
         ("fitnesse_delete_page", {"page_path": "A", "delete_versions": True}, {"deleteVersions=yes"}),
-        ("fitnesse_add_child_page", {"parent_page_path": "A", "page_name": "B", "help_text": "h", "suites": "t"}, {"helpText=h", "suites=t"}),
-        ("fitnesse_view_version", {"page_path": "A", "version": "v1", "variables": {"X": "1"}}, {"version=v1", "X=1"}),
+        ("fitnesse_page_versions", {"page_path": "A"}, {"responder=versions"}),
+        ("fitnesse_page_versions", {"page_path": "A", "version": "v1"}, {"responder=viewVersion", "version=v1"}),
+        ("fitnesse_page_versions", {"page_path": "A", "version": "v1", "compare_to": "latest"},
+         {"responder=compareVersions", "Version_v1"}),
         ("fitnesse_get_suite_overview", {"page_path": "S", "suite_filter": "x"}, {"responder=overview", "suiteFilter=x"}),
-        ("fitnesse_compare_versions", {"page_path": "A", "versions": ["v1", "v2"]}, {"Version_v1", "Version_v2"}),
+        ("fitnesse_page_versions", {"page_path": "A", "version": "v1", "compare_to": "v2"},
+         {"responder=compareVersions", "Version_v1", "Version_v2"}),
         ("fitnesse_replace", {"page_path": "A", "search_string": "a+", "replacement_string": "b", "method_replace": True},
          {"responder=replace", "searchString=a%2B", "replacementString=b", "isMethodReplace"}),
     ],
@@ -1143,6 +1217,169 @@ async def test_run_test_nohistory_and_text_format():
 @pytest.mark.asyncio
 async def test_documented_inputs_forwarded(tool, args, expected):
     assert expected <= set(await _query(tool, args))
+
+
+@pytest.mark.asyncio
+async def test_purge_history_forwards_its_inputs(complete_env):
+    assert {"purgeGlobal=true"} <= set(await _query("fitnesse_purge_history", {"days": 7, "purge_global": True}))
+
+
+async def _call(tool: str, body: str, **args):
+    with _patch_urlopen(body=body.encode(), content_type="text/html"):
+        async with Client(my_server.mcp) as c:
+            return (await c.call_tool(tool, args)).data
+
+
+_VERSIONS_HTML = """<article><p>Current: Last modified by jane on Nov 06, 2026 at 10:26:01 AM</p>
+<table><thead><tr><th>Compare</th><th>Name</th><th>Author</th><th>Age</th></tr></thead><tbody>
+<tr><td><input type="checkbox" name="Version_jane@x.de-20261105204144"/></td>
+ <td>jane@x.de-20261105204144</td><td>jane@x.de</td><td>4 days</td>
+ <td><a href="?responder=viewVersion&amp;version=jane@x.de-20261105204144">view</a></td></tr>
+<tr><td><input type="checkbox" name="Version_joe-20220411142456"/></td>
+ <td>joe-20220411142456</td><td>joe</td><td>4 years</td><td><a href="?x">view</a></td></tr>
+</tbody></table></article>"""
+_VERSION_HTML = """<html><head><script>var a = 1;</script></head><body><nav>Menu</nav><article>
+<h1>Title</h1><table><tr><td>click</td><td>a &amp; b</td></tr><tr><td>check</td></tr></table>
+<div id="-shortcut-keys" class="modal-dialog"><h4>Keyboard Shortcuts</h4></div>
+<script>Mousetrap.bind('?');</script></article></body></html>"""
+_VERSION_DIFF_HTML = """<article><h2>Comparing version v1 to latest</h2><table>
+<tr><td class="diff_line diff_chunk_header">--- v1</td></tr>
+<tr><td class="diff_line diff_chunk_header">+++ latest</td></tr>
+<tr><td class="diff_line diff_chunk_header">@@ -1,2 +1,2 @@</td></tr>
+<tr><td class="diff_line"> |click|a|</td></tr>
+<tr><td class="diff_line diff_line_removed">-|check|&lt;b&gt;|</td></tr>
+<tr><td class="diff_line diff_line_added">+|check|c|</td></tr></table></article>"""
+
+
+@pytest.mark.asyncio
+async def test_page_versions_lists_shows_and_compares():
+    """One tool for the versions, viewVersion and compareVersions responders, each condensed from
+    FitNesse's HTML; HTML it does not recognise is passed on as body."""
+    data = await _call("fitnesse_page_versions", _VERSIONS_HTML, page_path="A")
+    assert data["current"] == "Last modified by jane on Nov 06, 2026 at 10:26:01 AM" and "body" not in data
+    assert data["versions"] == [
+        {"version": "jane@x.de-20261105204144", "author": "jane@x.de", "age": "4 days"},
+        {"version": "joe-20220411142456", "author": "joe", "age": "4 years"},
+    ]
+    data = await _call("fitnesse_page_versions", _VERSION_HTML, page_path="A", version="v1")
+    assert data["content"] == "Title\nclick | a & b |\ncheck |" and data["version"] == "v1"
+    data = await _call("fitnesse_page_versions", _VERSION_DIFF_HTML, page_path="A", version="v1", compare_to="latest")
+    assert data["diff"] == "--- v1\n+++ latest\n@@ -1,2 +1,2 @@\n |click|a|\n-|check|<b>|\n+|check|c|"
+    same = "<article><h2>Comparing version v1 to latest</h2><table></table></article>"
+    data = await _call("fitnesse_page_versions", same, page_path="A", version="v1", compare_to="latest")
+    assert data["diff"] == "" and "same" in data["note"]
+    for args in ({}, {"version": "v1"}, {"version": "v1", "compare_to": "v2"}):
+        data = await _call("fitnesse_page_versions", "<html>Login</html>", page_path="A", **args)
+        assert data["body"] == "<html>Login</html>"
+    async with Client(my_server.mcp) as c:
+        with pytest.raises(ToolError, match="compare_to needs version"):
+            await c.call_tool("fitnesse_page_versions", {"page_path": "A", "compare_to": "latest"})
+
+
+@pytest.mark.asyncio
+async def test_variables_condensed_and_secrets_masked():
+    html = """<article><table id="definedVariables" class="dirListing"><thead><tr><th>Variable name</th>
+    <th>Variable value</th><th>Variable location</th></tr></thead><tbody>
+    <tr><td>browser</td><td>Chrome &amp; co</td><td><a href="S.Win">S.Win</a></td></tr>
+    <tr><td>API_TOKEN</td><td>abc123</td><td><a href="S">S</a></td></tr>
+    <tr><td>TEST_SYSTEM</td><td>fit</td><td><a href=""></a></td></tr></tbody></table></article>"""
+    data = await _call("fitnesse_get_variables", html, page_path="S.Win.T")
+    assert "body" not in data
+    assert data["variables"] == [
+        {"name": "browser", "value": "Chrome & co", "location": "S.Win"},
+        {"name": "API_TOKEN", "value": "***", "location": "S"},
+        {"name": "TEST_SYSTEM", "value": "fit"},
+    ]
+    assert (await _call("fitnesse_get_variables", "<html>Login</html>", page_path="S"))["body"] == "<html>Login</html>"
+
+
+def _run_xml(*tables: str, date: str = "2026-11-06T23:00:26Z") -> bytes:
+    from html import escape
+    content = "".join(f"<table>{''.join(f'<tr>{row}</tr>' for row in t.split(chr(10)))}</table>" for t in tables)
+    return (f"<?xml version='1.0'?><testResults><rootPath>S.A</rootPath><result><counts><right>1</right>"
+            f"<wrong>0</wrong><ignores>0</ignores><exceptions>0</exceptions></counts><date>{date}</date>"
+            f"<content>{escape(content)}</content></result></testResults>").encode()
+
+
+async def _compare(bodies: dict[str, bytes], **args):
+    """Call fitnesse_get_page_history with one stored answer per resultDate."""
+    asked = []
+
+    def answer(req, timeout=None):
+        date = req.full_url.split("resultDate=")[1].split("&")[0]
+        asked.append(date)
+        if date not in bodies:
+            raise HTTPError(req.full_url, 400, "Bad Request", {}, None)
+        return _FakeResponse(bodies[date], "text/xml")
+
+    with patch("urllib.request.urlopen", side_effect=answer):
+        async with Client(my_server.mcp) as c:
+            data = (await c.call_tool("fitnesse_get_page_history", {"page_path": "S.A", **args})).data
+    return data, asked
+
+
+@pytest.mark.asyncio
+async def test_page_history_compares_two_test_runs():
+    """compare_to replaces fitnesse_compare_history, whose answer is both reports as HTML: only
+    the tables whose rows differ come back, as a diff."""
+    new = _run_xml('<td class="pass">open</td>', '<td>url</td><td class="fail">x expected</td>\n<td>same</td>',
+                   "<td>extra</td>", "<td>end</td>")
+    old = _run_xml('<td class="pass">open</td>', '<td>url</td><td class="pass">x</td>\n<td>same</td>',
+                   "<td>end</td>", date="2026-11-05T23:00:26Z")
+    data, asked = await _compare({"latest": new, "20261105230026": old}, compare_to="20261105230026")
+    assert asked == ["latest", "20261105230026"]  # result_date defaults to the latest run
+    assert data["run"]["date"] == "2026-11-06T23:00:26Z" and data["compared_to"]["result_date"] == "20261105230026"
+    assert data["tables_same"] == 2
+    assert data["differences"] == [
+        {"table": 1, "diff": "@@ -1,2 +1,2 @@\n-| url | [pass] x |\n+| url | [fail] x expected |\n | same |"},
+        {"table": 2, "only_in": "run", "text": "Table 2:\n| extra |"},
+    ]
+    data, _ = await _compare({"1": new, "2": new}, result_date="1", compare_to="2")
+    assert data["differences"] == [] and data["tables_same"] == 4
+
+
+@pytest.mark.asyncio
+async def test_page_history_compare_caps_the_differences():
+    new = _run_xml(*[f"<td>a{i}</td>" for i in range(13)])
+    old = _run_xml(*[f"<td>b{i}</td>" for i in range(13)])
+    data, _ = await _compare({"1": new, "2": old}, result_date="1", compare_to="2")
+    assert len(data["differences"]) == 10 and data["differences_left_out"] == 3
+
+
+@pytest.mark.asyncio
+async def test_page_history_compares_two_suite_runs():
+    other = (_SUITE_RUN_XML.replace(b"<wrong>3</wrong><ignores>0</ignores><exceptions>2</exceptions>",
+                                    b"<wrong>0</wrong><ignores>0</ignores><exceptions>0</exceptions>")
+             .replace(b"<name>S.B</name>", b"<name>S.C</name>"))
+    data, _ = await _compare({"1": _SUITE_RUN_XML, "2": other}, result_date="1", compare_to="2")
+    assert data["pages_same"] == 0
+    assert data["differences"] == [
+        {"page": "S.A", "run": "error", "compared_to": "pass",
+         "run_result_date": "20261106225946", "compared_to_result_date": "20261106225946"},
+        {"page": "S.B", "run": "pass", "compared_to": "not in this run", "run_result_date": "20261106230022"},
+        {"page": "S.C", "run": "not in this run", "compared_to": "pass", "compared_to_result_date": "20261106230022"},
+    ]
+    data, _ = await _compare({"1": _SUITE_RUN_XML, "2": _SUITE_RUN_XML}, result_date="1", compare_to="2")
+    assert data["pages_same"] == 2 and data["differences"] == []
+
+
+@pytest.mark.asyncio
+async def test_page_history_compare_says_what_cannot_be_compared():
+    with pytest.raises(ToolError, match="No stored run of S.A with result_date '3'.*fitnesse_get_page_history"):
+        await _compare({"1": _TEST_RUN_XML}, result_date="1", compare_to="3")
+    with pytest.raises(ToolError, match="cannot be compared"):
+        await _compare({"1": _TEST_RUN_XML, "2": _SUITE_RUN_XML}, result_date="1", compare_to="2")
+
+
+@pytest.mark.asyncio
+async def test_descriptions_stay_short(toolsets_env):
+    """Every client loads all descriptions and the instructions: keep them from growing back.
+    Explanations needed only sometimes belong in the result (note, hint), not here."""
+    await toolsets_env("all,debug,complete")
+    tools = await my_server.mcp.list_tools()
+    assert {t.name: len(t.description) for t in tools if len(t.description) > 1700} == {}
+    assert sum(len(t.description) for t in tools) < 23000
+    assert len(my_server.mcp.instructions) < 3300
 
 
 @pytest.mark.asyncio

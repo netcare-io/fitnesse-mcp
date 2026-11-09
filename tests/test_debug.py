@@ -266,7 +266,7 @@ async def test_debug_tools_hidden_by_default():
         async with Client(my_server.mcp) as c:
             names = {t.name for t in await c.list_tools()}
         assert "fitnesse_debug_run_wiki" in names and "fitnesse_table_source" in names
-        assert "fitnesse_table_save" in names
+        assert {"fitnesse_table_edit", "fitnesse_table_edit_text"} <= names
         _reload(FITNESSE_TOOLSETS="read,write,test")
         async with Client(my_server.mcp) as c:
             names = {t.name for t in await c.list_tools()}
@@ -274,8 +274,7 @@ async def test_debug_tools_hidden_by_default():
         debug = {"read": {"fitnesse_debug_status", "fitnesse_debug_page_tables", "fitnesse_debug_inspect",
                           "fitnesse_debug_defined_action_source", "fitnesse_table_source",
                           "fitnesse_debug_read_link", "fitnesse_debug_steps"},
-                 "write": {"fitnesse_table_save", "fitnesse_table_insert", "fitnesse_table_delete",
-                           "fitnesse_table_move", "fitnesse_table_save_text", "fitnesse_table_move_text"},
+                 "write": {"fitnesse_table_edit", "fitnesse_table_edit_text"},
                  "test": {"fitnesse_debug_start", "fitnesse_debug_run_wiki", "fitnesse_debug_run_page",
                           "fitnesse_debug_end"}}
         for toolsets, modes in (("read,debug", {"read"}), ("write,debug", {"write"}),
@@ -479,6 +478,8 @@ async def test_busy_process_is_asked_again_later_for_reading_actions(debug_env):
         data, fake = await _call("fitnesse_debug_inspect", {"kind": "scope"}, busy, busy,
                                  (200, {"html": "<table><tr><td>scope</td></tr></table>"}))
     assert fake.actions == ["scope"] * 3 and [c.args[0] for c in sleep.call_args_list] == [2.0, 5.0]
+    # how to read the scope comes with the result, not with every client's tool list
+    assert data["note"] == my_server._SCOPE_NOTE and "Lookup order" not in my_server.DEBUG_INSTRUCTIONS
     with patch("time.sleep"), pytest.raises(ToolError, match="HTTP 423.*Tried 3 times"):
         await _call("fitnesse_debug_inspect", {"kind": "scope"}, busy, busy, busy)
     with patch("time.sleep") as sleep, pytest.raises(ToolError, match="HTTP 423") as err:
@@ -898,15 +899,15 @@ SOURCE = {"tables": ["|note|hello2|"], "texts": ["Scratch\n\n", "\n"], "page": "
 @pytest.mark.asyncio
 async def test_table_edits_return_the_page_after_the_change(debug_env):
     args = {"page_path": "DebugScratch", "index": 0, "original": "|note|hello|", "wiki": "|note|hello2|"}
-    data, fake = await _call("fitnesse_table_save", args, (200, {"index": 0, "wiki": "|note|hello2|", "source": SOURCE}))
+    data, fake = await _call("fitnesse_table_edit", {"action": "save", **args}, (200, {"index": 0, "wiki": "|note|hello2|", "source": SOURCE}))
     assert fake.actions == ["save"]  # mod #157: no second request
     assert data["source"] == SOURCE
 
-    data, fake = await _call("fitnesse_table_save", args, (200, {"index": 0, "wiki": "|note|hello2|"}), (200, SOURCE))
+    data, fake = await _call("fitnesse_table_edit", {"action": "save", **args}, (200, {"index": 0, "wiki": "|note|hello2|"}), (200, SOURCE))
     assert fake.actions == ["save", "source"]  # older mod: read here
     assert data["source"] == SOURCE and "hint" not in data
 
-    data, fake = await _call("fitnesse_table_delete", {"page_path": "P", "index": 0, "original": "o"},
+    data, fake = await _call("fitnesse_table_edit", {"action": "delete", "page_path": "P", "index": 0, "original": "o"},
                              (200, {"index": 0}), (500, {"error": "boom"}))
     assert fake.actions == ["delete", "source"]
     assert "source" not in data and "Saved, but reading the page again failed" in data["hint"]
@@ -915,7 +916,7 @@ async def test_table_edits_return_the_page_after_the_change(debug_env):
 @pytest.mark.asyncio
 async def test_table_save_block_and_conflict(debug_env):
     _, fake = await _call(
-        "fitnesse_table_save", {"page_path": "P", "index": 1, "last": 2, "original": "o", "wiki": "w"},
+        "fitnesse_table_edit", {"action": "save", "page_path": "P", "index": 1, "last": 2, "original": "o", "wiki": "w"},
         (200, {"index": 1, "wiki": "w", "html": "", "source": SOURCE}),
     )
     assert fake.actions == ["saveBlock"]
@@ -923,7 +924,7 @@ async def test_table_save_block_and_conflict(debug_env):
     assert "responder=debugTable" in fake.requests[0]["url"]
     with pytest.raises(ToolError, match="page changed"):
         await _call(
-            "fitnesse_table_delete", {"page_path": "P", "index": 0, "original": "o"},
+            "fitnesse_table_edit", {"action": "delete", "page_path": "P", "index": 0, "original": "o"},
             (409, {"error": "Page was modified"}),
         )
 
@@ -1012,7 +1013,7 @@ async def test_changed_definition_says_how_to_reload_it(debug_env):
                     (200, {"tables": ["|other|"], "texts": ["", "\n"]}))
     # a save conflict has no code: read the source again
     with pytest.raises(ToolError, match="Read fitnesse_table_source again"):
-        await _call("fitnesse_table_save", {"page_path": "P", "index": 0, "original": "o", "wiki": "w"},
+        await _call("fitnesse_table_edit", {"action": "save", "page_path": "P", "index": 0, "original": "o", "wiki": "w"},
                     (409, {"error": "The page has been changed in the meantime; reload it to edit the current version"}))
 
 
@@ -1136,13 +1137,13 @@ async def test_defined_action_source_by_page_without_session(debug_env):
 async def test_table_save_reloads_defined_actions(debug_env):
     args = {"page_path": "Lib.Login", "index": 2, "last": 4, "original": "o", "wiki": "w",
             "reload_defined_actions": True}
-    data, fake = await _call("fitnesse_table_save", args, (200, {"index": 2, "wiki": "w"}), (200, SOURCE))
+    data, fake = await _call("fitnesse_table_edit", {"action": "save", **args}, (200, {"index": 2, "wiki": "w"}), (200, SOURCE))
     assert fake.actions == ["saveBlock", "source"]  # no session: saved only
     assert data["reload"]["reloaded"] is False and "saved only" in data["reload"]["reason"]
 
     await _start()
     data, fake = await _call(
-        "fitnesse_table_save", args,
+        "fitnesse_table_edit", {"action": "save", **args},
         (200, {"index": 2, "wiki": "w"}),
         (200, SOURCE),
         (200, {"html": "<table><tr><td>define actions at</td></tr></table>", "counts": {"right": 0, "wrong": 0}}),
@@ -1155,7 +1156,7 @@ async def test_table_save_reloads_defined_actions(debug_env):
     assert [a["action"] for a in data["reload"]["definedActions"]] == ["|start with url|url|and login with|credentials|"]
 
     data, _ = await _call(
-        "fitnesse_table_save", args,
+        "fitnesse_table_edit", {"action": "save", **args},
         (200, {"index": 2, "wiki": "w"}),
         (200, SOURCE),
         (500, {"error": "boom"}),
@@ -1167,8 +1168,8 @@ async def test_table_save_reloads_defined_actions(debug_env):
 async def test_table_save_and_insert_let_the_fork_reload(debug_env):
     await _start()
     data, fake = await _call(
-        "fitnesse_table_save",
-        {"page_path": "Lib.Login", "index": 2, "last": 4, "original": "o", "wiki": "w", "reload_defined_actions": True},
+        "fitnesse_table_edit",
+        {"action": "save", "page_path": "Lib.Login", "index": 2, "last": 4, "original": "o", "wiki": "w", "reload_defined_actions": True},
         (200, {"index": 2, "wiki": "w", "reloaded": True, "reloadHtml": "<table></table>", "reloadCounts": {},
                "keywords": "<table>big</table>",
                "definedActions": [{"action": "|''<i>a</i>''|x|", "page": ".Lib.Login", "overrides": []},
@@ -1182,13 +1183,15 @@ async def test_table_save_and_insert_let_the_fork_reload(debug_env):
     assert data == {"index": 2, "wiki": "w", "source": SOURCE, "reload": {"reloaded": True, "definedActions": [
         {"action": "|a|x|"}, {"action": "|c|", "note": "old", "author": "ds", "deprecated": True}]}}
     data, fake = await _call(
-        "fitnesse_table_insert",
-        {"page_path": "Lib.Login", "index": 5, "before": "", "wiki": "|new action|\n", "reload_defined_actions": True},
+        "fitnesse_table_edit",
+        {"action": "insert", "page_path": "Lib.Login", "index": 5, "original": "", "wiki": "|new action|\n", "reload_defined_actions": True},
         (200, {"added": 1, "html": "<table><tr><td>new action</td></tr></table>", "reloaded": False,
                "error": "busy", "code": "busy", "source": SOURCE}),
     )
     assert fake.actions == ["insert"]  # code/error in a 200 answer: saved, only the reload failed
     assert fake.requests[0]["form"]["start"] == "false" and fake.requests[0]["form"]["before"] == ""
+    hint = data["reload"].pop("hint")  # what to do when the session still has the old version
+    assert "still runs the old version" in hint and "|define actions at|.Lib.Login|" in hint
     assert data["reload"] == {"reloaded": False, "error": "busy", "code": "busy"}
     assert "new action" in data["tables"] and "html" not in data and data["source"] == SOURCE
 
@@ -1204,27 +1207,50 @@ async def test_reload_by_the_fork_sends_the_session_cookie(debug_env):
         (200, {"pages": []}),
     )
     args = {"page_path": "Lib.Login", "index": 0, "original": "o", "wiki": "w"}
-    _, fake = await _call("fitnesse_table_save", {**args, "reload_defined_actions": True},
+    _, fake = await _call("fitnesse_table_edit", {"action": "save", **args, "reload_defined_actions": True},
                           (200, {"index": 0, "reloaded": True, "definedActions": [], "source": SOURCE}))
     assert fake.requests[0]["headers"].get("Cookie") == "debugTestSession=abc"
-    _, fake = await _call("fitnesse_table_save", args, (200, {"index": 0, "source": SOURCE}))
+    _, fake = await _call("fitnesse_table_edit", {"action": "save", **args}, (200, {"index": 0, "source": SOURCE}))
     assert "Cookie" not in fake.requests[0]["headers"]  # a plain edit stays outside the session
 
 
 @pytest.mark.asyncio
 async def test_move_save_text_and_move_text_forms(debug_env):
-    _, fake = await _call("fitnesse_table_move", {"page_path": "P", "index": 0, "original": "t", "to": 3, "start": True},
+    _, fake = await _call("fitnesse_table_edit", {"action": "move", "page_path": "P", "index": 0, "original": "t", "to": 3, "start": True},
                           (200, {"ok": True, "source": SOURCE}))
     assert fake.requests[0]["form"] == {"action": "move", "index": "0", "original": "t", "to": "3", "start": "true"}
-    data, fake = await _call("fitnesse_table_save_text", {"page_path": "P", "index": 1, "original": "a", "wiki": "b\n|x|\n"},
+    data, fake = await _call("fitnesse_table_edit_text", {"action": "save", "page_path": "P", "index": 1, "original": "a", "wiki": "b\n|x|\n"},
                              (200, {"added": 1, "html": "<table><tr><td>x</td></tr></table>", "source": SOURCE}))
     assert fake.requests[0]["form"] == {"action": "saveText", "index": "1", "original": "a", "wiki": "b\n|x|\n"}
     assert data["added"] == 1 and "| x |" in data["tables"]
-    _, fake = await _call("fitnesse_table_move_text",
-                          {"page_path": "P", "index": 1, "original": "a", "to": 3, "to_original": "c"},
+    _, fake = await _call("fitnesse_table_edit_text",
+                          {"action": "move", "page_path": "P", "index": 1, "original": "a", "to": 3, "to_original": "c"},
                           (200, {}), (200, SOURCE))
     assert fake.requests[0]["form"] == {"action": "moveText", "index": "1", "original": "a", "to": "3",
                                         "toOriginal": "c", "start": "false"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool,args,message", [
+    ("fitnesse_table_edit", {"action": "save"}, "action='save' needs wiki"),
+    ("fitnesse_table_edit", {"action": "insert"}, "action='insert' needs wiki"),
+    ("fitnesse_table_edit", {"action": "move"}, "action='move' needs to"),
+    ("fitnesse_table_edit", {"action": "delete", "wiki": "|x|"}, "wiki does not go with action='delete'"),
+    ("fitnesse_table_edit", {"action": "move", "to": 1, "last": 2}, "last does not go with action='move'"),
+    ("fitnesse_table_edit", {"action": "save", "wiki": "w", "to": 1}, "to does not go with action='save'"),
+    ("fitnesse_table_edit_text", {"action": "save"}, "action='save' needs wiki"),
+    ("fitnesse_table_edit_text", {"action": "move"}, "action='move' needs to"),
+    ("fitnesse_table_edit_text", {"action": "save", "wiki": "w", "to_original": "x"},
+     "to_original does not go with action='save'"),
+])
+async def test_edit_tools_refuse_arguments_that_do_not_fit_the_action(debug_env, tool, args, message):
+    """One tool for several actions: a missing or stray argument is refused before any request."""
+    fake = FakeFitNesse()
+    with patch("urllib.request.urlopen", side_effect=fake):
+        async with Client(my_server.mcp) as c:
+            with pytest.raises(ToolError, match=message):
+                await c.call_tool(tool, {"page_path": "P", "index": 0, "original": "o", **args})
+    assert fake.requests == []
 
 
 INCLUDE_PAGE_HTML = (
@@ -1409,7 +1435,7 @@ async def test_debug_instructions_sent_only_with_visible_debug_tools():
                 assert set(re.findall(r"fitnesse_\w+", instructions)) - {"fitnesse_table_"} <= names
                 toolsets = env["FITNESSE_TOOLSETS"]
                 assert "fitnesse_table_source" in instructions
-                assert ("Editing tables" in instructions) is ("write" in toolsets or "all" in toolsets), env
+                assert ("- Editing:" in instructions) is ("write" in toolsets or "all" in toolsets), env
     finally:
         for key, value in previous.items():
             if value is None:

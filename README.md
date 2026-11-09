@@ -100,7 +100,7 @@ Three further notes:
 | `FITNESSE_AUTH_MODE` | `env` | `env`: every call uses `FITNESSE_USERNAME` / `FITNESSE_PASSWORD`. `headers`: every HTTP request brings its own FitNesse login in `X-FitNesse-Username` / `X-FitNesse-Password`; the env pair is ignored and a request without them fails. HTTP transport only |
 | `FITNESSE_USERNAME` | _(none)_ | Basic Auth username (`env` mode) |
 | `FITNESSE_PASSWORD` | _(none)_ | Basic Auth password (`env` mode) |
-| `FITNESSE_TOOLSETS` | **required** | Comma-separated toolsets. `all` = `read,write,test` (every mode, no area); `all,debug,complete` grants everything. **Modes** `read`, `write`, `test` (named after FitNesse's `secure-read`/`-write`/`-test`) filter every tool: `read` reads pages, history, and files; `write` changes pages and files (also `fitnesse_shutdown` / `fitnesse_save_account`, which still need their own flag); `test` runs and stops tests. **Areas** `debug` (KDTA debug tools, `fitnesse_debug_*` / `fitnesse_table_*`; needs netcare's FitNesse fork with the `debugTest`/`debugTable` responders) and `complete` (16 lower-traffic tools, marked below) add tools, which are still filtered by the modes: `read,debug` shows only the reading debug tools. A missing or empty value, an area without a mode, or an unknown value stops the server at startup |
+| `FITNESSE_TOOLSETS` | **required** | Comma-separated toolsets. `all` = `read,write,test` (every mode, no area); `all,debug,complete` grants everything. **Modes** `read`, `write`, `test` (named after FitNesse's `secure-read`/`-write`/`-test`) filter every tool: `read` reads pages, history, and files; `write` changes pages and files (also `fitnesse_shutdown` / `fitnesse_save_account`, which still need their own flag); `test` runs and stops tests. **Areas** `debug` (KDTA debug tools, `fitnesse_debug_*` / `fitnesse_table_*`; needs netcare's FitNesse fork with the `debugTest`/`debugTable` responders) and `complete` (21 lower-traffic tools, marked below) add tools, which are still filtered by the modes: `read,debug` shows only the reading debug tools. A missing or empty value, an area without a mode, or an unknown value stops the server at startup |
 | `FITNESSE_ALLOW_SHUTDOWN` | `false` | `1`/`true`/`yes`/`on` exposes `fitnesse_shutdown` |
 | `FITNESSE_ALLOW_ACCOUNT_ADMIN` | `false` | `1`/`true`/`yes`/`on` exposes `fitnesse_save_account` |
 | `FITNESSE_ALLOW_ADOPT` | `false` | With `debug`: `1`/`true`/`yes`/`on` adds `adopt`/`session` to `fitnesse_debug_status`, so the MCP server can take over a debug session it did not start (maybe a person's in the browser). Off, it only works with its own sessions and the tool texts never suggest taking one over; give it its own FitNesse account |
@@ -144,6 +144,16 @@ grants everything.
 | 0.4.x | 1.0.0 |
 |---|---|
 | `fitnesse_execute_search_properties` | `fitnesse_search_properties` (needs `complete`) |
+| `fitnesse_get_versions`, `fitnesse_view_version` | `fitnesse_page_versions(page_path)` lists the versions, with `version` shows one, with `version` and `compare_to` (another version or `latest`) returns a diff. Condensed results (`versions`, `content`, `diff`) instead of FitNesse's HTML; the `variables` argument of `fitnesse_view_version` is gone |
+| `fitnesse_compare_history` | `fitnesse_get_page_history(page_path, result_date, compare_to)`: both arguments are result dates (`yyyyMMddHHmmss` or `latest`), not result file names. Returns only what differs (`differences`), not FitNesse's HTML report |
+| `fitnesse_get_rss`, `fitnesse_import_pages`, `fitnesse_import_and_view`, `fitnesse_manage_symlink`, `fitnesse_purge_history` | unchanged, but need `complete` in `FITNESSE_TOOLSETS` |
+
+Removed arguments and changed results:
+
+| Tool | 0.4.x | 1.0.0 |
+|---|---|---|
+| `fitnesse_run_test`, `fitnesse_run_suite` | `remote_debug` | removed: it makes the test process wait for a Java debugger to attach, which an agent cannot do. `debug` stays |
+| `fitnesse_get_variables` | FitNesse's HTML in `body` | `variables` (`name`, `value`, `location`); values of variables named like a secret (password, token, …) are masked as `***` |
 
 Parameter mapping for `fitnesse_search_properties`:
 
@@ -171,6 +181,19 @@ Parameter mapping for `fitnesse_search_properties`:
 
 - **`fitnesse_search` `search_type`** accepts only `title` or `content`.
 - **`fitnesse_save_page_content` `edit_time` / `ticket_id`** must be numeric.
+
+### Changed results
+
+- **`fitnesse_search` and `fitnesse_search_properties` return the matches**, not
+  FitNesse's HTML: `count` and `matches` (`page`, `type`, `tags`, `last_modified`),
+  plus `note` when nothing matched and `left_out` above 200 matches. `fitnesse_search`
+  now really runs the search (FitNesse answers only the search form without
+  `isTextSearch`/`isMethodSearch`). Anything that read `body` has to read `matches`.
+- **The tools that change pages answer short**: `fitnesse_add_child_page`,
+  `fitnesse_delete_page`, `fitnesse_move_page`, `fitnesse_rename_page` and
+  `fitnesse_save_page_content` return `ok`, `status` and a `message` (on failure also
+  `error`) instead of the 15-50k characters of HTML page FitNesse sends back. Read the
+  page with `fitnesse_get_page_data` if you need it.
 
 ### Changed behaviour
 
@@ -304,7 +327,7 @@ Visible without `complete` now (0.4.x: only with `FITNESSE_COMPLETE_TOOLSET` or 
 | Tool | Kind | Needs in `FITNESSE_TOOLSETS` |
 |---|---|---|
 | `fitnesse_search` | read | `read` |
-| `fitnesse_compare_versions` | read | `read` |
+| `fitnesse_page_versions` (with `compare_to`: `compareVersions`) | read | `read` |
 | `fitnesse_get_suite_overview` | read | `read` |
 | `fitnesse_replace` | **write, destructive** (saves every matching page below `page_path`) | `write` |
 
@@ -325,26 +348,26 @@ enabled.
 description; regenerate it with `python scripts/tools_list.py` after changing a tool
 (a test fails while it is out of date).
 
-27 tools with `FITNESSE_TOOLSETS=all` and no other flags, each mapping to
+19 tools with `FITNESSE_TOOLSETS=all` and no other flags, most mapping to
 one FitNesse responder. Set `FITNESSE_FILES_ROOT` to the files-section
 resource root on your FitNesse instance to also expose `fitnesse_list_files`,
 `fitnesse_create_dir`, `fitnesse_upload_file`, `fitnesse_download_file`,
-`fitnesse_delete_file`, and `fitnesse_rename_file` (33 total), add `complete`
-to `FITNESSE_TOOLSETS` for 16 additional lower-traffic tools (49), `debug` for
-the 17 KDTA debug tools (66), `FITNESSE_ALLOW_SHUTDOWN=1` for
+`fitnesse_delete_file`, and `fitnesse_rename_file` (25 total), add `complete`
+to `FITNESSE_TOOLSETS` for 21 additional lower-traffic tools (46), `debug` for
+the 13 KDTA debug tools (59), `FITNESSE_ALLOW_SHUTDOWN=1` for
 `fitnesse_shutdown`, and `FITNESSE_ALLOW_ACCOUNT_ADMIN=1` for
-`fitnesse_save_account` (68). The modes in `FITNESSE_TOOLSETS` filter all of
+`fitnesse_save_account` (61). The modes in `FITNESSE_TOOLSETS` filter all of
 these. Visible tools:
 
 | `FITNESSE_TOOLSETS` | no flags | + `FITNESSE_FILES_ROOT` | + `FITNESSE_FILES_ROOT`, `,complete` | + `,complete`, all flags |
 |---|---|---|---|---|
-| `read` | 12 | 14 | 29 | 29 |
-| `read,debug` | 19 | 21 | 36 | 36 |
-| `read,test` | 15 | 17 | 32 | 32 |
-| `read,test,debug` | 26 | 28 | 43 | 43 |
-| `read,write` | 24 | 30 | 46 | 48 |
-| `all` (= `read,write,test`) | 27 | 33 | 49 | 51 |
-| `all,debug` | 44 | 50 | 66 | 68 |
+| `read` | 8 | 10 | 26 | 26 |
+| `read,debug` | 15 | 17 | 33 | 33 |
+| `read,test` | 11 | 13 | 29 | 29 |
+| `read,test,debug` | 22 | 24 | 40 | 40 |
+| `read,write` | 16 | 22 | 43 | 45 |
+| `all` (= `read,write,test`) | 19 | 25 | 46 | 48 |
+| `all,debug` | 32 | 38 | 59 | 61 |
 
 `write` or `test` without `read` work too, but leave the model blind to what
 it changes or runs.
@@ -406,13 +429,13 @@ Compatibility details:
 | `fitnesse_get_page_data` | `pageData`; also returns `edit_time` / `ticket_id` (from `edit`) for the conflict check of `fitnesse_save_page_content` |
 | `fitnesse_get_packet` | `packet` — all tables on a page, as JSON _(needs `complete`)_ |
 | `fitnesse_get_properties` | `properties` |
-| `fitnesse_get_variables` | `variables` |
+| `fitnesse_get_variables` | `variables`, condensed: `name`, `value`, `location`; secrets masked |
 | `fitnesse_list_names` | `names` |
 | `fitnesse_edit_page` | `edit` — with redirect/nonExistent options _(needs `complete`)_ |
 | `fitnesse_get_page_content` | `edit` — convenience alias _(needs `complete`)_ |
 | `fitnesse_get_new_page_form` | `new` _(needs `complete`)_ |
 | `fitnesse_get_refactor_screen` | `refactor` _(needs `complete`)_ |
-| `fitnesse_get_rss` | `rss` |
+| `fitnesse_get_rss` | `rss` _(needs `complete`)_ |
 | `fitnesse_get_proxy_data` | `proxy` — serialized page data used by import _(needs `complete`)_ |
 
 ### Pages — write
@@ -426,9 +449,9 @@ Compatibility details:
 | `fitnesse_move_page` | `movePage` — optional `refactorReferences` |
 | `fitnesse_delete_page` | `deletePage` — optional `deleteVersions` (20261101) |
 | `fitnesse_replace` | `replace` — text (regex) or method replace below a page |
-| `fitnesse_manage_symlink` | `symlink` |
-| `fitnesse_import_pages` | `import` |
-| `fitnesse_import_and_view` | `importAndView` |
+| `fitnesse_manage_symlink` | `symlink` _(needs `complete`)_ |
+| `fitnesse_import_pages` | `import` _(needs `complete`)_ |
+| `fitnesse_import_and_view` | `importAndView` _(needs `complete`)_ |
 | `fitnesse_publish` | `publish` _(needs `complete`)_ |
 
 ### Tests
@@ -450,19 +473,16 @@ Compatibility details:
 |---|---|---|
 | `fitnesse_get_test_history` | `testHistory` — XML, or HTML with `results`/`trim` _(needs `complete`)_ | read |
 | `fitnesse_get_execution_log` | `executionLog` _(needs `complete`)_ | read |
-| `fitnesse_get_page_history` | `pageHistory` (`format=xml`), condensed: without `result_date` the `runs`; for a suite run `final_counts`, `pages` and `failed_pages`; for a test run `outcome`, `counts` and only the failing `tables` (as in the debug tools). `raw=true` for the XML _(drops `executionLog` `command`/`stdOut`/`stdErr` unless `include_command`/`include_stdout`/`include_stderr`)_ | read |
-| `fitnesse_compare_history` | `compareHistory` | read |
-| `fitnesse_get_versions` | `versions` | read |
-| `fitnesse_view_version` | `viewVersion` | read |
-| `fitnesse_compare_versions` | `compareVersions` — one version against latest, or two | read |
+| `fitnesse_get_page_history` | `pageHistory` (`format=xml`), condensed: without `result_date` the `runs`; for a suite run `final_counts`, `pages` and `failed_pages`; for a test run `outcome`, `counts` and only the failing `tables` (as in the debug tools). With `compare_to` (a second result date): what differs between two runs, the tables whose rows differ as diffs for a test page, the pages whose outcome differs for a suite (replaces `compareHistory`, whose answer is both reports as HTML). `raw=true` for the XML _(drops `executionLog` `command`/`stdOut`/`stdErr` unless `include_command`/`include_stdout`/`include_stderr`)_ | read |
+| `fitnesse_page_versions` | `versions` (list: `current`, `versions`), with `version` `viewVersion` (`content`, as text), with `version` and `compare_to` `compareVersions` (`diff`, one version against `latest` or another) | read |
 | `fitnesse_rollback_version` | `rollback` | write |
-| `fitnesse_purge_history` | `purgeHistory` — page subtree, or all with `purge_global` | write |
+| `fitnesse_purge_history` | `purgeHistory` — page subtree, or all with `purge_global` _(needs `complete`)_ | write |
 
 ### Search
 
 | Tool | Responder |
 |---|---|
-| `fitnesse_search` | `search` — title/content, method search, `searchScope` — read |
+| `fitnesse_search` | `search` — title/content, method search, `searchScope`; result parsed to `matches` — read |
 | `fitnesse_search_properties` | `searchProperties` — page types, tags, actions, security, SetUp/TearDown, skipped, `searchScope` — read _(needs `complete`)_ |
 | `fitnesse_get_search_form` | `searchForm` — read _(needs `complete`)_ |
 | `fitnesse_where_used` | `whereUsed` — read _(needs `complete`)_ |
@@ -500,7 +520,7 @@ All need `debug` in `FITNESSE_TOOLSETS`, plus the listed mode.
 | `fitnesse_debug_defined_action_source` | `debugTable definedAction` (with the session, or `page=` without one). Forks without it: page of the defined action from `keywords`, then `debugTable source` of that page, cut to the definition block as FitLibrary reads it (header first or after `----`, exactly four dashes anywhere between two tables, up to the next one; `-----` and dashes inside `!-…-!`, `{{{…}}}` or `#` comments don't separate; refuses a header found twice) | read |
 | `fitnesse_debug_end` | the current page's TearDown tables not run yet (`pageHtml`, `runTable`; `teardown.teardown_tables`); single page with a SuiteTearDown, after a `fitnesse_debug_run_page`: `nextPage` to the SuiteTearDown and run it (`suite_teardown`); `skip_teardown` leaves both out; `log` (number of lines), then `end` or `abort` with `logFrom` and `logMax` (mod #162; older forks send all lines from `logFrom`, cut here): the last unread log lines | test |
 | `fitnesse_table_source` | `debugTable source` | read |
-| `fitnesse_table_save`, `fitnesse_table_insert`, `fitnesse_table_delete`, `fitnesse_table_move`, `fitnesse_table_save_text`, `fitnesse_table_move_text` | `debugTable save`/`saveBlock`, `insert`, `delete`, `move`, `saveText`, `moveText` — saves the wiki page, refused with 409 if it changed since it was read. The result's `source` is the page after the change (from the answer since mod #157, else read again). With `reload_defined_actions=true` every `fitnesse_table_*` edit sends `reload=true` with the session, so the fork reloads the page's defined actions; forks that don't answer `reloaded` get `\|define actions at\|.<page>\|` via `runWiki` instead | write |
+| `fitnesse_table_edit` (`action` = `save`, `insert`, `delete`, `move`), `fitnesse_table_edit_text` (`action` = `save`, `move`) | `debugTable save`/`saveBlock`, `insert`, `delete`, `move`; `saveText`, `moveText` — saves the wiki page; an argument that does not fit the action is refused before anything is sent. Saving is refused with 409 if it changed since it was read. The result's `source` is the page after the change (from the answer since mod #157, else read again). With `reload_defined_actions=true` every edit sends `reload=true` with the session, so the fork reloads the page's defined actions; forks that don't answer `reloaded` get `\|define actions at\|.<page>\|` via `runWiki` instead | write |
 
 Dependencies between the tools (the same rules go to MCP clients as server
 `instructions` when a session can be used, i.e. with `read,test,debug` in
@@ -513,14 +533,14 @@ fitnesse_debug_start                                                opens the se
         ├─ fitnesse_debug_run_page(setup_only=true)                   SetUp first: browser, defined actions
         ├─ fitnesse_debug_inspect(kind='keywords')                    categories; with filter: exact wording
         ├─ fitnesse_debug_inspect(kind='definedActions')              defined actions loaded in the session
-        │     └─ fitnesse_debug_defined_action_source ──> fitnesse_table_save(…, reload_defined_actions=true)
+        │     └─ fitnesse_debug_defined_action_source ──> fitnesse_table_edit(action='save', …, reload_defined_actions=true)
         ├─ fitnesse_debug_run_wiki                                    ad-hoc tables, no SetUp/TearDown
         ├─ fitnesse_debug_page_tables ──> fitnesse_debug_run_page(tables=[…])
         ├─ fitnesse_debug_status                                      progress, log, busy
         │
 fitnesse_debug_end                                                    tear down, frees the session
 
-fitnesse_table_source ──> fitnesse_table_save / _insert / _delete / _move / _save_text / _move_text   no session needed
+fitnesse_table_source ──> fitnesse_table_edit / fitnesse_table_edit_text   no session needed
                               └─ result.source ──> next edit
 ```
 
@@ -571,7 +591,7 @@ fitnesse_table_source ──> fitnesse_table_save / _insert / _delete / _move / 
   it can't be read). As with the console of the browser debugger, try
   corrected versions of the table with `run_wiki`, which runs them in the
   session and saves nothing, until one passes; save that one once with
-  `fitnesse_table_save`. If none passes (the application is wrong, not the
+  `fitnesse_table_edit`. If none passes (the application is wrong, not the
   test), report that instead. Either way `run_page()` then continues at `next_table` (also in `fitnesse_debug_status`);
   `page_done=true` when all tables ran. Outside a suite session the same goes
   for the SuiteSetUp: if it stops, the result has `suite_setup.stopped_at` and
@@ -586,7 +606,7 @@ fitnesse_table_source ──> fitnesse_table_save / _insert / _delete / _move / 
 - **Building a test: passed steps are noted.** Every `run_wiki` call whose
   tables all pass is noted as a step (`step` in its result; `record=false`
   for tables that only look around). `fitnesse_debug_steps` lists them with
-  their wiki joined, ready for `fitnesse_table_insert`; `drop` leaves tries
+  their wiki joined, ready for `fitnesse_table_edit(action='insert')`; `drop` leaves tries
   out, `clear=true` forgets them after saving. They stay after
   `fitnesse_debug_end`; a new `fitnesse_debug_start` clears them. A SetUp is
   built the same way and saved on the SetUp page (see
@@ -643,7 +663,7 @@ fitnesse_table_source ──> fitnesse_table_save / _insert / _delete / _move / 
 - **Defined actions:** `inspect(kind='definedActions')` lists what
   `|define actions at|` has loaded into the session (empty before). To edit
   one, `fitnesse_debug_defined_action_source` gives `page`, `index`, `last`
-  and `original` for `fitnesse_table_save(..., reload_defined_actions=true)`,
+  and `original` for `fitnesse_table_edit(action='save', ..., reload_defined_actions=true)`,
   which makes the session run the new version at once. Forks with
   `debugTable definedAction` (mod #156 + lib #84) pick the definition as a
   run would; on older ones (400, or 501 `unsupported`) the MCP finds the block

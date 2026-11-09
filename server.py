@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 import binascii
+import difflib
 from html import unescape as _unescape_html
 import http.client
 import json
@@ -55,7 +56,7 @@ type WikiPath = Annotated[
 type FilesPath = Annotated[
     str,
     Field(
-        description="Path under the FitNesse files section, e.g. 'files/images'. Must start with the resource root configured via FITNESSE_FILES_ROOT (default 'files'). No leading slash."
+        description="Directory in the FitNesse files section, e.g. 'files/images'. Has to start with the root set in FITNESSE_FILES_ROOT (usually 'files'). No leading slash."
     ),
 ]
 type PageName = Annotated[
@@ -74,6 +75,16 @@ type RunFormat = Annotated[
     Literal["xml", "junit", "text"],
     Field(description="xml: full report; junit: simple jUnit XML; text: plain text summary."),
 ]
+
+
+type _ANY_TAG = Annotated[str | None, Field(description="Only tests with any of these comma-separated tags.")]
+type _ALL_TAGS = Annotated[str | None, Field(description="Only tests with all of these comma-separated tags.")]
+type _NO_TAG = Annotated[str | None, Field(description="Leave out tests with any of these comma-separated tags.")]
+type _FIRST_TEST = Annotated[str | None, Field(description="Start at this test page (in run order) and leave out those before it.")]
+type _VERSION = Annotated[str, Field(description="A version id from fitnesse_page_versions, e.g. 'jane-20261109143000'.")]
+type _NO_HISTORY = Annotated[bool, Field(description="Do not store the run in the test history.")]
+type _NO_CHUNK = Annotated[bool, Field(description="Have FitNesse send the report in one piece; does not change it.")]
+type _RUN_VARIABLES = Annotated[dict[str, str] | None, Field(description="Page variables for this run, e.g. {'BASE_URL': 'https://test.example'}; they override those defined on the pages.")]
 
 
 def _env_flag(name: str) -> bool:
@@ -343,6 +354,19 @@ def _retrying(once):
     return call
 
 
+def _page_change(result: dict, done: str) -> dict:
+    """The short answer of a tool that changes pages: FitNesse answers with a whole page (15-50k characters)."""
+    out = {"ok": result.get("ok", False), "status": result.get("status")}
+    if result.get("ok"):
+        out["message"] = done
+        return out
+    out["error"] = result.get("error", "")
+    body = result.get("body")
+    if isinstance(body, str) and body:
+        out["message"] = _plain_text(re.sub(r"(?s)<(script|style)\b.*?</\1>", "", body))[:300]
+    return out
+
+
 @_retrying
 def _request(
     method: str,
@@ -534,7 +558,12 @@ def _build_multipart_form_data(
 
 @mcp.tool(
     name="fitnesse_add_child_page",
-    description="Creates a new child page beneath the selected page using pageName and pageContent, with optional pageTemplate, pageType, help text and tags (suites).",
+    description=(
+        'Creates a page below parent_page_path with the given wiki text. page_type makes it a '
+        'Test page (can run), a Suite (runs its child pages) or Static; without it FitNesse '
+        "decides by the name (e.g. a name starting or ending with Test). Result: ok, status and a short "
+        'message; read the page back with fitnesse_get_page_data.'
+    ),
     tags={"fitnesse", "rest", "pages", "write"},
     annotations={"destructiveHint": False},
 )
@@ -542,62 +571,36 @@ def fitnesse_add_child_page(
     parent_page_path: WikiPath,
     page_name: PageName,
     page_content: PageContent = "",
-    page_template: str | None = None,
+    page_template: Annotated[str | None, Field(description="Path of a template page whose content the new page starts with, e.g. '.TemplateLibrary.TestPage'; page_content then is ignored.")] = None,
     page_type: PageType | None = None,
-    help_text: str | None = None,
+    help_text: Annotated[str | None, Field(description="Short description, shown next to the page's link in listings.")] = None,
     suites: Annotated[str | None, Field(description="Comma-separated tags for the new page.")] = None,
     timeout_seconds: float = _make_timeout(30.0),
 ) -> dict:
     """Create a child page using responder=addChild."""
-    params: dict[str, str | None] = {
-        "responder": "addChild",
-        "pageName": page_name,
-        "pageContent": page_content,
-    }
+    # POST like the browser's form (FitNesse answers 303 to the new page): a long page_content
+    # does not fit into a URL.
+    form: dict[str, str] = {"responder": "addChild", "pageName": page_name, "pageContent": page_content}
     if page_template:
-        params["pageTemplate"] = page_template
+        form["pageTemplate"] = page_template
     if page_type:
-        params["pageType"] = page_type
+        form["pageType"] = page_type
     if help_text:
-        params["helpText"] = help_text
+        form["helpText"] = help_text
     if suites:
-        params["suites"] = suites
-    return _request(
-        "GET", parent_page_path, params=params, timeout_seconds=timeout_seconds
-    )
-
-
-@mcp.tool(
-    name="fitnesse_compare_history",
-    description="Generates a report comparing two test result files for a page history responder call.",
-    tags={"fitnesse", "rest", "history", "read"},
-    annotations={"readOnlyHint": True},
-)
-def fitnesse_compare_history(
-    page_path: WikiPath,
-    first_result_file: str,
-    second_result_file: str,
-    timeout_seconds: float = _make_timeout(60.0),
-) -> dict:
-    """Compare two history result files via responder=compareHistory."""
-    # list of tuples preserves both params even when both filenames are equal
-    return _request(
-        "GET",
-        page_path,
-        params=[
-            ("responder", "compareHistory"),
-            (first_result_file, None),
-            (second_result_file, None),
-        ],
-        timeout_seconds=timeout_seconds,
-    )
+        form["suites"] = suites
+    result = _request("POST", parent_page_path, body=parse.urlencode(form),
+                      content_type="application/x-www-form-urlencoded", timeout_seconds=timeout_seconds)
+    return _page_change(result, f"Created {parent_page_path}.{page_name}. Read it with fitnesse_get_page_data.")
 
 
 if os.getenv("FITNESSE_FILES_ROOT"):
 
     @mcp.tool(
         name="fitnesse_create_dir",
-        description="Creates a new directory in the files section below the given resource using dirname.",
+        description=(
+            'Creates the directory dirname in a directory of the files section.'
+        ),
         tags={"fitnesse", "rest", "files", "write"},
         annotations={"destructiveHint": False, "idempotentHint": True},
     )
@@ -620,7 +623,10 @@ if os.getenv("FITNESSE_FILES_ROOT"):
 
 @mcp.tool(
     name="fitnesse_delete_page",
-    description="Deletes the specified page.",
+    description=(
+        'Deletes the page together with all its child pages. Only on request: there is no '
+        'undo.'
+    ),
     tags={"fitnesse", "rest", "pages", "write"},
     annotations={"destructiveHint": True},
 )
@@ -636,14 +642,18 @@ def fitnesse_delete_page(
     params: dict[str, str | None] = {"responder": "deletePage", "confirmed": "yes"}
     if delete_versions:
         params["deleteVersions"] = "yes"
-    return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+    result = _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+    return _page_change(result, f"Deleted {page_path} with its child pages.")
 
 
 if os.getenv("FITNESSE_FILES_ROOT"):
 
     @mcp.tool(
         name="fitnesse_delete_file",
-        description="Deletes a file from the files section directory identified by the resource and filename.",
+        description=(
+            'Deletes a file, or a directory with everything in it, from a directory of the files '
+            'section. No undo.'
+        ),
         tags={"fitnesse", "rest", "files", "write"},
         annotations={"destructiveHint": True},
     )
@@ -705,7 +715,8 @@ if COMPLETE_TOOLSET:
             "special covers SetUp/TearDown pages: listed kinds are included, unlisted excluded. "
             "prune=true finds only pages marked as skipped. Searches page_path and its children "
             "unless search_scope names an ancestor or 'root'. Navigation actions (RecentChanges, "
-            "Files, Search) are only matched by FitNesse 20261101 or later."
+            "Files, Search) are only matched by FitNesse 20261101 or later. Result: matches (page, type, "
+            "tags, last_modified) and count."
         ),
         tags={"fitnesse", "rest", "search", "read"},
         annotations={"readOnlyHint": True},
@@ -730,7 +741,8 @@ if COMPLETE_TOOLSET:
         timeout_seconds: float = _make_timeout(60.0),
     ) -> dict:
         """Search by properties via responder=searchProperties."""
-        params: dict[str, str | None] = {"responder": "searchProperties"}
+        # without searchType netcare's FitNesse answers with the search form only
+        params: dict[str, str | None] = {"responder": "searchProperties", "searchType": "Search Properties"}
         if page_types:
             # "PageType": the only name FitNesse 20251025 reads; 20261101 still accepts it.
             params["PageType"] = ",".join(page_types)
@@ -743,13 +755,16 @@ if COMPLETE_TOOLSET:
             params["Prune"] = None
         if search_scope:
             params["searchScope"] = search_scope
-        return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+        return _search_matches(_request("GET", page_path, params=params, timeout_seconds=timeout_seconds))
 
 if os.getenv("FITNESSE_FILES_ROOT"):
 
     @mcp.tool(
         name="fitnesse_list_files",
-        description="Displays a directory listing in the files section for the selected files resource. Returns result as JSON.",
+        description=(
+            'Lists a directory of the files section (uploads, screenshots, reports) as JSON '
+            '(body): its files and subdirectories.'
+        ),
         tags={"fitnesse", "rest", "files", "read"},
         annotations={"readOnlyHint": True},
     )
@@ -767,7 +782,10 @@ if os.getenv("FITNESSE_FILES_ROOT"):
 
     @mcp.tool(
         name="fitnesse_download_file",
-        description="Downloads a file from the files section directory identified by the resource and filename, returning its content directly as an image or text/binary resource.",
+        description=(
+            'Reads a file of the files section: an image comes back as an image, anything else as '
+            'a resource with its content.'
+        ),
         tags={"fitnesse", "rest", "files", "read"},
         annotations={"readOnlyHint": True},
     )
@@ -857,54 +875,63 @@ def _import_pages(
     return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
 
 
-@mcp.tool(
-    name="fitnesse_import_pages",
-    description="Imports a page hierarchy from a foreign FitNesse using remoteUrl with optional credentials and autoUpdate.",
-    tags={"fitnesse", "rest", "pages", "write"},
-    annotations={"destructiveHint": False},
-)
-def fitnesse_import_pages(
-    page_path: WikiPath,
-    remote_url: str,
-    remote_username: str | None = None,
-    remote_password: str | None = None,
-    auto_update: bool = False,
-    timeout_seconds: float = _make_timeout(60.0),
-) -> dict:
-    return _import_pages(
-        page_path,
-        remote_url,
-        remote_username,
-        remote_password,
-        auto_update,
-        False,
-        timeout_seconds,
+if COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_import_pages",
+        description=(
+            'Imports the pages below remote_url, a page of another FitNesse, as children of '
+            'page_path. auto_update=true imports them again whenever the page is viewed.'
+        ),
+        tags={"fitnesse", "rest", "pages", "write"},
+        annotations={"destructiveHint": False},
     )
+    def fitnesse_import_pages(
+        page_path: WikiPath,
+        remote_url: str,
+        remote_username: str | None = None,
+        remote_password: str | None = None,
+        auto_update: bool = False,
+        timeout_seconds: float = _make_timeout(60.0),
+    ) -> dict:
+        return _import_pages(
+            page_path,
+            remote_url,
+            remote_username,
+            remote_password,
+            auto_update,
+            False,
+            timeout_seconds,
+        )
 
 
-@mcp.tool(
-    name="fitnesse_import_and_view",
-    description="Imports a page hierarchy if needed and then views the selected page.",
-    tags={"fitnesse", "rest", "pages", "write"},
-    annotations={"destructiveHint": False},
-)
-def fitnesse_import_and_view(
-    page_path: WikiPath,
-    remote_url: str,
-    remote_username: str | None = None,
-    remote_password: str | None = None,
-    auto_update: bool = False,
-    timeout_seconds: float = _make_timeout(60.0),
-) -> dict:
-    return _import_pages(
-        page_path,
-        remote_url,
-        remote_username,
-        remote_password,
-        auto_update,
-        True,
-        timeout_seconds,
+if COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_import_and_view",
+        description=(
+            "As fitnesse_import_pages, but answers with the imported page's view."
+        ),
+        tags={"fitnesse", "rest", "pages", "write"},
+        annotations={"destructiveHint": False},
     )
+    def fitnesse_import_and_view(
+        page_path: WikiPath,
+        remote_url: str,
+        remote_username: str | None = None,
+        remote_password: str | None = None,
+        auto_update: bool = False,
+        timeout_seconds: float = _make_timeout(60.0),
+    ) -> dict:
+        return _import_pages(
+            page_path,
+            remote_url,
+            remote_username,
+            remote_password,
+            auto_update,
+            True,
+            timeout_seconds,
+        )
 
 
 if COMPLETE_TOOLSET:
@@ -931,13 +958,16 @@ if COMPLETE_TOOLSET:
 
 @mcp.tool(
     name="fitnesse_move_page",
-    description="Moves the selected page below a different parent page using newLocation.",
+    description=(
+        'Moves the page with its child pages below another parent page; its name stays. To '
+        'rename it, use fitnesse_rename_page.'
+    ),
     tags={"fitnesse", "rest", "pages", "write"},
     annotations={"destructiveHint": False},
 )
 def fitnesse_move_page(
     page_path: WikiPath,
-    new_location: str,
+    new_location: Annotated[str, Field(description="Path of the new parent page, e.g. 'FrontPage.Archive'; empty for the top level.")],
     refactor_references: Annotated[
         bool, Field(description="Also update references to the moved page.")
     ] = False,
@@ -947,21 +977,26 @@ def fitnesse_move_page(
     params: dict[str, str | None] = {"responder": "movePage", "newLocation": new_location}
     if refactor_references:
         params["refactorReferences"] = None
-    return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+    result = _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+    return _page_change(result, f"Moved {page_path} below {new_location or 'the top level'}.")
 
 
 @mcp.tool(
     name="fitnesse_list_names",
-    description="Lists page names at the current level and supports Recursive, LeafOnly, ShowTags, and ShowChildCount. Returns JSON.",
+    description=(
+        'Lists the child pages of page_path (default: the top level) as a list of names '
+        '(body). recursive=true lists the whole subtree as paths relative to page_path. Use it '
+        'to find pages; fitnesse_search finds them by content.'
+    ),
     tags={"fitnesse", "rest", "pages", "read"},
     annotations={"readOnlyHint": True},
 )
 def fitnesse_list_names(
     page_path: WikiPath = "",
-    recursive: bool = False,
-    leaf_only: bool = False,
-    show_tags: bool = False,
-    show_child_count: bool = False,
+    recursive: Annotated[bool, Field(description="All pages below page_path, not only its children.")] = False,
+    leaf_only: Annotated[bool, Field(description="Only pages without children.")] = False,
+    show_tags: Annotated[bool, Field(description="Append each page's tags to its name.")] = False,
+    show_child_count: Annotated[bool, Field(description="Append each page's number of children to its name, e.g. 'MySuite 4'.")] = False,
     timeout_seconds: float = _make_timeout(30.0),
 ) -> dict:
     """List page names using responder=names."""
@@ -1038,10 +1073,10 @@ def _edit_session(page_path: str, timeout_seconds: float) -> dict[str, str | Non
 @mcp.tool(
     name="fitnesse_get_page_data",
     description=(
-        "Returns the raw wiki text of the selected page via pageData responder (body), plus "
-        "edit_time and ticket_id. Pass both to fitnesse_save_page_content when saving changes "
-        "based on this text: if someone else saved the page in between, the save fails "
-        "instead of overwriting their change."
+        'Returns the wiki text of a page (body), plus edit_time and ticket_id. Pass both to '
+        'fitnesse_save_page_content when saving a change based on this text: if someone else '
+        'saved the page in between, the save then fails instead of overwriting their change. '
+        'Text of included pages (SetUp, !include) is not part of it.'
     ),
     tags={"fitnesse", "rest", "pages", "read"},
     annotations={"readOnlyHint": True},
@@ -1072,17 +1107,22 @@ def fitnesse_get_page_data(
         "run. For a suite: final_counts and pages (page, outcome, counts, result_date; failed_pages "
         "lists the red ones): call again with a failing page and its result_date. For a test page: "
         "outcome, counts and tables, only the tables with a [fail] or [error] cell, cells prefixed "
-        "[pass]/[fail]/[error]/[ignore]. raw=true returns FitNesse's XML instead."
+        "[pass]/[fail]/[error]/[ignore]. With compare_to (a second result_date; result_date then "
+        "defaults to 'latest'): what differs between the two runs. Test page: differences, the "
+        "tables whose rows are not the same in both, each as a diff (+ lines are from run, - lines "
+        "from compared_to). Suite: the pages whose outcome differs. raw=true returns FitNesse's "
+        "XML instead."
     ),
     tags={"fitnesse", "rest", "history", "read"},
     annotations={"readOnlyHint": True},
 )
 def fitnesse_get_page_history(
     page_path: WikiPath,
-    result_date: str | None = None,
-    include_command: bool = False,
-    include_stdout: bool = False,
-    include_stderr: bool = False,
+    result_date: Annotated[str | None, Field(description="A run: result_date from runs (yyyyMMddHHmmss), or 'latest'.")] = None,
+    compare_to: Annotated[str | None, Field(description="result_date of a second run to compare the first with.")] = None,
+    include_command: Annotated[bool, Field(description="Also return the command line that started the test process.")] = False,
+    include_stdout: Annotated[bool, Field(description="Also return the test process's output (can be very large).")] = False,
+    include_stderr: Annotated[bool, Field(description="Also return the test process's error output.")] = False,
     raw: Annotated[bool, Field(description="Return FitNesse's XML (body) instead of the condensed result.")] = False,
     timeout_seconds: float = _make_timeout(30.0),
 ) -> dict:
@@ -1091,6 +1131,8 @@ def fitnesse_get_page_history(
     The executionLog's command, stdOut and stdErr are dropped unless requested;
     stdOut alone can be megabytes and break MCP clients.
     """
+    if compare_to:
+        return _compare_runs(page_path, result_date or "latest", compare_to, timeout_seconds)
     params: dict[str, str | None] = {"responder": "pageHistory", "format": "xml"}
     if result_date:
         params["resultDate"] = result_date
@@ -1128,6 +1170,98 @@ def fitnesse_get_page_history(
         )
         result["truncated"] = True
     result["body"] = xml_bytes[:MAX_BYTES].decode("utf-8", errors="replace")
+    return result
+
+
+_MAX_RUN_DIFFERENCES = 10
+
+
+def _stored_run(page_path: str, result_date: str, timeout_seconds: float) -> dict:
+    """One stored run for comparing: kind ('suite' or 'test'), head (what to show of it), and
+    pages ({page: entry}) or tables ([(number, text)])."""
+    result = _request_bytes("GET", page_path, timeout_seconds=timeout_seconds,
+                            params={"responder": "pageHistory", "format": "xml", "resultDate": result_date})
+    try:
+        root = ET.fromstring(result["body"]) if result.get("ok") and not result.get("truncated") else None
+    except ET.ParseError:
+        root = None
+    if root is None or root.tag not in ("suiteResults", "testResults"):
+        raise ToolError(f"No stored run of {page_path} with result_date {result_date!r} "
+                        f"({result.get('error') or 'FitNesse did not answer with a test result'}). "
+                        "List the runs with fitnesse_get_page_history(page_path).")
+    summary = _history_summary(result["body"]) or {}
+    if root.tag == "suiteResults":
+        return {"kind": "suite", "pages": {p["page"]: p for p in summary["pages"]},
+                "head": {"result_date": result_date, "date": summary.get("date"),
+                         "final_counts": summary.get("final_counts")}}
+    res = root.find("result")
+    content = (res.findtext("content") if res is not None else None) or ""
+    return {"kind": "test", "tables": [b for b in _table_blocks(content) if b[0] is not None],
+            "head": {"result_date": result_date, "date": summary.get("date"),
+                     "outcome": summary.get("outcome"), "counts": summary.get("counts")}}
+
+
+def _capped_lines(lines: list[str], limit: int = 40) -> str:
+    if len(lines) > limit:
+        lines = [*lines[:limit], f"… [{len(lines) - limit} more lines]"]
+    return "\n".join(lines)
+
+
+def _rows_only(block: str) -> str:
+    """A table's rows without its number, links and images: those differ in every run."""
+    return "\n".join(line for line in block.splitlines() if line.startswith("| "))
+
+
+def _compare_runs(page_path: str, result_date: str, compare_to: str, timeout_seconds: float) -> dict:
+    """What differs between two stored runs of a page. FitNesse's own compareHistory answers with
+    the two full reports side by side as HTML, close to a megabyte for one test page."""
+    run = _stored_run(page_path, result_date, timeout_seconds)
+    other = _stored_run(page_path, compare_to, timeout_seconds)
+    if run["kind"] != other["kind"]:
+        raise ToolError(f"{result_date!r} is a {run['kind']} run and {compare_to!r} a {other['kind']} run of "
+                        f"{page_path}: they cannot be compared.")
+    result: dict = {"ok": True, "page": page_path, "run": run["head"], "compared_to": other["head"]}
+    differences: list[dict] = []
+    if run["kind"] == "suite":
+        same = 0
+        for page in dict.fromkeys([*run["pages"], *other["pages"]]):
+            a, b = run["pages"].get(page), other["pages"].get(page)
+            if a and b and a["outcome"] == b["outcome"]:
+                same += 1
+                continue
+            differences.append({
+                "page": page,
+                "run": a["outcome"] if a else "not in this run",
+                "compared_to": b["outcome"] if b else "not in this run",
+                **({"run_result_date": a["result_date"]} if a else {}),
+                **({"compared_to_result_date": b["result_date"]} if b else {}),
+            })
+        result["pages_same"] = same
+    else:
+        ours, theirs = run["tables"], other["tables"]
+        matcher = difflib.SequenceMatcher(
+            None, [_rows_only(t) for _, t in ours], [_rows_only(t) for _, t in theirs], autojunk=False)
+        same = 0
+        for op, i1, i2, j1, j2 in matcher.get_opcodes():
+            if op == "equal":
+                same += i2 - i1
+                continue
+            for k in range(max(i2 - i1, j2 - j1)):
+                a = ours[i1 + k] if i1 + k < i2 else None
+                b = theirs[j1 + k] if j1 + k < j2 else None
+                if a and b:
+                    lines = list(difflib.unified_diff(
+                        b[1].splitlines()[1:], a[1].splitlines()[1:], lineterm="", n=1))[2:]
+                    entry = {"table": a[0], "diff": _capped_lines(lines)}
+                else:
+                    only = a or b
+                    entry = {"table": only[0], "only_in": "run" if a else "compared_to",
+                             "text": _capped_lines(only[1].splitlines())}
+                differences.append(entry)
+        result["tables_same"] = same
+    if len(differences) > _MAX_RUN_DIFFERENCES:
+        result["differences_left_out"] = len(differences) - _MAX_RUN_DIFFERENCES
+    result["differences"] = differences[:_MAX_RUN_DIFFERENCES]
     return result
 
 
@@ -1217,6 +1351,7 @@ def _history_summary(xml_bytes: bytes) -> dict | None:
 # …', 'X-Api-Key=…', JSON bodies and 'key:value' query parameters), masked before a model sees
 # them. The names stay, and an auth scheme (Bearer, Basic): the log still shows what was set.
 _SECRET_NAME = r"(?!access-control-)[\w.-]*(?:authorization|api[-_]?key|token|secret|passw(?:or)?d|pwd|j?session[-_]?id|credential)[\w.-]*"
+_SECRET_VARIABLE = re.compile(_SECRET_NAME, re.I)
 _QUOTE = r'(?:"|&quot;)'
 _SCHEME = r"((?:bearer|basic|digest|negotiate|ntlm|token)\s+)?"
 _SECRET_QUOTED = re.compile(  # "name": "value with spaces"
@@ -1250,7 +1385,13 @@ def _strip_execution_log(raw: bytes, tags: set[str]) -> bytes:
 
 @mcp.tool(
     name="fitnesse_get_properties",
-    description="Displays the properties form for the selected page. Returns JSON.",
+    description=(
+        'Returns the properties of a page as JSON (body): its type (Test, Suite; neither = '
+        'static), the flags for the actions shown (Edit, Versions, Properties, Refactor, '
+        'WhereUsed, RecentChanges, Files, Search), the security flags (secure-read, '
+        'secure-write, secure-test), Prune (skipped in suite runs), and Help and Suites (tags) '
+        'when set. Change them with fitnesse_save_properties.'
+    ),
     tags={"fitnesse", "rest", "pages", "read"},
     annotations={"readOnlyHint": True},
 )
@@ -1289,23 +1430,28 @@ if COMPLETE_TOOLSET:
         )
 
 
-@mcp.tool(
-    name="fitnesse_purge_history",
-    description="Purges test history files older than `days` for the selected page and its children; purge_global=true purges the history of all pages instead.",
-    tags={"fitnesse", "rest", "pages", "write"},
-    annotations={"destructiveHint": True},
-)
-def fitnesse_purge_history(
-    days: int,
-    page_path: WikiPath = "",
-    purge_global: bool = False,
-    timeout_seconds: float = _make_timeout(120.0),
-) -> dict:
-    """Purge old history via responder=purgeHistory."""
-    params: dict[str, str | None] = {"responder": "purgeHistory", "days": str(days)}
-    if purge_global:
-        params["purgeGlobal"] = "true"
-    return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+if COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_purge_history",
+        description=(
+            'Deletes the test history older than `days` days of a page and its children; '
+            'purge_global=true that of all pages. Cannot be undone.'
+        ),
+        tags={"fitnesse", "rest", "pages", "write"},
+        annotations={"destructiveHint": True},
+    )
+    def fitnesse_purge_history(
+        days: int,
+        page_path: WikiPath = "",
+        purge_global: bool = False,
+        timeout_seconds: float = _make_timeout(120.0),
+    ) -> dict:
+        """Purge old history via responder=purgeHistory."""
+        params: dict[str, str | None] = {"responder": "purgeHistory", "days": str(days)}
+        if purge_global:
+            params["purgeGlobal"] = "true"
+        return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
 
 
 if COMPLETE_TOOLSET:
@@ -1356,7 +1502,9 @@ if os.getenv("FITNESSE_FILES_ROOT"):
 
     @mcp.tool(
         name="fitnesse_rename_file",
-        description="Renames a file in the files section using filename and newName within the selected directory.",
+        description=(
+            'Renames a file or directory of the files section within its directory.'
+        ),
         tags={"fitnesse", "rest", "files", "write"},
         annotations={"destructiveHint": False, "idempotentHint": True},
     )
@@ -1381,7 +1529,10 @@ if os.getenv("FITNESSE_FILES_ROOT"):
 
 @mcp.tool(
     name="fitnesse_rename_page",
-    description="Renames the selected page using newName and does not perform page moves.",
+    description=(
+        'Gives the page a new name below the same parent; its child pages stay with it. To '
+        'move it elsewhere, use fitnesse_move_page.'
+    ),
     tags={"fitnesse", "rest", "pages", "write"},
     annotations={"destructiveHint": False, "idempotentHint": True},
 )
@@ -1397,18 +1548,23 @@ def fitnesse_rename_page(
     params: dict[str, str | None] = {"responder": "renamePage", "newName": new_name}
     if refactor_references:
         params["refactorReferences"] = None
-    return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+    result = _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+    return _page_change(result, f"Renamed {page_path} to {new_name}.")
 
 
 @mcp.tool(
     name="fitnesse_rollback_version",
-    description="Rolls back a page to a selected version identifier from saved versions.",
+    description=(
+        "Makes a saved version the page's current content again. version is an id from "
+        'fitnesse_page_versions; look at what changes first with '
+        "fitnesse_page_versions(page_path, version, compare_to='latest')."
+    ),
     tags={"fitnesse", "rest", "pages", "write"},
     annotations={"destructiveHint": True},
 )
 def fitnesse_rollback_version(
     page_path: WikiPath,
-    version: str,
+    version: _VERSION,
     timeout_seconds: float = _make_timeout(30.0),
 ) -> dict:
     """Rollback to a saved version via responder=rollback."""
@@ -1420,23 +1576,27 @@ def fitnesse_rollback_version(
     )
 
 
-@mcp.tool(
-    name="fitnesse_get_rss",
-    description="Returns an RSS feed for the current page and all of its children.",
-    tags={"fitnesse", "rest", "pages", "read"},
-    annotations={"readOnlyHint": True},
-)
-def fitnesse_get_rss(
-    page_path: WikiPath,
-    timeout_seconds: float = _make_timeout(30.0),
-) -> dict:
-    """Get RSS feed via responder=rss."""
-    return _request(
-        "GET",
-        page_path,
-        params={"responder": "rss"},
-        timeout_seconds=timeout_seconds,
+if COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_get_rss",
+        description=(
+            'Returns the RSS feed of the recent changes of a page and its children (XML).'
+        ),
+        tags={"fitnesse", "rest", "pages", "read"},
+        annotations={"readOnlyHint": True},
     )
+    def fitnesse_get_rss(
+        page_path: WikiPath,
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """Get RSS feed via responder=rss."""
+        return _request(
+            "GET",
+            page_path,
+            params={"responder": "rss"},
+            timeout_seconds=timeout_seconds,
+        )
 
 
 type PageAttribute = Literal[
@@ -1494,13 +1654,12 @@ _OVERWRITE_EDIT_TIME = str(2**63 - 1)
 @mcp.tool(
     name="fitnesse_save_page_content",
     description=(
-        "Saves wiki page content via POST using pageContent and optional editTime, ticketId, "
-        "and redirect fields. FitNesse removes the page's help text and tags when they are "
-        "not sent, so help_text and suites are kept from the current page unless given; "
-        "pass an empty string to remove them. Without edit_time the save overwrites the page "
-        "(last write wins). With edit_time and ticket_id (from fitnesse_get_page_data) "
-        "FitNesse checks for a conflict: if someone else saved the page since then, nothing "
-        "is saved and the tool fails; re-read the page, merge, and save again."
+        'Saves the wiki text of a page, replacing all of it. Read it first with '
+        "fitnesse_get_page_data and pass that call's edit_time and ticket_id: if someone else "
+        'saved the page since then, nothing is saved and the call fails; read the page again, '
+        'merge, and save again. Without edit_time the save overwrites whatever is there. The '
+        "page's help text and tags are kept unless help_text or suites are given; an empty "
+        'string removes them.'
     ),
     tags={"fitnesse", "rest", "pages", "write"},
     annotations={"destructiveHint": False, "idempotentHint": True},
@@ -1510,9 +1669,9 @@ def fitnesse_save_page_content(
     page_content: PageContent,
     edit_time: Annotated[str | None, Field(description="edit_time returned by fitnesse_get_page_data; enables the conflict check. Omit to overwrite.", pattern=r"^\d+$")] = None,
     ticket_id: Annotated[str | None, Field(description="ticket_id returned by the same fitnesse_get_page_data call; saves with the same ticket never conflict with each other.", pattern=r"^-?\d+$")] = None,
-    redirect: str | None = None,
-    help_text: str | None = None,
-    suites: str | None = None,
+    redirect: Annotated[str | None, Field(description="Not needed: where FitNesse redirects a browser after the save.")] = None,
+    help_text: Annotated[str | None, Field(description="New help text; omit to keep the current one, '' to remove it.")] = None,
+    suites: Annotated[str | None, Field(description="New comma-separated tags; omit to keep the current ones, '' to remove them.")] = None,
     timeout_seconds: float = _make_timeout(30.0),
 ) -> dict:
     """Save a FitNesse page using responder=saveData form payload."""
@@ -1554,7 +1713,7 @@ def fitnesse_save_page_content(
             "into the current content, and save with a fresh edit_time (or without edit_time "
             "to overwrite)."
         )
-    return result
+    return _page_change(result, f"Saved {page_path}.")
 
 
 @mcp.tool(
@@ -1613,39 +1772,73 @@ def fitnesse_save_properties(
 @mcp.tool(
     name="fitnesse_search",
     description=(
-        "Searches pages for searchString in page names (search_type='title') or page content "
-        "(search_type='content'). Text search is plain text, not a regex. method_search=true "
-        "(content only) finds pages using a method or scenario: give a wiki line that evaluates to "
-        "it, e.g. '|click|x|'. Searches page_path and its children, unless search_scope names an "
-        "ancestor page or 'root' for the whole wiki. Returns an HTML table of matches."
+        "Finds pages by name (search_type='title') or by content (search_type='content'). "
+        "Result: matches (page, type Test/Suite, tags, last_modified) and count. Both are plain "
+        "text matches, not regular expressions; a title match is any name containing the "
+        "search_string. method_search=true (content only) finds the pages that use a method or "
+        "scenario: give a wiki line that evaluates to it, e.g. '|click|x|'. Searches page_path and "
+        "its children; search_scope names an ancestor page instead, or 'root' for the whole wiki "
+        "(a content search over the whole wiki can take minutes)."
     ),
     tags={"fitnesse", "rest", "search", "read"},
     annotations={"readOnlyHint": True},
 )
 def fitnesse_search(
-    search_string: str,
+    search_string: Annotated[str, Field(description="Text to find, or with method_search a wiki line such as '|click|x|'.")],
     page_path: WikiPath = "",
     search_type: Literal["title", "content"] = "content",
-    method_search: bool = False,
+    method_search: Annotated[bool, Field(description="Find the pages that use a method or scenario (content only).")] = False,
     search_scope: Annotated[
         str | None,
-        Field(description="Ancestor page to search below, or 'root' for the whole wiki."),
+        Field(description="Ancestor page to search below, or 'root' for the whole wiki. Default: page_path."),
     ] = None,
-    timeout_seconds: float = _make_timeout(30.0),
+    timeout_seconds: float = _make_timeout(120.0),
 ) -> dict:
-    """Search pages with responder=search."""
+    """Search pages with responder=search, results parsed from its HTML."""
     if method_search and search_type != "content":
         raise ToolError("method_search only works with search_type='content'")
+    # without isTextSearch (or isMethodSearch) netcare's FitNesse answers with the search form only
     params: dict[str, str | None] = {
         "responder": "search",
         "searchString": search_string,
         "searchType": search_type,
+        "isMethodSearch" if method_search else "isTextSearch": None,
     }
-    if method_search:
-        params["isMethodSearch"] = None
     if search_scope:
         params["searchScope"] = search_scope
-    return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+    result = _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+    return _search_matches(result)
+
+
+_SEARCH_TABLE = re.compile(r'<table id="searchResultsTable".*?<tbody>(.*?)</tbody>', re.S)
+_SEARCH_ROW = re.compile(r"<tr>\s*<td>(.*?)</td>\s*<td>(.*?)</td>\s*<td[^>]*>(.*?)</td>\s*<td>(.*?)</td>", re.S)
+_SEARCH_FEEDBACK = re.compile(r"getElementById\(\"feedback\"\)\.innerHTML = '([^']*)'")
+_MAX_MATCHES = 200
+
+
+def _search_matches(result: dict) -> dict:
+    """The rows of a search responder's result table as matches; the answer as it is if there is none."""
+    body = result.get("body")
+    if not result.get("ok") or result.get("truncated") or not isinstance(body, str):
+        return result
+    table = _SEARCH_TABLE.search(body)
+    if not table:
+        return result
+    matches = []
+    for kind, page, tags, modified in _SEARCH_ROW.findall(table.group(1)):
+        match = {"page": _plain_text(page), "type": _plain_text(kind) or None,
+                 "tags": _plain_text(tags) or None, "last_modified": _plain_text(modified) or None}
+        matches.append({k: v for k, v in match.items() if v})
+    feedback = _SEARCH_FEEDBACK.search(body)
+    del result["body"]
+    result["count"] = len(matches)
+    result["matches"] = matches[:_MAX_MATCHES]
+    if len(matches) > _MAX_MATCHES:
+        result["left_out"] = len(matches) - _MAX_MATCHES
+    if not matches and feedback:
+        result["note"] = feedback.group(1)
+    return result
+
 
 if COMPLETE_TOOLSET:
 
@@ -1687,12 +1880,15 @@ if _env_flag("FITNESSE_ALLOW_SHUTDOWN"):
 
 @mcp.tool(
     name="fitnesse_stop_test",
-    description="Stops running tests, either all active tests or one process when id is provided.",
+    description=(
+        'Stops running test and suite runs of this FitNesse, whoever started them: all of '
+        'them, or the one with test_process_id.'
+    ),
     tags={"fitnesse", "rest", "tests", "admin", "control"},
     annotations={"destructiveHint": False, "idempotentHint": True},
 )
 def fitnesse_stop_test(
-    test_process_id: str | None = None,
+    test_process_id: Annotated[str | None, Field(description="Id of one run, as in the stop link FitNesse shows while it runs. Omit to stop all.")] = None,
     timeout_seconds: float = _make_timeout(30.0),
 ) -> dict:
     """Stop tests with responder=stoptest for one process or all tests."""
@@ -1726,31 +1922,32 @@ def _suite_filter_params(
 @mcp.tool(
     name="fitnesse_run_suite",
     description=(
-        "Runs all tests below the selected page. Select tests with tags (suite_filter / "
-        "run_tests_matching_any_tag: any of the tags, the latter wins; run_tests_matching_all_tags; "
-        "exclude_suite_filter), first_test, or a partition (partition_count + zero-based "
-        "partition_index; preview with fitnesse_partition_preview). Returns XML unless format "
-        "says otherwise. Do not combine nohistory with format='xml': the XML report is built "
-        "from the history."
+        "Runs the test pages below a suite page and returns FitNesse's report (body). Narrow "
+        'the selection with tags (suite_filter, run_tests_matching_all_tags, '
+        'exclude_suite_filter), first_test, or a partition (partition_count with '
+        'partition_index). The run is stored: fitnesse_get_suite_overview(page_path) then '
+        "shows each page's outcome, fitnesse_get_page_history a failing page's tables. Do not "
+        "combine nohistory with format='xml': that report is built from the history. A run that "
+        "takes longer than the server's run timeout fails here but may go on in FitNesse: "
+        "fitnesse_stop_test stops it."
     ),
     tags={"fitnesse", "rest", "tests", "execute"},
     annotations={"destructiveHint": False},
 )
 def fitnesse_run_suite(
     page_path: WikiPath,
-    debug: bool = False,
-    remote_debug: bool = False,
-    suite_filter: TagList = None,
-    exclude_suite_filter: TagList = None,
-    first_test: str | None = None,
-    nohistory: bool = False,
-    includehtml: bool = False,
-    nochunk: bool = False,
-    variables: dict[str, str] | None = None,
-    run_tests_matching_any_tag: TagList = None,
-    run_tests_matching_all_tags: TagList = None,
-    partition_count: Annotated[int | None, Field(ge=1)] = None,
-    partition_index: Annotated[int | None, Field(ge=0)] = None,
+    debug: Annotated[bool, Field(description="Run inside the FitNesse process instead of a test process of its own (Slim only; for Java debugging). Normally leave it off.")] = False,
+    suite_filter: _ANY_TAG = None,
+    exclude_suite_filter: _NO_TAG = None,
+    first_test: _FIRST_TEST = None,
+    nohistory: _NO_HISTORY = False,
+    includehtml: Annotated[bool, Field(description="format='xml' only: also return each page's result as HTML (large).")] = False,
+    nochunk: _NO_CHUNK = False,
+    variables: _RUN_VARIABLES = None,
+    run_tests_matching_any_tag: Annotated[str | None, Field(description="Same as suite_filter; wins when both are given.")] = None,
+    run_tests_matching_all_tags: _ALL_TAGS = None,
+    partition_count: Annotated[int | None, Field(description="Split the selected tests into this many parts and run only one of them.", ge=1)] = None,
+    partition_index: Annotated[int | None, Field(description="Which part to run, counted from 0.", ge=0)] = None,
     format: RunFormat = "xml",
     timeout_seconds: float | None = _make_run_timeout(),
 ) -> dict:
@@ -1762,8 +1959,6 @@ def fitnesse_run_suite(
     params: dict[str, str | None] = {"responder": "suite", "format": format}
     if debug:
         params["debug"] = None
-    if remote_debug:
-        params["remote_debug"] = None
     params.update(
         _suite_filter_params(
             suite_filter,
@@ -1786,49 +1981,61 @@ def fitnesse_run_suite(
     return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
 
 
-@mcp.tool(
-    name="fitnesse_manage_symlink",
-    description="Creates, removes, or renames symbolic links between pages using removal, rename, newname, linkName, and linkPath.",
-    tags={"fitnesse", "rest", "pages", "write"},
-    annotations={"destructiveHint": False},
-)
-def fitnesse_manage_symlink(
-    page_path: WikiPath,
-    removal: str | None = None,
-    rename: str | None = None,
-    newname: str | None = None,
-    link_name: str | None = None,
-    link_path: str | None = None,
-    timeout_seconds: float = _make_timeout(30.0),
-) -> dict:
-    """Create/update/remove symlinks via responder=symlink."""
-    params: dict[str, str | None] = {"responder": "symlink"}
-    if removal:
-        params["removal"] = removal
-    if rename:
-        params["rename"] = rename
-    if newname:
-        params["newname"] = newname
-    if link_name:
-        params["linkName"] = link_name
-    if link_path:
-        params["linkPath"] = link_path
-    return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+if COMPLETE_TOOLSET:
+
+    @mcp.tool(
+        name="fitnesse_manage_symlink",
+        description=(
+            'Manages the symbolic links of a page, which show another page as its child. Create: '
+            "link_name and link_path (the target page). Remove: removal, the link's name. Rename: "
+            "rename, the link's name, and newname."
+        ),
+        tags={"fitnesse", "rest", "pages", "write"},
+        annotations={"destructiveHint": False},
+    )
+    def fitnesse_manage_symlink(
+        page_path: WikiPath,
+        removal: str | None = None,
+        rename: str | None = None,
+        newname: str | None = None,
+        link_name: str | None = None,
+        link_path: str | None = None,
+        timeout_seconds: float = _make_timeout(30.0),
+    ) -> dict:
+        """Create/update/remove symlinks via responder=symlink."""
+        params: dict[str, str | None] = {"responder": "symlink"}
+        if removal:
+            params["removal"] = removal
+        if rename:
+            params["rename"] = rename
+        if newname:
+            params["newname"] = newname
+        if link_name:
+            params["linkName"] = link_name
+        if link_path:
+            params["linkPath"] = link_path
+        return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
 
 
 @mcp.tool(
     name="fitnesse_run_test",
-    description="Runs a test page and supports debug, remote_debug, nochunk, nohistory, and markup variable inputs. Returns XML unless format says otherwise.",
+    description=(
+        "Runs a test page from start to end and returns FitNesse's report (body): format 'xml' "
+        'has every table with its results and can be large. Unless nohistory=true the run is '
+        "stored: fitnesse_get_page_history(page_path, result_date='latest') then shows it "
+        "condensed, with only the failing tables. A run that takes longer than the server's run "
+        "timeout fails here but may go on in FitNesse: fitnesse_stop_test stops it."
+    )
+    + (" To step through a failing test and try out fixes, use fitnesse_debug_start." if "debug" in FITNESSE_TOOLSETS else ""),
     tags={"fitnesse", "rest", "tests", "execute"},
     annotations={"destructiveHint": False},
 )
 def fitnesse_run_test(
     page_path: WikiPath,
-    debug: bool = False,
-    remote_debug: bool = False,
-    nochunk: bool = False,
-    variables: dict[str, str] | None = None,
-    nohistory: bool = False,
+    debug: Annotated[bool, Field(description="Run inside the FitNesse process instead of a test process of its own (Slim only; for Java debugging). Normally leave it off.")] = False,
+    nochunk: _NO_CHUNK = False,
+    variables: _RUN_VARIABLES = None,
+    nohistory: _NO_HISTORY = False,
     format: RunFormat = "xml",
     timeout_seconds: float | None = _make_run_timeout(),
 ) -> dict:
@@ -1836,8 +2043,6 @@ def fitnesse_run_test(
     params: dict[str, str | None] = {"responder": "test", "format": format}
     if debug:
         params["debug"] = None
-    if remote_debug:
-        params["remote_debug"] = None
     if nochunk:
         params["nochunk"] = None
     if nohistory:
@@ -1882,7 +2087,11 @@ if os.getenv("FITNESSE_FILES_ROOT"):
 
     @mcp.tool(
         name="fitnesse_upload_file",
-        description="Uploads file content into the files section directory selected by the resource path. Pass text content directly via `content`, or binary/base64-encoded content via `content_base64`.",
+        description=(
+            'Stores a file in a directory of the files section, replacing a file of the same name. '
+            'Give the content as text (content) or base64-encoded for binary files '
+            '(content_base64).'
+        ),
         tags={"fitnesse", "rest", "files", "write"},
         annotations={"destructiveHint": False, "idempotentHint": True},
     )
@@ -1935,43 +2144,85 @@ if os.getenv("FITNESSE_FILES_ROOT"):
 
 
 @mcp.tool(
-    name="fitnesse_get_versions",
-    description="Returns the versions view that lists saved versions for the selected wiki page.",
+    name="fitnesse_page_versions",
+    description=(
+        "The saved versions of a page's wiki text. Without version: current (who saved the page "
+        "last, and when) and versions (version, author, age), newest first; these are earlier states, the "
+        "newest need not equal the current page. With version: that "
+        "version as rendered text (content). With version and compare_to (another version, or "
+        "'latest' for the current page): diff, a unified diff of the wiki text (- lines are from version, + lines from "
+        "compare_to). A version id ends with the time it was saved (yyyyMMddHHmmss). "
+        "fitnesse_rollback_version makes a version the current one again."
+    ),
     tags={"fitnesse", "rest", "history", "read"},
     annotations={"readOnlyHint": True},
 )
-def fitnesse_get_versions(
+def fitnesse_page_versions(
     page_path: WikiPath,
+    version: Annotated[str | None, Field(description="A version id from the list, e.g. 'jane-20261109143000'.")] = None,
+    compare_to: Annotated[str | None, Field(description="Another version id, or 'latest'. Needs version.")] = None,
     timeout_seconds: float = _make_timeout(30.0),
 ) -> dict:
-    """List saved versions via responder=versions."""
-    return _request(
-        "GET",
-        page_path,
-        params={"responder": "versions"},
-        timeout_seconds=timeout_seconds,
-    )
+    """responder=versions, viewVersion or compareVersions, condensed (all three answer HTML only)."""
+    if compare_to and not version:
+        raise ToolError("compare_to needs version: pass the version to compare, and compare_to='latest' "
+                        "or another version id.")
+    if not version:
+        params: list[tuple[str, str | None]] = [("responder", "versions")]
+    elif not compare_to:
+        params = [("responder", "viewVersion"), ("version", version)]
+    else:
+        params = [("responder", "compareVersions"), (f"Version_{version}", None)]
+        if compare_to != "latest":
+            params.append((f"Version_{compare_to}", None))
+    result = _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+    body = result.get("body")
+    if not result.get("ok") or result.get("truncated") or not isinstance(body, str):
+        return result
+    if not version:
+        versions = [{"version": _unescape_html(v), "author": _plain_text(author), "age": _plain_text(age)}
+                    for v, author, age in _VERSION_ROW.findall(body)]
+        current = _VERSION_CURRENT.search(body)
+        if not versions and not current:
+            return result  # not the versions view
+        condensed = {"current": _plain_text(current.group(1)) if current else None, "versions": versions}
+    elif not compare_to:
+        if "<article" not in body:
+            return result
+        article = body[body.index("<article"):]
+        for end in ('<div id="-shortcut-keys"', "</article>"):  # the help dialog sits inside the article
+            if end in article:
+                article = article[:article.index(end)]
+                break
+        condensed = {"version": version, "content": _plain_text(_HIDDEN_HTML.sub("", article), layout=True)}
+    else:
+        lines = [_unescape_html(line) for line in _DIFF_LINE.findall(body)]
+        if not lines:
+            if "diff_" not in body and "Comparing" not in body:
+                return result
+            return {**{k: v for k, v in result.items() if k != "body"}, "version": version,
+                    "compare_to": compare_to, "diff": "", "note": "The two are the same."}
+        condensed = {"version": version, "compare_to": compare_to, "diff": "\n".join(lines)}
+    del result["body"]
+    result.update(condensed)
+    return result
 
 
-@mcp.tool(
-    name="fitnesse_view_version",
-    description="Shows a selected saved page version identified by the version file id.",
-    tags={"fitnesse", "rest", "history", "read"},
-    annotations={"readOnlyHint": True},
-)
-def fitnesse_view_version(
-    page_path: WikiPath,
-    version: str,
-    variables: dict[str, str] | None = None,
-    timeout_seconds: float = _make_timeout(30.0),
-) -> dict:
-    """View one saved version via responder=viewVersion."""
-    return _request(
-        "GET",
-        page_path,
-        params=_merge_extra({"responder": "viewVersion", "version": version}, variables),
-        timeout_seconds=timeout_seconds,
-    )
+_VERSION_ROW = re.compile(
+    r'name="Version_([^"]+)"\s*/?>\s*</td>\s*<td>.*?</td>\s*<td>(.*?)</td>\s*<td>(.*?)</td>', re.S)
+_VERSION_CURRENT = re.compile(r"<p>\s*Current:\s*(.*?)</p>", re.S)
+_DIFF_LINE = re.compile(r'<td class="diff_line[^"]*">(.*?)</td>', re.S)
+_BLOCK_END = re.compile(r"(?i)<br\s*/?>|</(?:tr|p|div|li|h[1-6]|center|pre|table)\s*>")
+_CELL_END = re.compile(r"(?i)</t[dh]\s*>")
+
+
+def _plain_text(html: str, layout: bool = False) -> str:
+    """HTML as text. layout: one line per block or table row, cells separated by ' | '."""
+    if layout:
+        html = _BLOCK_END.sub("\n", _CELL_END.sub(" | ", html))
+    text = _unescape_html(re.sub(r"<[^>]+>", "" if layout else " ", html))
+    lines = [" ".join(line.split()) for line in text.splitlines()]
+    return "\n".join(line for line in lines if line) if layout else " ".join(lines).strip()
 
 
 if COMPLETE_TOOLSET:
@@ -1997,7 +2248,11 @@ if COMPLETE_TOOLSET:
 
 @mcp.tool(
     name="fitnesse_get_variables",
-    description="Returns the variables available on the selected page context.",
+    description=(
+        "The variables a page can use as ${NAME}, its own and those inherited from parent pages: "
+        "variables (name, value, location = the page that defines it; none for FitNesse's own). "
+        "Values of passwords, tokens and the like are masked as ***."
+    ),
     tags={"fitnesse", "rest", "pages", "read"},
     annotations={"readOnlyHint": True},
 )
@@ -2005,13 +2260,32 @@ def fitnesse_get_variables(
     page_path: WikiPath,
     timeout_seconds: float = _make_timeout(30.0),
 ) -> dict:
-    """Return variables available on a page via responder=variables."""
-    return _request(
+    """Variables of a page via responder=variables (HTML only), condensed."""
+    result = _request(
         "GET",
         page_path,
         params={"responder": "variables"},
         timeout_seconds=timeout_seconds,
     )
+    body = result.get("body")
+    if not result.get("ok") or result.get("truncated") or not isinstance(body, str):
+        return result
+    table = re.search(r'<table id="definedVariables".*?<tbody>(.*?)</tbody>', body, re.S)
+    if not table:
+        return result
+    variables = []
+    for name, value, location in _VARIABLE_ROW.findall(table.group(1)):
+        name = _plain_text(name)
+        entry = {"name": name, "value": "***" if _SECRET_VARIABLE.fullmatch(name) else _plain_text(value)}
+        if _plain_text(location):
+            entry["location"] = _plain_text(location)
+        variables.append(entry)
+    del result["body"]
+    result["variables"] = variables
+    return result
+
+
+_VARIABLE_ROW = re.compile(r"<tr>\s*<td>(.*?)</td>\s*<td>(.*?)</td>\s*<td>(.*?)</td>", re.S)
 
 
 if COMPLETE_TOOLSET:
@@ -2038,27 +2312,6 @@ if COMPLETE_TOOLSET:
 # ---------------------------------------------------------------------------
 # Responders documented in RestfulServices (FitNesse 20251025 and 20261101)
 # ---------------------------------------------------------------------------
-
-
-@mcp.tool(
-    name="fitnesse_compare_versions",
-    description=(
-        "Shows the differences between two saved versions of a page, or between one version and "
-        "the latest when only one is given. Version ids as listed by fitnesse_get_versions. "
-        "Returns HTML."
-    ),
-    tags={"fitnesse", "rest", "history", "read"},
-    annotations={"readOnlyHint": True},
-)
-def fitnesse_compare_versions(
-    page_path: WikiPath,
-    versions: Annotated[list[str], Field(min_length=1, max_length=2)],
-    timeout_seconds: float = _make_timeout(30.0),
-) -> dict:
-    """Diff versions via responder=compareVersions (Version_<id> flags)."""
-    params: list[tuple[str, str | None]] = [("responder", "compareVersions")]
-    params += [(f"Version_{version}", None) for version in versions]
-    return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
 
 
 @mcp.tool(
@@ -2894,7 +3147,15 @@ def _condition_outcome(table: dict) -> str | None:
 def _tables_text(
     html: str, document: dict | None = None, only_failures: bool = False, numbers: list[int] | None = None
 ) -> str:
-    """Condense annotated FitLibrary HTML into one text block per table.
+    """_table_blocks as one text."""
+    return "\n\n".join(text for _, text in _table_blocks(html, document, only_failures, numbers))
+
+
+def _table_blocks(
+    html: str, document: dict | None = None, only_failures: bool = False, numbers: list[int] | None = None
+) -> list[tuple[int | None, str]]:
+    """Condense annotated FitLibrary HTML into one text block per table: (number, text); the
+    number is None for what comes before the first table.
 
     Cells carry their status as a prefix: [pass], [fail], [error], [ignore]. Folding areas,
     links and images follow the table they belong to. only_failures keeps just the tables with
@@ -2907,7 +3168,7 @@ def _tables_text(
     blocks = []
     leading = [] if only_failures else _extras_lines(document["leading"], "Before the first table")
     if leading:
-        blocks.append("\n".join(leading))
+        blocks.append((None, "\n".join(leading)))
     for i, table in zip(numbers, document["tables"]):
         if only_failures and not _failed(table):
             continue
@@ -2922,8 +3183,8 @@ def _tables_text(
         if outcome:
             lines.append(f"Table {i} – condition: {outcome}")
         lines.extend(_extras_lines(table, f"Table {i}"))
-        blocks.append("\n".join(lines))
-    return "\n\n".join(blocks)
+        blocks.append((i, "\n".join(lines)))
+    return blocks
 
 
 def _inline_images(document: dict) -> list[dict]:
@@ -3600,6 +3861,14 @@ def _keywords(html: str, filter: str | None, limit: int, details: bool = False) 
 # actions that |define actions at| loaded into FitLibrary's repository, one row each:
 # defined | wiki | tooltip | author | defining page | overridden pages.
 
+# FitLibrary's rules for several objects of one class; in the result, as only kind='scope' needs them.
+_SCOPE_NOTE = (
+    "Lookup order: the table's own object, those of |add global| (level global, newest first), "
+    "the selected and select objects, suite, FitLibrary's globals and flow. Several objects of "
+    "one class only with |add named|, and only while the class has no global or local object; "
+    "after it, |add global| and local objects of that class don't work, and the other way "
+    "round. A local object comes before a global one of its class but is gone at the next test."
+)
 _NO_DEFINED_ACTIONS = (
     "No defined actions loaded in this session. They are loaded by |define actions at|.Page| "
     "tables, usually in SetUp: find them with fitnesse_debug_page_tables and run them with "
@@ -3725,7 +3994,7 @@ def _definition_block(source: Mapping, action: dict) -> dict:
     if len(starts) > 1:
         raise ToolError(
             f"{action['action']} is defined {len(starts)} times on {action['page']} (tables "
-            f"{starts}): refusing to pick one. Edit the page with fitnesse_table_source / fitnesse_table_save."
+            f"{starts}): refusing to pick one. Edit the page with fitnesse_table_source / fitnesse_table_edit."
         )
     first = last = starts[0]
     while last + 1 < len(tables) and not _separates(texts[last + 1] if last + 1 < len(texts) else ""):
@@ -3811,6 +4080,29 @@ def _session_defined_action(state: _DebugState, action: str, timeout_seconds: fl
     return found[0]
 
 
+def _needed(value, name: str, action: str):
+    """value, an argument action can't do without."""
+    if value is None:
+        raise ToolError(f"action='{action}' needs {name}.")
+    return value
+
+
+def _only_for(action: str, arguments: dict[str, tuple[object, tuple[str, ...]]]) -> None:
+    """Refuse an argument given for an action that doesn't take it, before anything is saved."""
+    for name, (value, actions) in arguments.items():
+        if value is not None and action not in actions:
+            raise ToolError(
+                f"{name} does not go with action='{action}' (only with {' and '.join(actions)}). "
+                "Nothing was changed.")
+
+
+_DEFINED_ACTION_FORMAT = (
+    "A defined action on a library page is a signature table with plain parameter names, e.g. "
+    "|greet|name|, then body tables using @{name}, e.g. |show|@{name}|; no |define action| "
+    "table. Put a ---- line between two definitions, or the second one is lost silently."
+)
+
+
 def _save_and_reload(page_path: str, action: str, form: dict, timeout_seconds: float | None, reload: bool) -> dict:
     """A debugTable save; with reload, the page's defined actions are loaded into the running
     session afterwards: by the fork itself (reload=true) where it can, else here via runWiki."""
@@ -3836,10 +4128,21 @@ def _save_and_reload(page_path: str, action: str, form: dict, timeout_seconds: f
     for key in ("error", "code"):
         if result.get(key):
             reload_result[key] = result[key]
+    if isinstance(reload_result.get("error"), str):  # the fork names the field it sends; here it is 'tables'
+        reload_result["error"] = reload_result["error"].replace("reloadHtml", "tables")
     if not reload_result["reloaded"] and isinstance(result.get("reloadHtml"), str):
         reload_result["tables"] = _tables_text(result["reloadHtml"])
     if isinstance(result.get("reloadCounts"), dict) and not reload_result["reloaded"]:
         reload_result["counts"] = result["reloadCounts"]
+    if not reload_result["reloaded"]:
+        reload_result["hint"] = (
+            "The page is saved, but the session still runs the old version. Fix the definition and "
+            f"save again, or run |define actions at|.{page}| with fitnesse_debug_run_wiki. "
+            "A reload adds and replaces actions, it never removes one: after a wrong format start "
+            "a new session. " + _DEFINED_ACTION_FORMAT)
+    elif isinstance(actions, list) and not reload_result.get("definedActions"):
+        reload_result["hint"] = (
+            "Reloaded, but the page defined no action. " + _DEFINED_ACTION_FORMAT)
     rest = {k: v for k, v in result.items()
             if k not in {"reloaded", "definedActions", "error", "code", "reloadHtml", "reloadCounts", "keywords"}}
     return {**rest, "reload": reload_result}
@@ -4372,35 +4675,26 @@ if DEBUG_TOOLSET:
     @mcp.tool(
         name="fitnesse_debug_start",
         description=(
-            "Starts a debug session for stepwise testing on a KDTA FitNesse: a test process that "
-            "stays alive between calls, so you can run tables one call at a time and the state (open "
-            "browsers, objects in scope, variables) carries over from one call to the next. Use it to"
-            " try out steps, build a new test, or step through a failing one; for a plain complete "
-            "run use fitnesse_run_test instead. Nothing is written to the test history.\n"
-            "The page decides which fixtures and variables are available, so start on the test page "
-            "or suite page you want to work on; its type decides how (suite=true/false only to "
-            "override it).\n"
-            "Typical flow: fitnesse_debug_start -> fitnesse_debug_run_page(setup_only=true) -> "
-            "fitnesse_debug_inspect(kind='keywords' or 'definedActions') -> fitnesse_debug_run_wiki or "
-            "fitnesse_debug_run_page, repeatedly -> fitnesse_debug_end. Run the SetUp first: defined "
-            "actions, the browser and often fixtures only exist once it has run.\n"
-            "One session per page and FitNesse account (older forks: one per account). If "
-            "one is already running on this page (possibly a person working in the browser), this "
-            + ("fails and says so: then continue it with fitnesse_debug_status(adopt=true, session=...) "
-               "or end it. " if ALLOW_ADOPT else
-               "fails and says so: then use another page or wait for it to end; this server does not take "
-               "over sessions it did not start. ")
-            + "Sessions on other pages are not affected. This server works with one session "
-            "at a time: end its own before starting another. Use replace=true only when told to: it "
-            "kills the running session without tear down, and a browser tab on it then shows 'replaced'.\n"
-            "The result says suite (true/false) and lists 'pages' in run order, each with path, kind "
-            "(test, suiteSetUp, suiteTearDown) and runnable (false = cannot run in this session; skip "
-            "it). Suite: run each runnable page with fitnesse_debug_run_page, in that order. Test page: "
-            "the pages around it are its SuiteSetUp and SuiteTearDown (also named as suite_setup/"
-            "suite_teardown), which run by themselves as in a normal test run: the first "
-            "fitnesse_debug_run_page runs the SuiteSetUp first, fitnesse_debug_end the SuiteTearDown.\n"
-            "Always end the session with fitnesse_debug_end when done: it occupies a server slot and "
-            "browsers until then."
+            "Starts a debug session on a KDTA FitNesse: a test process that stays alive between "
+            "calls, so tables run one call at a time and the state (open browsers, objects in "
+            "scope, variables) carries over. Use it to try out steps, build a new test or step "
+            "through a failing one; for a plain run use fitnesse_run_test. Nothing is written to "
+            "the test history.\n"
+            "Start on the test or suite page you want to work on: it decides which fixtures and "
+            "variables there are, and its type the kind of session. Then: "
+            "fitnesse_debug_run_page(setup_only=true), since defined actions, the browser and often "
+            "fixtures only exist once the SetUp has run -> fitnesse_debug_inspect -> "
+            "fitnesse_debug_run_wiki or fitnesse_debug_run_page, repeatedly -> fitnesse_debug_end, "
+            "always: the session holds a server slot and browsers until then.\n"
+            "Result: suite (true/false) and pages in run order (path, kind test/suiteSetUp/"
+            "suiteTearDown, runnable). Suite session: call fitnesse_debug_run_page for each page "
+            "with runnable=true, in that order. Test page: its SuiteSetUp and SuiteTearDown run by "
+            "themselves, with the first fitnesse_debug_run_page and with fitnesse_debug_end.\n"
+            "Fails if a session is already running on this page (maybe a person's, in the browser): "
+            + ("continue it with fitnesse_debug_status(adopt=true, session=...) or end it. "
+               if ALLOW_ADOPT else
+               "use another page or wait; this server does not take over sessions it did not start. ")
+            + "This server holds one session at a time: end it before starting another."
         ),
         tags={"fitnesse", "debug", "execute"},
         annotations={"destructiveHint": False},
@@ -4482,27 +4776,22 @@ if DEBUG_TOOLSET:
     _STATUS_TOOL = dict(
         name="fitnesse_debug_status",
         description=(
-            "Shows the debug session of this FitNesse account and the new lines of the test process "
-            "log since the last call. Answers immediately, even while another call is still running a"
-            " long table, so use it to watch progress.\n"
-            "Result: running (false = no session), page (where the session was started), currentPage "
-            "(whose test is running), suite, busy, idleSecondsLeft (the session ends itself after "
-            "this idle time), known_to_this_server, and log.lines, one per log entry ('time [out|err|info] text', time as this "
-            "server's local time with its UTC offset, Z = UTC; a multi-line message such as a stack trace or a "
-            "logged REST request is one entry; 'info' lines show the command, exit code and crashes; values of "
-            "secrets such as Authorization headers, API keys, tokens, cookies and passwords are masked as ***). "
-            "log_level, log_filter and log_newest narrow what comes back; left_out counts the unread "
-            "entries they dropped, skipped the older ones log_newest passed over: both are read and gone. "
-            "These describe this server's session, "
-            "else the account's session on page_path, else its only one. sessions lists "
-            "all running sessions of the account (not on older forks): session, page, currentPage, suite, busy, startedAt (local time).\n"
-            "busy=true means the process is still working on a call that timed out: wait and call "
-            "this again until busy is false, or abort with fitnesse_debug_end(abort=true).\n"
-            "known_to_this_server=false with running=true means someone else's session (or one from "
-            "before a restart): the other debug tools refuse to touch it"
+            "Shows the debug session and the new entries of the test process's log since the last "
+            "call. Answers at once, also while another call is still running a long table: use it "
+            "to watch progress.\n"
+            "Result: running, page (where the session started), currentPage, suite, busy, "
+            "idleSecondsLeft (the session ends itself after this idle time), "
+            "known_to_this_server, sessions (all running sessions of the account) and log.lines, "
+            "one log entry each ('time [out|err|info] text'; values of secrets are masked as "
+            "***). log_level, log_filter and log_newest narrow the log; the entries they leave out "
+            "(left_out, skipped) count as read.\n"
+            "busy=true: the process is still working on a call that timed out. Call this again "
+            "until it is false, or fitnesse_debug_end(abort=true). known_to_this_server=false with "
+            "running=true: someone else's session, or one from before a restart; the other debug "
+            "tools refuse to touch it"
             + (" until you call this with adopt=true (with several sessions: plus session=<id> from "
                "'sessions'). Only adopt a session you are meant to continue." if ALLOW_ADOPT else
-               ", and this server does not take it over: leave it alone; it ends itself after its idle time.")
+               ", and this server does not take it over: leave it alone, it ends itself when idle.")
         ),
         tags={"fitnesse", "debug", "read"},
         annotations={"readOnlyHint": True},
@@ -4583,33 +4872,23 @@ if DEBUG_TOOLSET:
     @mcp.tool(
         name="fitnesse_debug_run_wiki",
         description=(
-            "Runs FitNesse wiki tables in the debug session, e.g. '|with browser|'. Rows are "
-            "'|cell|cell|' lines; separate tables with an empty line. Variables of the current page "
-            "like ${BASE_URL} are resolved. The page's SetUp and TearDown are NOT added: run the SetUp "
-            "first with fitnesse_debug_run_page(setup_only=true), otherwise the defined actions, the "
-            "browser and fixtures it provides are missing.\n"
-            "State carries over between calls: a browser opened in one call is still open in the "
-            "next. All tables of one call run before the result comes back; it can take minutes (up "
-            "to ~10).\n"
-            "Result: 'tables' holds every table as text, one row per line; a cell's outcome is "
-            "prefixed: [pass] check passed, [fail] check failed (the cell shows '<value> expected ⏎ "
-            "<value> actual'),"
-            " [error] exception (message and shortened stack trace), [ignore] not run. Cells without "
-            "prefix are plain input. Cells of nested tables keep their prefix inline. Under a "
-            "|condition| table a line says what it did (then ran, else ran, condition false, "
-            "condition error, skipped): only the appended 'Result of then' row shows that then ran. 'counts' are this call's right/wrong/ignores/exceptions; "
-            "'page_totals' add up all calls since the current page's test began.\n"
-            "Below each table come what belongs to it: folding areas after it ('after: <title>', "
-            "e.g. FitLibrary's show after or logs), links ('link in row R, column C: text -> url') "
-            "and images. Inline screenshots ('[image N]' in a cell) are attached as image content "
-            f"(at most {DEBUG_MAX_IMAGES} per call); 'images' lists which one is where.\n"
+            "Runs wiki tables in the debug session without saving anything, e.g. '|with browser|'. "
+            "Variables of the current page such as ${BASE_URL} are resolved. The page's SetUp and "
+            "TearDown are not added: run the SetUp first with "
+            "fitnesse_debug_run_page(setup_only=true). Take the keywords' exact wording from "
+            "fitnesse_debug_inspect(kind='keywords'). All tables of a call run before the result "
+            "comes back, which can take minutes.\n"
+            "Result: tables, each as text with one row per line. A cell's outcome is prefixed: "
+            "[pass], [fail] ('<value> expected ⏎ <value> actual'), [error] (an exception), "
+            "[ignore] (not run); cells without prefix are input. Below a table come its folding "
+            "areas ('after: <title>'), links and images; screenshots are attached as images (at "
+            f"most {DEBUG_MAX_IMAGES} per call). counts are this call's, page_totals those since "
+            "the page's test began. A call whose tables all pass is noted as a step (step; see "
+            "fitnesse_debug_steps).\n"
             "A [pass] on a click only means the call returned: check its effect (URL, a text, an "
-            "element's visibility) before the next step.\n"
-            "Find the available keywords and their exact wording with "
-            "fitnesse_debug_inspect(kind='keywords') before writing tables.\n"
-            "restart=true first ends the running test (its TearDown tables that have not run yet run,"
-            " unless skip_teardown=true; result in previous_page_teardown) and begins it afresh: use "
-            "it for a clean state."
+            "element's visibility) before the next step. Every table with |with browser| starts its "
+            "own browser, which stays in the grid until fitnesse_debug_end: start it once in the "
+            "SetUp with |add global|with browser|."
         ),
         tags={"fitnesse", "debug", "execute"},
         annotations={"destructiveHint": False},
@@ -4643,12 +4922,11 @@ if DEBUG_TOOLSET:
         name="fitnesse_debug_steps",
         description=(
             "Lists the steps noted while building a test: every fitnesse_debug_run_wiki call whose "
-            "tables all passed (unless run with record=false), in order: step, page (current page "
-            "then), wiki. 'wiki' joins the kept steps, ready to save as the test's tables with "
-            "fitnesse_table_insert or fitnesse_table_save_text (read fitnesse_table_source first). "
-            "drop leaves steps out for good (e.g. tries that don't belong in the test), clear=true "
-            "forgets all, e.g. after saving. Kept after fitnesse_debug_end; a new "
-            "fitnesse_debug_start clears them."
+            "tables all passed (unless run with record=false), in order: step, page, wiki. 'wiki' "
+            "joins them, ready to save on the page with fitnesse_table_edit(action='insert'). drop "
+            "forgets single steps (tries that don't belong in the test), clear=true all of them, "
+            "e.g. after saving. They outlast fitnesse_debug_end; a new fitnesse_debug_start clears "
+            "them."
         ),
         tags={"fitnesse", "debug", "read"},
         annotations={"readOnlyHint": False, "destructiveHint": False},
@@ -4682,16 +4960,14 @@ if DEBUG_TOOLSET:
     @mcp.tool(
         name="fitnesse_debug_page_tables",
         description=(
-            "Lists the tables that running a page executes, in order, including those of its "
-            "SetUp/TearDown and included pages: index, number of rows and the first row. Use the "
-            "indices to run only some of them with fitnesse_debug_run_page(tables=[...]); setup_tables "
-            "are those of the SetUp (what run_page(setup_only=true) runs), teardown_tables those of the "
-            "TearDown (run when the test ends, if they have not run). These indices "
-            "differ from fitnesse_table_source's, which counts only the page's own tables: to edit a "
-            "table, use its source_page and source_index with the fitnesse_table_* tools. A table of an"
-            " included page (included=true, e.g. SetUp) is edited on that page, which changes it for "
-            "every page that includes it. Requires a debug session; omit page_path for the page "
-            "currently being tested."
+            "Lists the tables a run of the page executes, in order, with those of its SetUp, "
+            "TearDown and included pages: index, rows, first_row, source_page and source_index. "
+            "The indices are for fitnesse_debug_run_page(tables=[...]); setup_tables and "
+            "teardown_tables say which of them are the SetUp's and the TearDown's. To edit a table, "
+            "pass its source_page and source_index to fitnesse_table_source and fitnesse_table_edit, "
+            "never its index: those count only a page's own tables. included=true: the table is on "
+            "an included page (e.g. the SetUp), and editing it changes every page that includes "
+            "it. Needs a debug session; without page_path the page being tested."
         ),
         tags={"fitnesse", "debug", "read"},
         annotations={"readOnlyHint": True},
@@ -4718,14 +4994,13 @@ if DEBUG_TOOLSET:
     @mcp.tool(
         name="fitnesse_debug_read_link",
         description=(
-            "Reads a file a debug result links to, such as the screenshot ('Screen', "
+            "Reads a file a debug result links to: the screenshot ('Screen', "
             "/files/screenCaptures/...) or the page source at the failure ('HTML', "
-            "/files/htmlSource/...) that KDTA links from a table. An image comes back as image "
-            "content. HTML and text: scripts, styles and comments are left out and whitespace is "
-            "squeezed; with filter only the places that contain it (context_chars around each), to "
-            "check a locator against the page as it was (an id, a class, a visible text); without "
-            "filter the beginning (max_chars) and the length. Only links into this FitNesse's files "
-            "section; needs no session."
+            "/files/htmlSource/...) that KDTA links from a failing table. An image comes back as an "
+            "image. HTML and text come without scripts, styles and comments: with filter only the "
+            "places that contain it, to check a locator against the page as it was (an id, a "
+            "class, a visible text); without filter the beginning and the length. Only links "
+            "into this FitNesse's files section; needs no session."
         ),
         tags={"fitnesse", "debug", "read"},
         annotations={"readOnlyHint": True},
@@ -4774,38 +5049,30 @@ if DEBUG_TOOLSET:
     @mcp.tool(
         name="fitnesse_debug_run_page",
         description=(
-            "Runs the tables of a test page in the debug session, exactly as a normal test run would "
-            "send them (SetUp, TearDown and included pages included), and stops after the first "
-            "table with a [fail] or [error] cell, like a debugger: the rest of the page, its TearDown "
-            "included, has not run, so the browser and state are as the failure left them. The result"
-            " then has stopped_at (index, source_page, source_index, text_before: the page text "
-            "just before the table, wiki: the table's wiki to change, log: warnings, errors and "
-            "browser console entries written while it ran) and next_table. Like the console "
-            "in the browser debugger, try corrected versions of the table with "
-            "fitnesse_debug_run_wiki (runs in the session, saves nothing) until one passes, save "
-            "that one once (fitnesse_table_save on source_page/source_index). If no version passes "
-            "(e.g. the application is wrong, not the test), report that instead. Either way, then "
-            "call this again without tables to continue at next_table. page_done=true: all tables "
-            "ran. When it stops, the failing table's screenshot (KDTA's 'Screen' link) comes as an "
-            "image; read its 'HTML' link, the page source then, with "
-            "fitnesse_debug_read_link(url, filter=...). Result tables as for fitnesse_debug_run_wiki.\n"
-            "tables=[...] runs only those indices (see fitnesse_debug_page_tables), in that order, "
-            "and does not move next_table (repeated in the result while the page's run is stopped). "
-            "from_table continues the page at that index instead.\n"
-            "page_path must be a test or suite page, or one of fitnesse_debug_start's 'pages'. "
-            "If it is not the page currently being tested, the current page's test is ended "
-            "first: its TearDown tables that have not run yet (e.g. after a stop) run now, unless "
-            "skip_teardown=true. previous_page_teardown reports that end (teardown_tables, and "
-            "tables_not_run if it had stopped). Then the new page's test begins; restart=true ends "
-            "and begins the current page's test the same way.\n"
-            "setup_only=true runs just the SetUp (the tables of the included SetUp page): do this "
-            "right after fitnesse_debug_start, before fitnesse_debug_run_wiki or inspect. Outside a suite "
-            "session the first call runs the SuiteSetUp before (result suite_setup), once per "
-            "session; it stops at a failure as well, and the page's test begins only once it ran "
-            "to the end. A later call without tables then leaves the SetUp out "
-            "(skipped_setup lists its indices) instead of running it twice.\n"
-            "In a suite session, call it for each page with runnable=true from fitnesse_debug_start's"
-            " 'pages', in that order, and move on once page_done is true."
+            "Runs the tables of a test page in the debug session as a normal run would send them "
+            "(SetUp, TearDown and included pages included) and stops after the first table with a "
+            "[fail] or [error] cell, like a debugger: the rest of the page, its TearDown included, "
+            "has not run, and the browser and state are as the failure left them.\n"
+            "On a stop the result has stopped_at (index, source_page, source_index, text_before, "
+            "wiki, log), next_table and, when an element failed, its screenshot as an image; its "
+            "'HTML' link, the page source then, is read with fitnesse_debug_read_link(url, "
+            "filter=...). Not for |check|title|. "
+            "Try corrected versions of stopped_at.wiki with fitnesse_debug_run_wiki until one "
+            "passes and save that one with fitnesse_table_edit(source_page, source_index, "
+            "original=stopped_at.wiki), or "
+            "report that there is no fix (e.g. the application is wrong). "
+            "Then call this again without arguments: it continues at next_table. page_done=true: "
+            "all tables ran. Result tables as in fitnesse_debug_run_wiki.\n"
+            "setup_only=true runs just the SetUp: do that right after fitnesse_debug_start; a later "
+            "run of the page then leaves the SetUp out. tables=[...] runs only those indices of "
+            "fitnesse_debug_page_tables and does not move next_table. On a single test page the "
+            "first call runs its SuiteSetUp before (suite_setup), which stops at a failure the "
+            "same way.\n"
+            "page_path other than the current page (a test page, or one of fitnesse_debug_start's "
+            "pages) first ends the current page's test as a normal run would, with its TearDown "
+            "tables that have not run yet (previous_page_teardown), then begins the new one. In a "
+            "suite session call this for each runnable page in order, moving on once page_done is "
+            "true."
         ),
         tags={"fitnesse", "debug", "execute"},
         annotations={"destructiveHint": False},
@@ -4898,7 +5165,7 @@ if DEBUG_TOOLSET:
                         f"Stopped after table {failed} failed; the rest of the page (TearDown included) "
                         "has not run. Try corrected versions of stopped_at.wiki with "
                         "fitnesse_debug_run_wiki (saves nothing) "
-                        "until one passes and save that one once with fitnesse_table_save (stopped_at's "
+                        "until one passes and save that one once with fitnesse_table_edit (stopped_at's "
                         "source_page/source_index), or report that there is no fix; then call this "
                         f"without tables to continue at table {state.next_table}.")
                 elif rest:
@@ -4920,7 +5187,7 @@ if DEBUG_TOOLSET:
                     f"The SuiteSetUp {setup_page} stopped after its table {failed} failed; the test of "
                     f"{page} has not begun. Try corrected versions of stopped_at.wiki with "
                     "fitnesse_debug_run_wiki (saves "
-                    "nothing) until one passes and save that one once with fitnesse_table_save "
+                    "nothing) until one passes and save that one once with fitnesse_table_edit "
                     "(stopped_at's source_page/source_index), or report that there is no fix; then "
                     "call this again: it continues the "
                     f"SuiteSetUp at table {suite_setup['next_table']} (restart=true: from its first "
@@ -4936,34 +5203,23 @@ if DEBUG_TOOLSET:
         name="fitnesse_debug_inspect",
         description=(
             "Looks into the debug session. kind:\n"
-            "- 'keywords': the keywords you can use in tables right now. Without filter: only the "
-            "categories with their number of keywords (the full list is large). With filter (a word "
-            "such as 'click', or a category such as 'Web / Browser'; it also searches the help texts): "
-            "matching entries: syntax, where %1, %2 are the cells for parameters (e.g. 'click %1' -> "
-            "'|click|//button|'), parameters (label, allowed options), returnType and tableItems (the "
-            "rows a keyword expects in the rest of its table; mandatory=true marks required rows). "
-            "details=true adds the help texts. generated=true marks a public method without keyword "
-            "annotation (category: its class); its syntax works as written. Words such as JavaScript come "
-            "as !-JavaScript-! (otherwise FitNesse makes them a page link and the keyword fails): write "
-            "them so. Defined actions are not "
-            "in it: see 'definedActions'.\n"
-            "- 'definedActions': the defined actions loaded in this session by |define actions at| "
-            "(usually from SetUp): action (call syntax, parameters as cells), parameters, note, "
-            "deprecated, author, page (where it is defined; edit it with "
-            "fitnesse_debug_defined_action_source) and overrides. filter searches the call, note, author "
-            "and page, not the action's body: read that with fitnesse_debug_defined_action_source. Empty "
-            "until the page's 'define actions at' tables have run in the session.\n"
-            "- 'dynamicVariables': variables set during the test (name, value); include_system adds "
-            "the many unchanged Java system properties.\n"
+            "- 'keywords': the keywords usable in tables now. Without filter only the categories "
+            "and their sizes. With filter (a word such as 'click', or a category; help texts are "
+            "searched too) the matching entries: syntax, where %1, %2 are the parameter cells "
+            "('click %1' -> '|click|//button|'), parameters (label, options), returnType and "
+            "tableItems (the rows the keyword expects in the rest of its table). Write the syntax "
+            "as given, !-JavaScript-! included. generated=true: a method without keyword "
+            "annotation, callable as written. details=true adds the help texts. Defined actions "
+            "are not in it.\n"
+            "- 'definedActions': the defined actions the session has loaded with |define actions "
+            "at| (usually in the SetUp): action (the call), parameters, note, deprecated, author, "
+            "page and overrides. filter searches these, not the body: read that with "
+            "fitnesse_debug_defined_action_source.\n"
+            "- 'dynamicVariables': the variables set during the test (name, value).\n"
             "- 'scope': the objects whose keywords are available, in lookup order (level, name, "
-            "class, depth): the table's own, then those of |add global| (level global, newest first), "
-            "the selected and select objects, suite, FitLibrary's globals and flow. Several objects of "
-            "one class only with |add named|, and only while the class has no global or local object; "
-            "after it, |add global| and local objects of that class don't work, and the other way round. A "
-            "local object comes before a global one of its class but is gone at the next test.\n"
-            "- 'liveView': the open remote browsers (hub, selenium_session, browsers) and "
-            "live_view_url, a link where a person can watch the selected browser (per browser in "
-            "'browsers'; password not included). A 'note' says when the link is on localhost."
+            "class, depth).\n"
+            "- 'liveView': the open remote browsers and live_view_url, a link where a person can "
+            "watch the browser."
         ),
         tags={"fitnesse", "debug", "read"},
         annotations={"destructiveHint": False},
@@ -4998,25 +5254,21 @@ if DEBUG_TOOLSET:
             return _live_view(data)
         if kind == "dynamicVariables":
             return {kind: _variables(html, include_system)}
-        return {kind: _query_records(html, kind)}
+        return {kind: _query_records(html, kind), "note": _SCOPE_NOTE}
 
     @mcp.tool(
         name="fitnesse_debug_end",
         description=(
-            "Ends the debug session as a normal test run ends: first the current page's TearDown "
-            "tables that have not run yet (e.g. after a stop; teardown.teardown_tables) and, outside a "
-            "suite session once fitnesse_debug_run_page ran, the SuiteTearDown (suite_teardown); then "
-            "the test process stops. skip_teardown=true leaves both out. Every end of a page's test "
-            "(here and in fitnesse_debug_run_page's previous_page_teardown) shows FitLibrary's own "
-            "table 'Messages in storytest tear down' (here also '... suite tear down'), also when "
-            "teardown_tables is empty. Returns the "
-            "tear-down result, the remaining log "
-            "entries (as fitnesse_debug_status shows them, the last max_log_lines; log_omitted counts the lines left out: to read the whole "
-            "log, call fitnesse_debug_status before ending) and page_totals (counts per page). The "
-            "log's 'Exit code' is wrong + exceptions of everything the session ran, also before a "
-            "restart: the pages' results are page_totals. Call it whenever you are done.\n"
-            "abort=true stops the process immediately without tear down; it works even while another "
-            "call is still running. Use it when the session hangs or busy stays true."
+            "Ends the debug session as a normal run ends: first the current page's TearDown tables "
+            "that have not run yet (teardown), on a single test page also its SuiteTearDown "
+            "(suite_teardown), then the test process stops. Call it whenever you are done.\n"
+            "Result: the tear down's tables (FitLibrary's own 'Messages in storytest tear down' is "
+            "always among them), the last unread log entries (log; log_omitted counts "
+            "those left out) and page_totals, the counts per page. Take the outcome from "
+            "page_totals: the 'Exit code' in the log is the sum of the wrong and exception counts of "
+            "everything the session ran, not an outcome.\n"
+            "abort=true stops the process at once without tear down, also while another call is "
+            "running: use it when the session hangs or busy stays true."
         ),
         tags={"fitnesse", "debug", "execute"},
         annotations={"destructiveHint": False},
@@ -5075,17 +5327,15 @@ if DEBUG_TOOLSET:
     @mcp.tool(
         name="fitnesse_debug_defined_action_source",
         description=(
-            "Reads the current wiki of a defined action for editing: finds the page that defines it"
-            " via the session's defined actions, reads that page fresh (not what the session loaded)"
-            " and cuts out the definition block as FitLibrary reads it: the header table (the page's"
-            " first table or the first after a ----) and every table up to the next ----, with"
-            " the text in between. Forks with definedAction pick the definition as a run would "
-            "(keywords, number of arguments, loaded last wins). Result: page, index, last, original, "
-            "ready for "
-            "fitnesse_table_save(page_path=page, index=index, last=last, original=original, wiki=<new>,"
-            " reload_defined_actions=true). On older forks it fails if the header is on the page "
-            "more than once. "
-            "Needs a debug session in which the action is loaded, or page_path, the defining page."
+            "Reads the wiki of a defined action for editing, fresh from the page that defines it: "
+            "the definition block as FitLibrary reads it, from its header table to the next ---- "
+            "line. A definition is a signature table |greet|name| (plain names) plus body tables using "
+            "@{name}, ended by ----. Result: page, index, last and original, ready for "
+            "fitnesse_table_edit(action='save', page_path=page, index=index, last=last, "
+            "original=original, wiki=<new>, reload_defined_actions=true). Needs a debug session "
+            "that has loaded the action, or page_path, the page that defines it. To try a fix "
+            "before saving, run the body's rows with fitnesse_debug_run_wiki, its parameters "
+            "replaced by values."
         ),
         tags={"fitnesse", "debug", "read"},
         annotations={"readOnlyHint": True},
@@ -5147,13 +5397,12 @@ if DEBUG_TOOLSET:
     @mcp.tool(
         name="fitnesse_table_source",
         description=(
-            "Reads a wiki page as its tables and the text between them, for changing single tables "
-            "with fitnesse_table_save, fitnesse_table_insert and fitnesse_table_delete. Result: "
-            "tables (wiki markup of each of the page's own tables; tables from included pages and "
-            "tables nested in cells are not counted) and texts, where texts[i] is the text before "
-            "tables[i] and the last text follows the last table. Its indices differ from "
-            "fitnesse_debug_page_tables', which also counts SetUp, TearDown and included pages. Does "
-            "not need a debug session."
+            "Reads a wiki page as its tables and the texts between them, for fitnesse_table_edit "
+            "and fitnesse_table_edit_text. Result: tables (the wiki of each of the page's own "
+            "tables; tables of included pages and tables nested in cells don't count) and texts: "
+            "texts[i] is the text in front of tables[i], the last one follows the last table. "
+            "These indices are not those of fitnesse_debug_page_tables, which also counts SetUp, "
+            "TearDown and included pages. Needs no debug session."
         ),
         tags={"fitnesse", "debug", "read"},
         annotations={"readOnlyHint": True},
@@ -5167,137 +5416,97 @@ if DEBUG_TOOLSET:
 
     # debugTable saves wiki pages for real: tagged write, so they need FITNESSE_TOOLSETS=write.
     _TABLE_EDIT = (
-        " Saves the page for real (recent changes): change only pages you are asked to change. "
-        "original is tables[index] or texts[index] from fitnesse_table_source, unchanged; if the "
-        "page has changed since, this fails: read it again and redo the change. The result's source "
-        "is the page after the change: take the next original and indices from it. A running debug "
-        "session sees the change when the tables run again."
+        "Saves the page for real: change only pages you are asked to change. original is the "
+        "current wiki from fitnesse_table_source, unchanged; if the page has changed since, the "
+        "call fails: read it again and redo the change. The result's source is the page after the change (tables and texts, as "
+        "fitnesse_table_source): take the next original and the indices from it. A running debug session sees "
+        "the change when the tables run again."
     )
-    type TableIndex = Annotated[int, Field(description="Index among the page's own tables, as in fitnesse_table_source.", ge=0)]
+    _RELOAD = Annotated[bool, Field(description=(
+        "After saving, load the page's defined actions into the running debug session again, so "
+        "that it runs the new version (result: reload). For pages that define actions."))]
 
     @mcp.tool(
-        name="fitnesse_table_save",
+        name="fitnesse_table_edit",
         description=(
-            "Replaces table index of a page with new wiki markup; with last, replaces tables index..last "
-            "together with the text between them (e.g. a defined action spread over several tables).\n"
-            "Editing a defined action: take page, index, last and original from "
-            "fitnesse_debug_defined_action_source and pass reload_defined_actions=true. The running "
-            "session then loads the page's defined actions again and runs the new version at once. "
-            "The result has 'reload': reloaded (true = loaded), definedActions (the page's actions "
-            "as now loaded), and if reloaded is false the reason, or error/code and the tables of the "
-            "failed load. The page is saved either way: fix the definition and save again, or run "
-            "fitnesse_debug_run_wiki('|define actions at|.<page>|') once the page is right."
-        ) + _TABLE_EDIT,
+            "Changes the tables of a wiki page, one change per call. action:\n"
+            "- 'save': replaces table index with wiki; with last, tables index..last and the text "
+            "between them, e.g. a defined action of several tables.\n"
+            "- 'insert': puts the table(s) of wiki in front of table index; index = number of "
+            "tables appends them to the page.\n"
+            "- 'delete': removes table index.\n"
+            "- 'move': moves table index in front of table to, counted before the move; to = "
+            "number of tables moves it to the end.\n"
+            "insert and move put the table at the end of the text in front of the target table, "
+            "with start=true at its beginning.\n" + _TABLE_EDIT
+            + " A defined action: signature table |greet|name| plus body tables using @{name}, a ---- line "
+            "after each definition. A reload adds, it never removes: after a wrong format start a new session."
+        ),
         tags={"fitnesse", "debug", "write"},
         annotations={"destructiveHint": True},
     )
-    def fitnesse_table_save(
+    def fitnesse_table_edit(
         page_path: WikiPath,
-        index: TableIndex,
-        original: Annotated[str, Field(description="Current wiki of table index (with last: of tables index..last and the text between), as from fitnesse_table_source.")],
-        wiki: Annotated[str, Field(description="New wiki markup.")],
-        last: Annotated[int | None, Field(description="Last table of a block to replace.", ge=0)] = None,
-        reload_defined_actions: Annotated[bool, Field(description="After saving, reload the page's defined actions into the running debug session (|define actions at|.page|), so the session runs the new version.")] = False,
+        action: Literal["save", "insert", "delete", "move"],
+        index: Annotated[int, Field(description="Index among the page's own tables, as in fitnesse_table_source.", ge=0)],
+        original: Annotated[str, Field(description="tables[index] of fitnesse_table_source. save with last: tables index..last with the texts between them, as on the page. insert: the table now at index, empty when appending.")],
+        wiki: Annotated[str | None, Field(description="save, insert: the new wiki markup.")] = None,
+        last: Annotated[int | None, Field(description="save: last table of a block to replace.", ge=0)] = None,
+        to: Annotated[int | None, Field(description="move: target position, counted before the move.", ge=0)] = None,
+        start: Annotated[bool, Field(description="insert, move: go to the beginning of the text in front of the target table instead of its end.")] = False,
+        reload_defined_actions: _RELOAD = False,
         timeout_seconds: float = _make_timeout(60.0),
     ) -> dict:
-        """save/saveBlock via responder=debugTable (+ runWiki |define actions at| via responder=debugTest)."""
-        action = "save" if last is None else "saveBlock"
-        return _save_and_reload(
-            page_path, action, {"index": index, "last": last, "original": original, "wiki": wiki},
-            timeout_seconds, reload_defined_actions,
-        )
+        """save/saveBlock/insert/delete/move via responder=debugTable (+ reload of defined actions)."""
+        _only_for(action, {"wiki": (wiki, ("save", "insert")), "last": (last, ("save",)),
+                           "to": (to, ("move",)), "start": (start or None, ("insert", "move"))})
+        if action == "save":
+            form: dict = {"index": index, "last": last, "original": original, "wiki": _needed(wiki, "wiki", action)}
+            return _save_and_reload(page_path, "save" if last is None else "saveBlock", form,
+                                    timeout_seconds, reload_defined_actions)
+        if action == "insert":
+            form = {"index": index, "before": original, "start": start, "wiki": _needed(wiki, "wiki", action)}
+        elif action == "move":
+            form = {"index": index, "original": original, "to": _needed(to, "to", action), "start": start}
+        else:
+            form = {"index": index, "original": original}
+        return _save_and_reload(page_path, action, form, timeout_seconds, reload_defined_actions)
 
     @mcp.tool(
-        name="fitnesse_table_insert",
-        description="Inserts new table(s) before table index, into the text in front of it: at the end of that text, or with start=true at its beginning; index = number of tables appends them at the end of the page." + _TABLE_EDIT,
-        tags={"fitnesse", "debug", "write"},
-        annotations={"destructiveHint": False},
-    )
-    def fitnesse_table_insert(
-        page_path: WikiPath,
-        index: TableIndex,
-        before: Annotated[str, Field(description="Current wiki of table index (tables[index] of fitnesse_table_source); empty when appending at the end.")],
-        wiki: Annotated[str, Field(description="Wiki markup of the new table(s).")],
-        start: Annotated[bool, Field(description="Insert at the beginning of the text in front of table index instead of at its end.")] = False,
-        reload_defined_actions: Annotated[bool, Field(description="After saving, reload the page's defined actions into the running debug session, e.g. after adding a new defined action.")] = False,
-        timeout_seconds: float = _make_timeout(60.0),
-    ) -> dict:
-        """insert via responder=debugTable."""
-        return _save_and_reload(
-            page_path, "insert", {"index": index, "before": before, "start": start, "wiki": wiki},
-            timeout_seconds, reload_defined_actions,
-        )
-
-    @mcp.tool(
-        name="fitnesse_table_move",
-        description="Moves table index to position to (counted before the move) in one save: into the text in front of table to, at its end, or with start=true at its beginning; to = number of tables moves it to the end." + _TABLE_EDIT,
-        tags={"fitnesse", "debug", "write"},
-        annotations={"destructiveHint": False},
-    )
-    def fitnesse_table_move(
-        page_path: WikiPath,
-        index: TableIndex,
-        original: Annotated[str, Field(description="Current wiki of table index, as from fitnesse_table_source.")],
-        to: Annotated[int, Field(description="Target position, counted before the move.", ge=0)],
-        start: Annotated[bool, Field(description="Go to the beginning of the text in front of table to instead of its end.")] = False,
-        reload_defined_actions: Annotated[bool, Field(description="After saving, reload the page's defined actions into the running debug session.")] = False,
-        timeout_seconds: float = _make_timeout(60.0),
-    ) -> dict:
-        """move via responder=debugTable."""
-        return _save_and_reload(page_path, "move", {"index": index, "original": original, "to": to, "start": start}, timeout_seconds, reload_defined_actions)
-
-    @mcp.tool(
-        name="fitnesse_table_save_text",
-        description="Replaces texts[index], the wiki text in front of table index (one more after the last table), e.g. headings, comments, collapsible sections. Refuses text that would remove or change a table; tables in the new text are added (result: added, their number)." + _TABLE_EDIT,
+        name="fitnesse_table_edit_text",
+        description=(
+            "Changes the wiki text between the tables of a page (headings, comments, collapsible "
+            "sections), one change per call. texts[index] of fitnesse_table_source is the text in "
+            "front of table index; the last one follows the last table. action:\n"
+            "- 'save': replaces texts[index] with wiki. Tables in the new text are added (result: "
+            "added); text that would change or remove a table is refused.\n"
+            "- 'move': moves texts[index] behind texts[to], with start=true in front of it.\n"
+            + _TABLE_EDIT
+        ),
         tags={"fitnesse", "debug", "write"},
         annotations={"destructiveHint": True},
     )
-    def fitnesse_table_save_text(
+    def fitnesse_table_edit_text(
         page_path: WikiPath,
+        action: Literal["save", "move"],
         index: Annotated[int, Field(description="Index into texts of fitnesse_table_source.", ge=0)],
-        original: Annotated[str, Field(description="Current texts[index], as from fitnesse_table_source.")],
-        wiki: Annotated[str, Field(description="New wiki text.")],
-        reload_defined_actions: Annotated[bool, Field(description="After saving, reload the page's defined actions into the running debug session.")] = False,
+        original: Annotated[str, Field(description="texts[index] of fitnesse_table_source.")],
+        wiki: Annotated[str | None, Field(description="save: the new wiki text.")] = None,
+        to: Annotated[int | None, Field(description="move: index into texts of the target text.", ge=0)] = None,
+        to_original: Annotated[str | None, Field(description="move: texts[to] of fitnesse_table_source.")] = None,
+        start: Annotated[bool, Field(description="move: put it in front of texts[to] instead of behind it.")] = False,
+        reload_defined_actions: _RELOAD = False,
         timeout_seconds: float = _make_timeout(60.0),
     ) -> dict:
-        """saveText via responder=debugTable."""
-        return _save_and_reload(page_path, "saveText", {"index": index, "original": original, "wiki": wiki},
-                                timeout_seconds, reload_defined_actions)
-
-    @mcp.tool(
-        name="fitnesse_table_move_text",
-        description="Moves texts[index] next to texts[to] in one save: after it, or with start=true in front of it." + _TABLE_EDIT,
-        tags={"fitnesse", "debug", "write"},
-        annotations={"destructiveHint": False},
-    )
-    def fitnesse_table_move_text(
-        page_path: WikiPath,
-        index: Annotated[int, Field(description="Index into texts of the text to move.", ge=0)],
-        original: Annotated[str, Field(description="Current texts[index].")],
-        to: Annotated[int, Field(description="Index into texts of the target text.", ge=0)],
-        to_original: Annotated[str, Field(description="Current texts[to].")],
-        start: Annotated[bool, Field(description="Put it in front of texts[to] instead of after it.")] = False,
-        reload_defined_actions: Annotated[bool, Field(description="After saving, reload the page's defined actions into the running debug session.")] = False,
-        timeout_seconds: float = _make_timeout(60.0),
-    ) -> dict:
-        """moveText via responder=debugTable."""
-        return _save_and_reload(page_path, "moveText", {"index": index, "original": original, "to": to, "toOriginal": to_original, "start": start}, timeout_seconds, reload_defined_actions)
-
-    @mcp.tool(
-        name="fitnesse_table_delete",
-        description="Removes table index from the page." + _TABLE_EDIT,
-        tags={"fitnesse", "debug", "write"},
-        annotations={"destructiveHint": True},
-    )
-    def fitnesse_table_delete(
-        page_path: WikiPath,
-        index: TableIndex,
-        original: Annotated[str, Field(description="Current wiki of table index, as from fitnesse_table_source.")],
-        reload_defined_actions: Annotated[bool, Field(description="After saving, reload the page's defined actions into the running debug session.")] = False,
-        timeout_seconds: float = _make_timeout(60.0),
-    ) -> dict:
-        """delete via responder=debugTable."""
-        return _save_and_reload(page_path, "delete", {"index": index, "original": original}, timeout_seconds, reload_defined_actions)
+        """saveText/moveText via responder=debugTable (+ reload of defined actions)."""
+        _only_for(action, {"wiki": (wiki, ("save",)), "to": (to, ("move",)),
+                           "to_original": (to_original, ("move",)), "start": (start or None, ("move",))})
+        if action == "save":
+            form: dict = {"index": index, "original": original, "wiki": _needed(wiki, "wiki", action)}
+            return _save_and_reload(page_path, "saveText", form, timeout_seconds, reload_defined_actions)
+        form = {"index": index, "original": original, "to": _needed(to, "to", action),
+                "toOriginal": _needed(to_original, "to_original", action), "start": start}
+        return _save_and_reload(page_path, "moveText", form, timeout_seconds, reload_defined_actions)
 
 
 # The mode each tool needs: by tag, plus the few control tools by name.
@@ -5316,42 +5525,32 @@ for _mode in set(MODES) - FITNESSE_TOOLSETS:
 # The areas complete and debug gate registration (COMPLETE_TOOLSET, DEBUG_TOOLSET above).
 
 
-# Sent to the client at initialize; agents see it, the README they do not.
+# Sent to the client at initialize; agents see it, the README they do not. It holds what spans
+# several tools; what one tool does and returns is in that tool's description.
 DEBUG_INSTRUCTIONS = """\
-KDTA debug tools - how they depend on each other:
-- Session first: fitnesse_debug_start{adopt_start} must succeed before fitnesse_debug_run_wiki, \
-_run_page, _page_tables, _inspect, _defined_action_source and _end work. fitnesse_debug_status\
-{adopt_status} and the fitnesse_table_* tools need no session.{adopt_none}
-- Typical flow: start -> run_page(setup_only=true) -> inspect(kind='keywords' / 'definedActions') \
--> run_wiki / run_page, repeatedly -> end. Run the SetUp first: defined actions, the browser and \
-often fixtures come from it, so without it inspect shows no defined actions and run_wiki fails. \
-Always call fitnesse_debug_end when done; the session holds server resources.
-- Write run_wiki tables with the exact keyword wording from inspect(kind='keywords'). Defined \
-actions are listed separately by inspect(kind='definedActions'), once the page's |define actions \
-at| tables (usually in SetUp) have run in the session.
-- run_page stops after the first table with a [fail] or [error] cell (stopped_at with the \
-table's wiki and the page text before it; next_table), \
-before the rest of the page and its TearDown. Find the cause with inspect, try corrected \
-versions of the table with run_wiki (saves nothing, like the console in the browser) \
-until one passes and save that one once with the table edit tools, or report that there is no \
-fix; then run_page() continues at next_table. Go on to the next page only when page_done is true. \
-The failing table's screenshot comes with the stop as an image; its 'HTML' link (the page source \
-then) is read with fitnesse_debug_read_link(url, filter=<id, class or text>).
-- State (open browser, scope, variables) carries over between run_wiki and run_page calls on \
-the same page. run_page on another page, or restart=true, first ends the current page's test as \
-a normal run would: its TearDown tables that have not run yet run then (previous_page_teardown), \
-as with fitnesse_debug_end; skip_teardown=true leaves them out.
-- Building a test (or a SetUp): run_wiki notes each call whose tables all pass as a step \
-(record=false for tables that only look around); fitnesse_debug_steps returns them with their \
-wiki joined, to save on the page in one go. A new start clears them.
-- run_wiki adds no SetUp/TearDown: run_page(setup_only=true) runs the SetUp; other tables with \
-run_page(tables=[...]), indices from fitnesse_debug_page_tables.
-- fitnesse_debug_start decides by the page's type: a suite page starts a suite session (call \
-run_page for each page with runnable=true from 'pages', in that order), a test page a session on \
-that page (its SuiteSetUp and SuiteTearDown run by themselves; a failing SuiteSetUp table stops \
-run_page as well, result suite_setup.stopped_at, before the page begins).
-- busy=true in fitnesse_debug_status: wait and poll status, or fitnesse_debug_end(abort=true); \
-a run_wiki/run_page call fails at once while busy.
+KDTA debug tools, how they work together:
+- A session comes first: fitnesse_debug_start{adopt_start}. Only fitnesse_debug_status\
+{adopt_status}, fitnesse_debug_steps, fitnesse_debug_read_link and the fitnesse_table_* tools work\
+ without one.{adopt_none}
+- Flow: start -> run_page(setup_only=true) -> inspect(kind='keywords' / 'definedActions') -> \
+run_wiki / run_page, repeatedly -> end. Without the SetUp there are no defined actions, no \
+browser and often no fixtures. Always end the session: it holds server resources.
+- run_page stops after the first table with a [fail] or [error] cell (stopped_at, next_table). \
+Find the cause (the screenshot that comes with it, inspect, fitnesse_debug_read_link for the \
+'HTML' link), try corrected versions of the table with run_wiki, which saves nothing, and save \
+the one that passes, or report that there is no fix. A table that stopped partway can be run \
+again. Then run_page() continues at next_table. \
+Go on to the next page only when page_done is true.
+- State (browser, scope, variables) carries over between calls on the same page. run_page on \
+another page, restart=true and end first end the current page's test as a normal run would: its \
+TearDown tables that have not run yet run then; skip_teardown=true leaves them out.
+- Each |with browser| table starts its own browser, kept until fitnesse_debug_end: use |add global|with browser| in the SetUp.
+- Building a test or a SetUp: run_wiki notes each call whose tables all pass as a step \
+(record=false for tables that only look around); fitnesse_debug_steps returns their wiki, to save on the page in one go.
+- ${{VARIABLES}} in run_wiki are those of the current page; fitnesse_get_variables lists them.
+- busy=true in fitnesse_debug_status: a call that timed out is still running. Poll status, or fitnesse_debug_end(abort=true); run_wiki and run_page fail at once meanwhile. \
+That call's result is lost: once busy is false, see in the status log how far it got and go \
+on with run_page(from_table=...), or restart=true.
 """.format(
     adopt_start=" (or fitnesse_debug_status(adopt=true) for a running session)" if ALLOW_ADOPT else "",
     adopt_status=" without adopt" if ALLOW_ADOPT else "",
@@ -5361,23 +5560,24 @@ a run_wiki/run_page call fails at once while busy.
 
 # fitnesse_table_source needs debug and read, like the base part.
 DEBUG_TABLE_SOURCE_INSTRUCTIONS = """\
-- Table indices differ: fitnesse_debug_page_tables counts every table a run executes (SetUp, \
-TearDown, included pages); fitnesse_table_source counts only the page's own tables. Never pass \
-an index from one to the other.
+- Two ways of counting tables: fitnesse_debug_page_tables and run_page count every table a run \
+executes (SetUp, TearDown, included pages); fitnesse_table_source and the edit tools count only \
+the page's own tables. Never pass an index from one to the other: a session's table has \
+source_page and source_index for editing.
 """
 
-# Only with write as well, where fitnesse_table_save/_insert/_delete are visible.
+# Only with write as well, where fitnesse_table_edit and fitnesse_table_edit_text are visible.
 DEBUG_TABLE_EDIT_INSTRUCTIONS = """\
-- Editing tables: read fitnesse_table_source, pass the changed table or text (tables[index] / \
-texts[index]) unchanged as original to fitnesse_table_save / _insert / _delete / _move / \
-_save_text / _move_text. Each result's source is the page after the change: take the next \
-original and indices from it (indices shift). On "page changed" read fitnesse_table_source again \
-and redo the change. A running session sees the change when the tables are run again.
-- A table seen in a session: fitnesse_debug_page_tables gives its source_page and source_index; \
-tables of included pages (SetUp, includes) are edited on that page.
-- Editing a defined action: inspect(kind='definedActions') -> defined_action_source(action) -> \
-fitnesse_table_save(page, index, last, original, wiki=<new>, reload_defined_actions=true) -> run \
-it again. Check reload.reloaded in the result; false means the session still has the old version.
+- A new test page has to exist before fitnesse_debug_start: create it with fitnesse_add_child_page.
+- Editing: read fitnesse_table_source and pass the table or text to change, unchanged, as \
+original to fitnesse_table_edit / fitnesse_table_edit_text. Each result has the page after the \
+change (source): take the next original and indices from it. A running session sees the change \
+when the tables run again.
+- Changing a defined action: fitnesse_debug_defined_action_source(action) -> \
+fitnesse_table_edit(action='save', ..., reload_defined_actions=true) -> run it again. A new one: \
+fitnesse_table_edit(action='insert', ..., reload_defined_actions=true) on a page that the SetUp \
+loads with |define actions at|; a ---- line between two definitions is text, added with \
+fitnesse_table_edit_text. reload.hint says what to do if it did not load.
 """
 
 # Each part names only tools the toolsets make visible: the base part needs the session

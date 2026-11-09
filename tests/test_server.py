@@ -1203,6 +1203,7 @@ async def test_complete_toolset_documented_inputs(complete_env, tool, args, expe
     ("FITLIBRARYWEB - Response Headers:", "FITLIBRARYWEB - Response Headers:"),
     ("Authorization failed for user", "Authorization failed for user"),
     ("token count 5", "token count 5"),
+    ("access-control-allow-credentials=true", "access-control-allow-credentials=true"),  # CORS, no secret
 ])
 def test_mask_secrets_in_logs(line, masked):
     assert my_server._mask_secrets(line) == masked

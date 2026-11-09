@@ -1216,7 +1216,7 @@ def _history_summary(xml_bytes: bytes) -> dict | None:
 # Values of secrets in the test process's output (KDTA's REST logging writes 'Authorization=Bearer
 # …', 'X-Api-Key=…', JSON bodies and 'key:value' query parameters), masked before a model sees
 # them. The names stay, and an auth scheme (Bearer, Basic): the log still shows what was set.
-_SECRET_NAME = r"[\w.-]*(?:authorization|api[-_]?key|token|secret|passw(?:or)?d|pwd|j?session[-_]?id|credential)[\w.-]*"
+_SECRET_NAME = r"(?!access-control-)[\w.-]*(?:authorization|api[-_]?key|token|secret|passw(?:or)?d|pwd|j?session[-_]?id|credential)[\w.-]*"
 _QUOTE = r'(?:"|&quot;)'
 _SCHEME = r"((?:bearer|basic|digest|negotiate|ntlm|token)\s+)?"
 _SECRET_QUOTED = re.compile(  # "name": "value with spaces"
@@ -2359,6 +2359,14 @@ class _DebugState:
     step_count: int = 0
     # Pages fitnesse_debug_start listed (suitePages): run_page takes them without a type check.
     pages: set[str] = field(default_factory=set)
+    # When the last runTable began (this server's clock, epoch ms): the log lines of a failing
+    # table are those written from then on (_stop_log).
+    table_started: float | None = None
+    # The session's defined actions as last read: a busy session can't answer definedActions.
+    defined_actions: list[dict] | None = None
+    # A call that changes the session timed out (or got 504): the process may still be running it,
+    # and it answers definedAction(s) only after that (_session_busy asks status).
+    maybe_busy: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def reset(self) -> None:
@@ -2371,6 +2379,7 @@ class _DebugState:
         self.log_next = 0
         self.page_counts = {}
         self.pages = set()
+        self.table_started, self.defined_actions, self.maybe_busy = None, None, False
 
 
 def _page_key(path: str | None) -> str | None:
@@ -2495,7 +2504,7 @@ def _debug_post(
             return _debug_post_once(responder, page_path, action, form, timeout_seconds, state)
         except _Busy as exc:
             if attempt == attempts:
-                raise ToolError(f"{exc} Tried {attempts} times." if attempts > 1 else str(exc)) from exc
+                raise _Busy(f"{exc} Tried {attempts} times." if attempts > 1 else str(exc)) from exc
             logger.warning("%s (attempt %d of %d)", exc, attempt, attempts)
             time.sleep(_BUSY_WAITS[min(attempt, len(_BUSY_WAITS)) - 1])
         except _IncompleteAnswer as exc:
@@ -2550,6 +2559,8 @@ def _debug_post_once(
             headers = response.headers
             raw_bytes = _read_body(response, DEBUG_MAX_BYTES + 1)
     except TimeoutError as exc:
+        if state is not None and action not in _READ_ONLY_DEBUG_ACTIONS:
+            state.maybe_busy = True
         raise ToolError(
             f"No answer to '{action}' within {timeout_seconds}s. The test process may still be "
             "running it: check fitnesse_debug_status, which also shows the log."
@@ -2590,17 +2601,24 @@ def _debug_post_once(
             "FITNESSE_USERNAME/FITNESSE_PASSWORD or the X-FitNesse-* headers; Basic Auth bypasses the SSO), or this FitNesse "
             f"has no {responder} responder."
         )
+    if state is not None and status == 504:
+        state.maybe_busy = True
+    elif state is not None and status < 400 and action not in _READ_ONLY_DEBUG_ACTIONS:
+        state.maybe_busy = False  # it answered: nothing left running
     if status >= 400:
         code = data.get("code")
         message = data.get("error") or f"HTTP {status}"
         hint = _DEBUG_HINTS.get(status, "")
         if status == 409 and code in {"noSession", "replaced"} and state is not None:
+            had_session = bool(state.session)
             state.reset()
             hint = (
                 "The debug session was replaced by a new one (on the same page; on older forks anywhere), "
                 "e.g. from a browser with the same account. This MCP server forgot it; start a new one "
                 "with fitnesse_debug_start."
                 if code == "replaced"
+                else _LOST_HINTS["ended"] + " This MCP server forgot it."
+                if had_session
                 else "No debug session is running; start one with fitnesse_debug_start."
             )
         elif code == "changed" and action == "definedAction":
@@ -3084,6 +3102,8 @@ def _session_action(
 ) -> dict:
     if not state.session:  # lost in this call (409): without an id FitNesse picks the account's session
         raise ToolError("This MCP server's debug session has ended. Start a new one with fitnesse_debug_start.")
+    if action == "runTable":
+        state.table_started = time.time() * 1000
     return _debug_post(
         "debugTest",
         state.page or "",
@@ -3331,6 +3351,44 @@ def _status(
     return _debug_post("debugTest", page_path, "status", form, timeout_seconds=timeout_seconds, state=state)
 
 
+def _session_busy(state: _DebugState, timeout_seconds: float | None) -> bool:
+    """Whether this server's session still runs a document that timed out (only asked after one
+    did: a session answers definedAction(s) only after the document, as the fork's UI knows)."""
+    if not state.maybe_busy or not state.session:
+        return False
+    try:
+        status = _status(state.page or "FrontPage", state, timeout_seconds)
+    except ToolError as exc:
+        logger.info("status not read: %s", exc)
+        return False
+    mine = [s for s in _sessions(status) or [] if s.get("session") == state.session]
+    busy = bool(mine[0].get("busy")) if mine else bool(status.get("busy"))
+    state.maybe_busy = busy
+    return busy
+
+
+_LOST_HINTS = {
+    "replaced": "A new session on the same page replaced it (another client or a browser with this "
+                "account). If you still need one, check 'sessions' and start a new one with fitnesse_debug_start.",
+    "ended": "It ended: after its idle time, by fitnesse_debug_end/abort from another client with this "
+             "account, or the test process crashed. Start a new one with fitnesse_debug_start if you still need it.",
+}
+
+
+def _lost_session(state: _DebugState, timeout_seconds: float | None) -> dict:
+    """Why this server's session is gone: status with its id answers replaced=true if a new session
+    replaced it (the fork keeps the last 1000 replaced ids), else it ended."""
+    reason = "ended"
+    try:
+        data = _debug_post("debugTest", state.page or "FrontPage", "status", {"session": state.session},
+                           timeout_seconds=timeout_seconds, state=state)
+        if data.get("replaced"):
+            reason = "replaced"
+    except ToolError as exc:
+        logger.info("status of the lost session not read: %s", exc)
+    return {"session": state.session, "page": state.page, "reason": reason, "hint": _LOST_HINTS[reason]}
+
+
 def _split_tables(html: str) -> list[str]:
     return [html[t["start"]:t["end"]] for t in _parse_tables(html)]
 
@@ -3382,12 +3440,14 @@ def _html_text(fragment: str) -> str:
 
 
 def _stop_details(
-    html_page: str, parsed: list[dict], page: str | None, failed: int, timeout_seconds: float | None
+    state: _DebugState, html_page: str, parsed: list[dict], page: str | None, failed: int,
+    timeout_seconds: float | None,
 ) -> dict:
     """stopped_at for the failing table: its index, where it is written (source_page,
     source_index), the page text just before it (text_before, from the rendered page) and its
     wiki (from debugTable source of source_page, to change and try with run_wiki). Best effort:
-    text_before and wiki are left out when there is none or it can't be read."""
+    text_before and wiki are left out when there is none or it can't be read. log: the
+    warnings, errors and browser console entries written since the table began (_stop_log)."""
     source_page, source_index = _table_sources(parsed, page)[failed]
     details: dict = {"index": failed, "source_page": source_page, "source_index": source_index}
     start = parsed[failed - 1]["end"] if failed else 0
@@ -3402,6 +3462,9 @@ def _stop_details(
             details["wiki"] = tables[source_index]
     except ToolError as exc:
         logger.info("wiki of %s table %s not read: %s", source_page, source_index, exc)
+    log = _stop_log(state, timeout_seconds)
+    if log:
+        details["log"] = log
     return details
 
 
@@ -3478,12 +3541,26 @@ def _without_help(node):
 # only its 'defined' rows are read (defined actions).
 # A syntax is an annotation's wiki as written, i.e. help-page markup such as |''<i>name</i>''|%1|.
 # FitLibrary reads the tags as part of the name (Missing method …LessThanIGreaterThan…), so they go.
-_SYNTAX_TAGS = re.compile(r"</?(?:i|b|em|strong|u)>", re.I)
+# Empty tags (</>, as in |''with</>''|%2|) go as well.
+_SYNTAX_TAGS = re.compile(r"</?(?:i|b|em|strong|u)?>", re.I)
+# A CamelCase word such as JavaScript is a WikiWord to FitNesse: in a table it becomes a link and
+# FitLibrary looks for executeJavaScriptLeftSquareBracketQuestionRightSquareBracket. !-...-! keeps
+# it text. FitNesse's rule: a capital, then lower case letters or digits before each further capital.
+_WIKI_WORD = re.compile(r"(?<![\w!])[A-Z](?:[a-z0-9]+[A-Z][a-z0-9]*)+(?!\w)")
+_ESCAPED = re.compile(r"(!-.*?-!)", re.S)
+
+
+def _escape_wiki_words(wiki: str) -> str:
+    """|''execute JavaScript''|%1| -> |''execute !-JavaScript-!''|%1|; text already in !-...-! stays."""
+    parts = _ESCAPED.split(wiki)
+    return "".join(p if i % 2 else _WIKI_WORD.sub(lambda m: f"!-{m[0]}-!", p) for i, p in enumerate(parts))
 
 
 def _clean_syntax(entry: dict) -> dict:
     syntax = entry.get("syntax")
-    return {**entry, "syntax": _SYNTAX_TAGS.sub("", syntax)} if isinstance(syntax, str) else entry
+    if not isinstance(syntax, str):
+        return entry
+    return {**entry, "syntax": _escape_wiki_words(_SYNTAX_TAGS.sub("", syntax))}
 
 
 def _keywords(html: str, filter: str | None, limit: int, details: bool = False) -> dict:
@@ -3589,16 +3666,28 @@ def _json_defined_action(entry: dict) -> dict:
 def _session_defined_actions(state: _DebugState, timeout_seconds: float | None) -> list[dict]:
     """The session's defined actions: debugTest action=definedActions where the fork has it, else
     parsed from the keywords HTML."""
-    with _document(state):
-        try:
-            data = _session_action(state, "definedActions", timeout_seconds=timeout_seconds)
-        except ToolError as exc:
-            if not _unknown_action(exc):
-                raise
-        else:
-            return [_json_defined_action(a) for a in data.get("definedActions") or [] if isinstance(a, dict)]
-        data = _session_action(state, "keywords", timeout_seconds=timeout_seconds)
-    return _defined_actions(data.get("html") or "")
+    try:
+        if _session_busy(state, timeout_seconds):  # it would answer only after that document
+            raise _Busy("The test process is still running a document that timed out: wait until "
+                        "fitnesse_debug_status shows busy=false, or fitnesse_debug_end(abort=true).")
+        with _document(state):
+            try:
+                data = _session_action(state, "definedActions", timeout_seconds=timeout_seconds)
+            except ToolError as exc:
+                if not _unknown_action(exc):
+                    raise
+            else:
+                actions = [_json_defined_action(a) for a in data.get("definedActions") or [] if isinstance(a, dict)]
+                state.defined_actions = actions
+                return actions
+            data = _session_action(state, "keywords", timeout_seconds=timeout_seconds)
+    except _Busy:
+        if state.defined_actions is None:
+            raise
+        logger.info("test process busy: using the defined actions read before")
+        return state.defined_actions
+    state.defined_actions = _defined_actions(data.get("html") or "")
+    return state.defined_actions
 
 
 def _short_action(action: dict) -> dict:
@@ -3653,24 +3742,35 @@ def _unknown_action(exc: ToolError) -> bool:
             or text.startswith("http 501"))
 
 
-class _UnknownPlace(ToolError):
-    """definedAction can't place the definition (e.g. |define actions at|...|from|...| with another
-    root): look it up as on older forks."""
+class _LookUpOnPage(ToolError):
+    """definedAction gave no block: look the definition up on its page as on older forks (as the UI
+    does). reason: 'unknownPlace' (e.g. |define actions at|...|from|...| with another root),
+    'changed' (the page changed since the session loaded it) or 'busy' (423)."""
+
+    def __init__(self, message: str, reason: str):
+        super().__init__(message)
+        self.reason = reason
 
 
 def _server_defined_action(call: str, state: _DebugState) -> dict | None:
     """debugTable action=definedAction: the fork picks the definition as a run would (keywords,
-    number of arguments, loaded last wins) and cuts its block. None if this fork can't."""
+    number of arguments, loaded last wins) and cuts its block. None if this fork can't. While the
+    session runs a document that timed out it would answer only after that: look it up on the page."""
+    if _session_busy(state, 30.0):
+        raise _LookUpOnPage("The test process is still running a document that timed out.", "busy")
     try:
         found = _debug_post(
             "debugTable", state.page or "", "definedAction", {"name": call, "session": state.session},
             timeout_seconds=30.0, state=state,
         )
+    except _Busy as exc:
+        raise _LookUpOnPage(str(exc), "busy") from exc
     except ToolError as exc:
         if _unknown_action(exc):
             return None
-        if "(unknownplace)" in str(exc).lower():
-            raise _UnknownPlace(str(exc)) from exc
+        for code in ("unknownPlace", "changed"):
+            if f"({code.lower()})" in str(exc).lower():
+                raise _LookUpOnPage(str(exc), code) from exc
         raise
     found = {k: found[k] for k in ("action", "page", "index", "last", "original") if k in found}
     if isinstance(found.get("page"), str):
@@ -3820,15 +3920,74 @@ def _readable_times(status: dict) -> dict:
     return result
 
 
-def _log_line(line: dict) -> str:
-    text = _mask_secrets(str(line.get("text", "")))
-    if len(text) > _LOG_LINE_CHARS:
-        text = f"{text[:_LOG_LINE_CHARS]}… ({len(text)} chars)"
-    return f"{_clock(line.get('time'))} [{line.get('stream', '')}] {text}"
+# The test process's log (debug-mode.md, Output): raw lines; an entry is a line with its
+# continuation lines, as the debug UI groups them: same stream, at most 1 s apart, no head of
+# its own. Heads: log4j's "[LEVEL] date time [thread] Logger - msg", or java.util.logging's
+# first line "Nov 02, 2026 10:12:47 AM org.example.Class method" (its next line: "LEVEL: msg").
+_LOG4J_HEAD = re.compile(r"^\[(TRACE|DEBUG|INFO|WARN|ERROR|FATAL) *\] \S+ \S+ \[[^\]]*\] (\S+) - ")
+_JUL_HEAD = re.compile(r"^\S+ \d{1,2}, \d{4} \d{1,2}:\d{2}:\d{2} \S+ ([\w$.]+) \S+$")
+_JUL_LEVEL = re.compile(r"^(SEVERE|WARNING|INFO|CONFIG|FINEST|FINER|FINE): ")
+_JUL_LEVELS = {"SEVERE": "ERROR", "WARNING": "WARN", "INFO": "INFO", "CONFIG": "DEBUG",
+               "FINE": "DEBUG", "FINER": "TRACE", "FINEST": "TRACE"}
+LOG_LEVELS = ("TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL")
+_ENTRY_MILLIS = 1000
+_ENTRY_LINES = 40  # lines shown per entry; a REST body or stack trace can run to hundreds
+
+
+def _log_entries(lines) -> list[dict]:
+    """Group raw log lines into entries: time, stream, level and logger (from the head, else
+    None), lines, and first/last, the positions of its lines in the list."""
+    entries: list[dict] = []
+    last: dict[str, dict] = {}  # per stream, the entry a line may continue
+    for n, line in enumerate(lines or []):
+        if not isinstance(line, dict):
+            continue
+        text, stream, at = str(line.get("text", "")), str(line.get("stream", "")), line.get("time")
+        head = _LOG4J_HEAD.match(text)
+        jul = None if head else _JUL_HEAD.match(text)
+        entry = last.get(stream)
+        if (entry is not None and head is None and jul is None and isinstance(at, (int, float))
+                and isinstance(entry["end"], (int, float)) and 0 <= at - entry["end"] <= _ENTRY_MILLIS):
+            if entry["jul"] and len(entry["lines"]) == 1 and (level := _JUL_LEVEL.match(text)):
+                entry["level"] = _JUL_LEVELS[level[1]]
+            entry["lines"].append(text)
+            entry["end"], entry["last"] = at, n
+            continue
+        entry = {"time": at, "end": at, "stream": stream, "lines": [text], "first": n, "last": n,
+                 "level": head[1] if head else None, "jul": jul is not None,
+                 "logger": head[2] if head else (jul[1].rsplit(".", 1)[-1] if jul else None)}
+        entries.append(entry)
+        if stream in ("out", "err"):
+            last[stream] = entry
+    return entries
+
+
+def _log_text(line: str) -> str:
+    text = _mask_secrets(line)
+    return f"{text[:_LOG_LINE_CHARS]}… ({len(text)} chars)" if len(text) > _LOG_LINE_CHARS else text
+
+
+def _log_entry(entry: dict) -> str:
+    """'time [stream] text', continuation lines below it; secrets masked, long lines cut."""
+    lines = entry["lines"]
+    shown = [_log_text(l) for l in lines[:_ENTRY_LINES]]
+    if len(lines) > _ENTRY_LINES:
+        shown.append(f"… ({len(lines) - _ENTRY_LINES} more lines)")
+    return f"{_clock(entry['time'])} [{entry['stream']}] " + "\n".join(shown)
 
 
 def _log_lines(lines) -> list[str]:
-    return [_log_line(l) for l in lines or [] if isinstance(l, dict)]
+    return [_log_entry(e) for e in _log_entries(lines)]
+
+
+def _entry_wanted(entry: dict, level: str | None, needle: str | None) -> bool:
+    """level: entries below it are left out; 'info' lines (command, exit code, crashes) and
+    lines without a level (counted as INFO) stay unless level is above INFO."""
+    if level and entry["stream"] != "info":
+        rank = LOG_LEVELS.index(entry["level"] or "INFO")
+        if rank < LOG_LEVELS.index(level):
+            return False
+    return not needle or needle.lower() in "\n".join(entry["lines"]).lower()
 
 
 def _log_lines_total(state: _DebugState, timeout_seconds: float) -> int | None:
@@ -3847,15 +4006,66 @@ def _log_from(total: int | None, unread: int, max_lines: int) -> int | None:
     return unread if total is None else max(unread, total - max_lines)
 
 
-def _read_log(state: _DebugState, max_lines: int, timeout_seconds: float | None) -> dict:
+def _read_log(
+    state: _DebugState, max_entries: int, timeout_seconds: float | None,
+    level: str | None = None, needle: str | None = None, newest: bool = False,
+) -> dict:
+    """The unread log as entries, oldest first; level/needle leave entries out (left_out). newest:
+    the last max_entries of them, the older unread ones skipped. Moves log_next past what was read."""
     start = state.log_next
     data = _session_action(state, "log", {"from": start}, timeout_seconds=timeout_seconds)
     lines = data.get("lines") or []
     dropped = data.get("dropped") or 0
-    more = len(lines) > max_lines
-    # the first returned line has number start + dropped
-    state.log_next = start + dropped + max_lines if more else data.get("next", start)
-    return {"lines": _log_lines(lines[:max_lines]), "dropped": dropped, "more": more}
+    base = start + dropped  # the first returned line's number
+    end = data.get("next", base + len(lines))
+    entries = _log_entries(lines)
+    kept = [e for e in entries if _entry_wanted(e, level, needle)]
+    result: dict = {"dropped": dropped}
+    if newest:
+        shown = kept[-max_entries:]
+        if len(kept) > len(shown):
+            result["skipped"] = len(kept) - len(shown)
+        result["more"] = False
+    else:
+        shown = kept[:max_entries]
+        result["more"] = len(kept) > max_entries
+        if result["more"]:  # the next call goes on after the last entry shown
+            end = base + shown[-1]["last"] + 1
+    state.log_next = end
+    left_out = sum(1 for e in entries if e not in kept and base + e["last"] < end)
+    if left_out:
+        result["left_out"] = left_out
+    return {"lines": [_log_entry(e) for e in shown], **result}
+
+
+_STOP_LOG_WAIT = 0.5  # seconds: browser events (BiDi) reach the log just after the table's answer
+_STOP_LOG_ENTRIES = 15
+_STOP_LOG_SLACK = 1000  # ms the two clocks may differ
+
+
+def _stop_log(state: _DebugState, timeout_seconds: float | None) -> dict | None:
+    """The warnings, errors and browser console entries written since the failing table began,
+    the last _STOP_LOG_ENTRIES of them; None if there are none or the log can't be read."""
+    if state.table_started is None:
+        return None
+    time.sleep(_STOP_LOG_WAIT)
+    try:  # max (mod #162): only the end of the log; older forks send all of it
+        data = _session_action(state, "log", {"from": 0, "max": 400}, timeout_seconds=timeout_seconds or 30.0)
+    except ToolError as exc:
+        logger.info("log of the failing table not read: %s", exc)
+        return None
+    since = state.table_started - _STOP_LOG_SLACK
+    lines = [l for l in data.get("lines") or []
+             if isinstance(l, dict) and isinstance(l.get("time"), (int, float)) and l["time"] >= since]
+    found = [e for e in _log_entries(lines)
+             if e["logger"] == "BROWSER_CONSOLE" or LOG_LEVELS.index(e["level"] or "INFO") >= LOG_LEVELS.index("WARN")
+             or (e["stream"] == "info" and e["lines"] and e["lines"][0] and "exit code" not in e["lines"][0].lower())]
+    if not found:
+        return None
+    result: dict = {"lines": [_log_entry(e) for e in found[-_STOP_LOG_ENTRIES:]]}
+    if len(found) > _STOP_LOG_ENTRIES:
+        result["omitted"] = len(found) - _STOP_LOG_ENTRIES
+    return result
 
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
@@ -4051,7 +4261,7 @@ def _continue_page(state: _DebugState, page: str, stop_on_failure: bool, timeout
     if failed is None:
         result["page_done"] = True
     else:
-        result["stopped_at"] = _stop_details(html_page, parsed, page, failed, timeout_seconds)
+        result["stopped_at"] = _stop_details(state, html_page, parsed, page, failed, timeout_seconds)
         result["next_table"] = state.next_table
         result["_images"] = result.get("_images", []) + _failure_screenshot(data.get("html") or "")
     return result
@@ -4251,9 +4461,12 @@ if DEBUG_TOOLSET:
             " long table, so use it to watch progress.\n"
             "Result: running (false = no session), page (where the session was started), currentPage "
             "(whose test is running), suite, busy, idleSecondsLeft (the session ends itself after "
-            "this idle time), known_to_this_server, and log.lines ('time [out|err|info] text', time as this server's local "
-            "time with its UTC offset, Z = UTC; 'info' lines show the command, exit code and crashes; values of "
+            "this idle time), known_to_this_server, and log.lines, one per log entry ('time [out|err|info] text', time as this "
+            "server's local time with its UTC offset, Z = UTC; a multi-line message such as a stack trace or a "
+            "logged REST request is one entry; 'info' lines show the command, exit code and crashes; values of "
             "secrets such as Authorization headers, API keys, tokens, cookies and passwords are masked as ***). "
+            "log_level, log_filter and log_newest narrow what comes back; left_out counts the unread "
+            "entries they dropped, skipped the older ones log_newest passed over: both are read and gone. "
             "These describe this server's session, "
             "else the account's session on page_path, else its only one. sessions (mod #159) lists "
             "all running sessions of the account: session, page, currentPage, suite, busy, startedAt (local time).\n"
@@ -4269,10 +4482,14 @@ if DEBUG_TOOLSET:
         annotations={"readOnlyHint": True},
     )
     _STATUS_PAGE = Annotated[str | None, Field(description="Rarely needed: page used for the permission check; defaults to the session's page, else FrontPage.")]
-    _STATUS_LOG = Annotated[int, Field(description="Maximum number of new log lines to return; the rest follow on the next call. 0 for none.", ge=0)]
+    _STATUS_LOG = Annotated[int, Field(description="Maximum number of new log entries to return; the rest follow on the next call. 0 for none.", ge=0)]
+    _STATUS_LEVEL = Annotated[Literal[LOG_LEVELS] | None, Field(description="Only log entries of this level and above, e.g. 'WARN' (lines without a level count as INFO; 'info' lines stay).")]
+    _STATUS_FILTER = Annotated[str | None, Field(description="Only log entries containing this text (case-insensitive), e.g. a logger such as 'BROWSER_CONSOLE', 'BROWSER_NETWORK' or 'FITLIBRARYWEB', or a word of the message.")]
+    _STATUS_NEWEST = Annotated[bool, Field(description="The newest max_log_lines entries instead of the oldest unread ones, e.g. after a long run; the older unread ones are skipped.")]
 
     def _debug_status(
-        adopt: bool, session: str | None, page_path: str | None, max_log_lines: int, timeout_seconds: float
+        adopt: bool, session: str | None, page_path: str | None, max_log_lines: int, timeout_seconds: float,
+        log_level: str | None = None, log_filter: str | None = None, log_newest: bool = False,
     ) -> dict:
         """status (and log) via responder=debugTest."""
         state = _debug_state()
@@ -4292,13 +4509,17 @@ if DEBUG_TOOLSET:
                 state.current_page = _page_key(chosen.get("currentPage")) or state.page
                 state.suite = bool(chosen.get("suite"))
                 known = True
-        elif state.session and not known:
+        lost = None
+        if not known and state.session:
+            lost = _lost_session(state, timeout_seconds)
             state.reset()
         result = {**_readable_times(status), "known_to_this_server": known}
+        if lost:
+            result["lost_session"] = lost
         if known and state.table_count is not None:  # where run_page continues the current page
             result["next_table"] = state.next_table
         if known and max_log_lines:
-            result["log"] = _read_log(state, max_log_lines, timeout_seconds)
+            result["log"] = _read_log(state, max_log_lines, timeout_seconds, log_level, log_filter, log_newest)
         return result
 
     if ALLOW_ADOPT:
@@ -4309,10 +4530,14 @@ if DEBUG_TOOLSET:
             session: Annotated[str | None, Field(description="With adopt, when several sessions run: the id of the one to continue, from 'sessions'.")] = None,
             page_path: _STATUS_PAGE = None,
             max_log_lines: _STATUS_LOG = 50,
+            log_level: _STATUS_LEVEL = None,
+            log_filter: _STATUS_FILTER = None,
+            log_newest: _STATUS_NEWEST = False,
             timeout_seconds: float = _make_timeout(30.0),
         ) -> dict:
             """status (and log) via responder=debugTest; adopt takes over a running session."""
-            return _debug_status(adopt, session, page_path, max_log_lines, timeout_seconds)
+            return _debug_status(adopt, session, page_path, max_log_lines, timeout_seconds,
+                                 log_level, log_filter, log_newest)
 
     else:
 
@@ -4320,10 +4545,14 @@ if DEBUG_TOOLSET:
         def fitnesse_debug_status(
             page_path: _STATUS_PAGE = None,
             max_log_lines: _STATUS_LOG = 50,
+            log_level: _STATUS_LEVEL = None,
+            log_filter: _STATUS_FILTER = None,
+            log_newest: _STATUS_NEWEST = False,
             timeout_seconds: float = _make_timeout(30.0),
         ) -> dict:
             """status (and log) via responder=debugTest."""
-            return _debug_status(False, None, page_path, max_log_lines, timeout_seconds)
+            return _debug_status(False, None, page_path, max_log_lines, timeout_seconds,
+                                 log_level, log_filter, log_newest)
 
     @mcp.tool(
         name="fitnesse_debug_run_wiki",
@@ -4524,7 +4753,8 @@ if DEBUG_TOOLSET:
             "table with a [fail] or [error] cell, like a debugger: the rest of the page, its TearDown "
             "included, has not run, so the browser and state are as the failure left them. The result"
             " then has stopped_at (index, source_page, source_index, text_before: the page text "
-            "just before the table, wiki: the table's wiki to change) and next_table. Like the console "
+            "just before the table, wiki: the table's wiki to change, log: warnings, errors and "
+            "browser console entries written while it ran) and next_table. Like the console "
             "in the browser debugger, try corrected versions of the table with "
             "fitnesse_debug_run_wiki (runs in the session, saves nothing) until one passes, save "
             "that one once (fitnesse_table_save on source_page/source_index). If no version passes "
@@ -4632,7 +4862,7 @@ if DEBUG_TOOLSET:
             if skipped:
                 result["skipped_setup"] = skipped
             if failed is not None:
-                result["stopped_at"] = _stop_details(html_page, parsed, page, failed, timeout_seconds)
+                result["stopped_at"] = _stop_details(state, html_page, parsed, page, failed, timeout_seconds)
                 if stop_on_failure:  # the failing table is the last: its screenshot, as an image
                     result["_images"] = result.get("_images", []) + _failure_screenshot(data.get("html") or "")
                 rest = len(chosen) - len(ran)
@@ -4687,7 +4917,9 @@ if DEBUG_TOOLSET:
             "'|click|//button|'), parameters (label, allowed options), returnType and tableItems (the "
             "rows a keyword expects in the rest of its table; mandatory=true marks required rows). "
             "details=true adds the help texts. generated=true marks a public method without keyword "
-            "annotation (category: its class); its syntax works as written. Defined actions are not "
+            "annotation (category: its class); its syntax works as written. Words such as JavaScript come "
+            "as !-JavaScript-! (otherwise FitNesse makes them a page link and the keyword fails): write "
+            "them so. Defined actions are not "
             "in it: see 'definedActions'.\n"
             "- 'definedActions': the defined actions loaded in this session by |define actions at| "
             "(usually from SetUp): action (call syntax, parameters as cells), parameters, note, "
@@ -4721,7 +4953,11 @@ if DEBUG_TOOLSET:
             if not actions:
                 return {"definedActions": [], "hint": _NO_DEFINED_ACTIONS}
             hits = [a for a in actions if _matches_action(json.dumps(a, ensure_ascii=False), filter)]
-            return {"count": len(actions), "matches": len(hits), "definedActions": hits[:limit]}
+            result = {"count": len(actions), "matches": len(hits), "definedActions": hits[:limit]}
+            if state.maybe_busy:  # _session_defined_actions answered from what it read before
+                result["note"] = ("The test process is still running a call that timed out: this is the "
+                                  "list as read before it; it may have changed since.")
+            return result
         action = {"keywords": "keywordsJson"}.get(kind, kind)
         with _document(state):
             data = _session_action(state, action, timeout_seconds=timeout_seconds)
@@ -4745,7 +4981,7 @@ if DEBUG_TOOLSET:
             "table 'Messages in storytest tear down' (here also '... suite tear down'), also when "
             "teardown_tables is empty. Returns the "
             "tear-down result, the remaining log "
-            "lines (the last max_log_lines of them; log_omitted counts the others: to read the whole "
+            "entries (as fitnesse_debug_status shows them, the last max_log_lines; log_omitted counts the lines left out: to read the whole "
             "log, call fitnesse_debug_status before ending) and page_totals (counts per page). The "
             "log's 'Exit code' is wrong + exceptions of everything the session ran, also before a "
             "restart: the pages' results are page_totals. Call it whenever you are done.\n"
@@ -4791,14 +5027,15 @@ if DEBUG_TOOLSET:
             elif "teardown" not in frame:
                 result["teardown"] = {**ended, **before}
         log = data.get("log")
-        lines = _log_lines(log.get("lines")) if isinstance(log, dict) else []
-        kept = lines[len(lines) - max_log_lines:] if max_log_lines else []
+        entries = _log_entries(log.get("lines")) if isinstance(log, dict) else []
+        kept = entries[len(entries) - max_log_lines:] if max_log_lines else []
         if kept:
-            result["log"] = kept
-        # the unread lines logFrom skipped, those FitNesse left out for logMax, and any cut here
+            result["log"] = [_log_entry(e) for e in kept]
+        # the unread lines logFrom skipped, those FitNesse left out for logMax, and those of the entries cut here
         start = form["logFrom"] if form["logFrom"] is not None else max(state.log_next, total or 0)
         skipped = log.get("skipped") if isinstance(log, dict) else None
-        omitted = start - state.log_next + (skipped if isinstance(skipped, int) else 0) + len(lines) - len(kept)
+        cut = sum(len(e["lines"]) for e in entries[:len(entries) - len(kept)])
+        omitted = start - state.log_next + (skipped if isinstance(skipped, int) else 0) + cut
         if omitted:
             result["log_omitted"] = omitted
         result["page_totals"] = state.page_counts
@@ -4836,27 +5073,38 @@ if DEBUG_TOOLSET:
             if not call.startswith("|"):  # bare keywords: the fork wants a call row
                 defined = _session_defined_action(state, call, timeout_seconds)
                 call = defined["action"]
-            unknown_place = None
+            look_up = None
             try:
                 found = _server_defined_action(_call_row(call), state)
-            except _UnknownPlace as exc:
-                found, unknown_place = None, exc
+            except _LookUpOnPage as exc:
+                found, look_up = None, exc
             if found is not None:
                 return found
             try:
                 defined = defined or _session_defined_action(state, call, timeout_seconds)
                 source = _debug_post("debugTable", defined["page"], "source", timeout_seconds=30.0)
-                return {"action": defined["action"], "page": defined["page"], **_definition_block(source, defined)}
+                found = {"action": defined["action"], "page": defined["page"], **_definition_block(source, defined)}
+                if look_up is not None and look_up.reason == "changed":
+                    found["note"] = (
+                        "The page changed since the session loaded it: this is the definition on the page "
+                        "now, the session still runs the one it loaded. Save with "
+                        "reload_defined_actions=true, or run_wiki('|define actions at|."
+                        f"{defined['page']}|'), to load it."
+                    )
+                return found
             except ToolError as exc:
-                if unknown_place is None:
+                if look_up is None:
                     raise
                 if str(exc).startswith("No definition of"):
                     raise ToolError(
-                        f"{defined['page'] if defined else 'Its page'} no longer has {call}; the session "
-                        "keeps the old definition until it ends. Edit the page (fitnesse_table_source), "
-                        "or end the session and start again to drop it."
+                        f"{look_up} {defined['page'] if defined else 'Its page'} no longer has {call}; the "
+                        "session keeps the old definition "
+                        + ("until the page's defined actions are loaded again (|define actions at|)."
+                           if look_up.reason == "changed" else
+                           "until it ends. Edit the page (fitnesse_table_source), or end the session and "
+                           "start again to drop it.")
                     ) from exc
-                raise ToolError(f"{unknown_place} Looking it up on the page failed as well: {exc}") from exc
+                raise ToolError(f"{look_up} Looking it up on the page failed as well: {exc}") from exc
         elif page_path:
             call = _call_row(action)
             keywords = [_plain(c) for c in _wiki_cells(call)[::2]]

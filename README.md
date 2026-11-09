@@ -200,8 +200,8 @@ Parameter mapping for `fitnesse_search_properties`:
 - **`fitnesse_debug_inspect(kind='keywords', filter=…)` leaves out the help
   texts**; a help text marking a required row becomes `mandatory: true`.
   `details=true` returns them as before.
-- **`fitnesse_debug_end` returns the last 30 unread log lines**
-  (`max_log_lines`, 0 for none), `log_omitted` counts the others. It asks
+- **`fitnesse_debug_end` returns the last 30 unread log entries**
+  (`max_log_lines`, 0 for none), `log_omitted` counts the lines left out. It asks
   FitNesse for the number of log lines first (`log` with a large `from`) and
   sends `logFrom` so that only those lines come back; the answer used to carry
   the whole log (several hundred KB). Forks with `logMax` (mod #162) cut it
@@ -259,9 +259,26 @@ Parameter mapping for `fitnesse_search_properties`:
   writes request and response headers and bodies to the test process's output.
   The values of Authorization headers, API keys, tokens, cookies and passwords
   are now replaced by `***` (the name and an auth scheme such as `Bearer`
-  stay) in the log lines of `fitnesse_debug_status`/`fitnesse_debug_end`, in
+  stay; CORS headers `access-control-*` are left alone) in the log lines of `fitnesse_debug_status`/`fitnesse_debug_end`, in
   `fitnesse_get_execution_log` and in the `stdout`/`stderr`/`command` of
   `fitnesse_get_page_history`. `raw=true` returns FitNesse's answer unchanged.
+- **Debug log lines are grouped into entries.** A line that comes within a
+  second of the previous one on the same stream and has no log4j/JUL head
+  belongs to it (as in the fork's debug UI): a stack trace or a logged REST
+  request is one entry in `log.lines`, its lines joined by newlines (at most
+  40 per entry). `max_log_lines` of `fitnesse_debug_status` and
+  `fitnesse_debug_end` counts entries. New on `fitnesse_debug_status`:
+  `log_level` (e.g. `WARN`), `log_filter` (text such as `BROWSER_CONSOLE`) and
+  `log_newest`; what they leave out is read all the same (`left_out`,
+  `skipped`).
+- **A stop of `fitnesse_debug_run_page` brings the failing table's log.**
+  `stopped_at.log` has the warnings, errors and browser console entries
+  written while the table ran (the last 15). It costs one more `log` request
+  (`max=400` on forks with mod #162) after a short wait for the browser's
+  events.
+- **`fitnesse_debug_status` says why this server's session is gone**
+  (`lost_session`: `reason` `replaced` or `ended`, with a hint). It asks
+  `status` with the old session id for that.
 - **`restart=true` runs a stopped SuiteSetUp again from its first table.** On a
   single page whose SuiteSetUp stopped at a failure, `run_page(restart=true)`
   used to continue it after the failed table, which then never ran. Without
@@ -471,7 +488,7 @@ All need `debug` in `FITNESSE_TOOLSETS`, plus the listed mode.
 | Tool | Action | Mode |
 |---|---|---|
 | `fitnesse_debug_start` | without `suite`: `properties` (Suite/Test decide; neither: refused); `status`, then `start`; refuses if a session of the account runs on the same page (forks before mod #159: anywhere), unless `replace`, and while this server's own session still runs. Then `suitePages`: with `suite` the suite's pages, without it the page's SuiteSetUp/SuiteTearDown (`suite_setup`/`suite_teardown`, each only if present). The result has `suite` and `pages` | test |
-| `fitnesse_debug_status` | `status` plus new `log` lines (each cut at 500 characters; times as local time with UTC offset; secrets masked); `sessions` lists all of the account's (mod #159); with `FITNESSE_ALLOW_ADOPT`: `adopt` continues a running session, with several the one named by `session` | read |
+| `fitnesse_debug_status` | `status` plus new `log` entries (continuation lines grouped as in the fork's UI, each line cut at 500 characters; times as local time with UTC offset; secrets masked; `log_level`, `log_filter`, `log_newest`); `lost_session` with `reason` replaced/ended; `sessions` lists all of the account's (mod #159); with `FITNESSE_ALLOW_ADOPT`: `adopt` continues a running session, with several the one named by `session` | read |
 | `fitnesse_debug_run_wiki` | `runWiki` — wiki tables in the context of the current page, no SetUp/TearDown; `restart` ends the current test first (its TearDown tables not run yet, then `nextPage`; `skip_teardown` leaves the TearDown out). Failing before the SetUp ran in this test, on a page that has one, the result gets a `hint` to run `setup_only` (one `pageHtml` per test to check). `with_variables`/`with_live_view` send `withDynamicVariables`/`withLiveView` (mod v1.5.0/v1.6.0) and return `dynamicVariables`/`liveView` with the result; older forks: the separate actions afterwards | test |
 | `fitnesse_debug_read_link` | `GET` of a `/files/...` link from a debug result (Basic Auth as usual; other links refused): an image as image content; HTML/text without scripts, styles, comments, with `filter` only the places that contain it (`context_chars` around), else the start (`max_chars`). For KDTA's `Screen`/`HTML` links of a table | read |
 | `fitnesse_debug_steps` | none (this server's memory): the `run_wiki` calls whose tables all passed (`record=true`, the default), with `wiki` joined for saving; `drop`, `clear`. Kept after `end`, cleared by `start` | read |
@@ -609,7 +626,9 @@ fitnesse_table_source ──> fitnesse_table_save / _insert / _delete / _move / 
   `keywords` table knows fewer and is read only for defined actions.
   Formatting tags in a keyword's `syntax` (`|''<i>excel open file</i>''|%1|`,
   the annotation's help markup) are removed: FitLibrary would read them as
-  part of the keyword.
+  part of the keyword. CamelCase words in it (`execute JavaScript`) come as
+  `!-JavaScript-!`: FitNesse would make them a page link and the call would
+  fail.
   `filter` on `definedActions` searches the call, note, author and page, not
   the body of the action.
 - **Table edits:** `save`/`insert`/`delete`/`move`/`save_text`/`move_text`
@@ -629,10 +648,14 @@ fitnesse_table_source ──> fitnesse_table_save / _insert / _delete / _move / 
   itself and refuses a header that is on the page twice. Check
   `reload.reloaded` in the save result: `false` (with `error`/`code` in a 200
   answer) means the page is saved but the session still runs the old
-  version. 409 `changed` means the definition moved on its page since the
-  session loaded it: run `|define actions at|.<page>|` with `run_wiki` (or
-  repeat the edit with `reload_defined_actions=true`), then call
-  `defined_action_source` again. 404 `notLoaded` (the session runs no such
+  version. On 409 `changed` (the page changed since the session loaded it),
+  on 423, and while a call that timed out still runs (the session would answer
+  only after it; after such a timeout the MCP asks `status` whether it is still
+  `busy`), the MCP looks the definition up on its page as the fork's UI does.
+  After `changed` the result's `note` says that the session still runs the
+  loaded version until a save with `reload_defined_actions=true` or
+  `|define actions at|.<page>|`. While busy it uses the defined actions read
+  before in the session (`inspect(kind='definedActions')` then has a `note`). 404 `notLoaded` (the session runs no such
   action) leaves the session running. On 404 `unknownPlace` (the fork can't
   place the definition: a `|define action|` table, `|define actions at|`
   with `|from|` another root, or a definition the page no longer has) the

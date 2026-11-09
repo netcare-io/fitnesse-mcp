@@ -28,6 +28,7 @@ def _reload(**env):
         os.environ.pop(key, None)
     os.environ.update({"FITNESSE_TOOLSETS": "read,write,test,debug", **env})
     importlib.reload(my_server)
+    my_server._STOP_LOG_WAIT = 0
 
 
 @pytest.fixture
@@ -87,6 +88,8 @@ class FakeFitNesse:
         query = req.data.decode() if req.data else parse.urlsplit(req.full_url).query  # GET: the URL's
         form = dict(parse.parse_qsl(query, keep_blank_values=True))
         self.requests.append({"url": req.full_url, "form": form, "headers": dict(req.header_items()), "timeout": timeout})
+        if self._stop_log_request(form):  # the log excerpt of a stop, unless a test answers it
+            return _Resp(200, {"lines": [], "next": 0})
         if isinstance(self.answers[0], BaseException):
             raise self.answers.pop(0)
         status, body, *rest = self.answers.pop(0)
@@ -94,6 +97,15 @@ class FakeFitNesse:
         if status >= 400:
             raise HTTPError(req.full_url, status, "err", resp.headers, io.BytesIO(resp._body))
         return resp
+
+    def _stop_log_request(self, form):
+        if form.get("action") != "log" or form.get("from") != "0" or "max" not in form:
+            return False
+        nxt = self.answers[0] if self.answers else None
+        if isinstance(nxt, tuple) and isinstance(nxt[1], dict) and ("lines" in nxt[1] or "next" in nxt[1]):
+            return False
+        self.requests.pop()  # not recorded
+        return True
 
     @property
     def actions(self):
@@ -680,6 +692,18 @@ async def test_keywords_syntax_comes_without_formatting_tags(debug_env):
     assert data["keywords"][0]["syntax"] == "|add global|%1|%2|"
 
 
+@pytest.mark.parametrize("raw,syntax", [
+    # tcas-ta-ng: |''execute JavaScript''|%1| copied as it is fails (JavaScript turns into a page link)
+    ("|''execute JavaScript''|%1|''with</>''|%2|", "|''execute !-JavaScript-!''|%1|''with''|%2|"),
+    ("|''open PageX in NewTab2''|%1|", "|''open !-PageX-! in !-NewTab2-!''|%1|"),
+    ("|''execute !-JavaScript-!''|%1|", "|''execute !-JavaScript-!''|%1|"),  # already escaped
+    # no WikiWords: XPath (two capitals in a row), HTML, getUrl (lower case first), Url
+    ("|''find by XPath''|%1|''in HTML of''|%2|''getUrl''|''Url''|", "|''find by XPath''|%1|''in HTML of''|%2|''getUrl''|''Url''|"),
+])
+def test_keyword_syntax_escapes_wiki_words(raw, syntax):
+    assert my_server._clean_syntax({"syntax": raw})["syntax"] == syntax
+
+
 @pytest.mark.asyncio
 async def test_keywords_of_classes_without_annotations_come_from_keywords_json(debug_env):
     # the fork lists them as generated, in a category named after the class; the syntax runs as written
@@ -755,10 +779,10 @@ async def test_status_reads_log_and_end_forgets_session(debug_env):
     assert fake.actions == ["status", "log"]
     assert data["known_to_this_server"] is True
     assert data["log"]["more"] is True and data["log"]["lines"][0] == "t [out] l0"  # not epoch ms: as it came
-    assert my_server._log_line({"stream": "out", "text": "X-Api-Key=k1", "time": "t"}) == "t [out] X-Api-Key=***"
+    assert my_server._log_lines([{"stream": "out", "text": "X-Api-Key=k1", "time": "t"}]) == ["t [out] X-Api-Key=***"]
     long = {"stream": "info", "text": "Command: java -cp " + "x.jar:" * 1000, "time": "t"}
-    assert my_server._log_line(long).endswith(f"… ({len(long['text'])} chars)")
-    assert len(my_server._log_line(long)) < 600
+    assert my_server._log_lines([long])[0].endswith(f"… ({len(long['text'])} chars)")
+    assert len(my_server._log_lines([long])[0]) < 600
     data, fake = await _call("fitnesse_debug_end", {}, (200, {"lines": [], "next": 5, "dropped": 0}),
                              (200, {"ended": True, "html": "", "counts": {}, "log": {"lines": lines[3:]}}))
     assert fake.actions == ["log", "end"] and fake.requests[0]["form"]["from"] == "999999999"
@@ -775,7 +799,7 @@ def test_times_of_the_fork_read_as_local_time(monkeypatch):
         ms = 1794241563355  # 2026-11-09 16:26:03.355 UTC
         assert my_server._clock(ms) == "16:26:03.355Z"
         assert my_server._clock(str(ms), with_date=True) == "2026-11-09 16:26:03Z"
-        assert my_server._log_line({"time": ms, "stream": "out", "text": "x"}) == "16:26:03.355Z [out] x"
+        assert my_server._log_lines([{"time": ms, "stream": "out", "text": "x"}]) == ["16:26:03.355Z [out] x"]
         monkeypatch.setenv("TZ", "CET-1")
         time.tzset()
         assert my_server._clock(ms) == "17:26:03.355+01:00"
@@ -972,9 +996,20 @@ async def test_inspect_defined_actions_from_the_json(debug_env):
 @pytest.mark.asyncio
 async def test_changed_definition_says_how_to_reload_it(debug_env):
     await _start()
-    with pytest.raises(ToolError, match=r"Reload: fitnesse_debug_run_wiki\('\|define actions at\|\.Lib\.Js\|'\), then fitnesse_debug_defined_action_source again"):
-        await _call("fitnesse_debug_defined_action_source", {"action": "|greet|bob|"},
-                    (409, {"error": "Lib.Js changed; run |define actions at|.Lib.Js|", "code": "changed", "page": "Lib.Js"}))
+    changed = (409, {"error": "Lib.Js changed; run |define actions at|.Lib.Js|", "code": "changed", "page": "Lib.Js"})
+    loaded = (200, {"definedActions": [{"action": "|''greet''|name|", "page": ".Lib.Js"}]})
+    # as the UI does: the definition as the page has it now, with a note that the session runs the old one
+    data, fake = await _call(
+        "fitnesse_debug_defined_action_source", {"action": "|greet|bob|"}, changed, loaded,
+        (200, {"tables": ["|''greet''|name|", "|log message|hi @{name}|"], "texts": ["", "\n", "\n"]}),
+    )
+    assert fake.actions == ["definedAction", "definedActions", "source"]
+    assert data["index"] == 0 and data["last"] == 1 and data["original"].endswith("|log message|hi @{name}|")
+    assert "still runs the one it loaded" in data["note"] and "reload_defined_actions=true" in data["note"]
+    # the page no longer has it: the fork's hint says how to reload
+    with pytest.raises(ToolError, match=r"(?s)Reload: fitnesse_debug_run_wiki\('\|define actions at\|\.Lib\.Js\|'\).*no longer has"):
+        await _call("fitnesse_debug_defined_action_source", {"action": "|greet|bob|"}, changed, loaded,
+                    (200, {"tables": ["|other|"], "texts": ["", "\n"]}))
     # a save conflict has no code: read the source again
     with pytest.raises(ToolError, match="Read fitnesse_table_source again"):
         await _call("fitnesse_table_save", {"page_path": "P", "index": 0, "original": "o", "wiki": "w"},
@@ -1787,7 +1822,7 @@ async def test_page_switch_whose_teardown_cannot_run_says_how_to_go_on(debug_env
     with pytest.raises(ToolError, match="TearDown of FrontPage.Suite.A could not run.*skip_teardown=true"):
         await _call("fitnesse_debug_run_page", {"page_path": "FrontPage.Suite.B"}, page_a, (504, {"error": "timeout"}))
     # the session is lost meanwhile: no advice to skip, the session is forgotten
-    with pytest.raises(ToolError, match="No debug session is running") as caught:
+    with pytest.raises(ToolError, match="It ended: after its idle time.*forgot it") as caught:
         await _call("fitnesse_debug_run_page", {"page_path": "FrontPage.Suite.B"}, page_a,
                     (409, {"error": "no session", "code": "noSession"}))
     assert "skip_teardown" not in str(caught.value)
@@ -1999,3 +2034,143 @@ async def test_run_wiki_notes_passing_steps_for_saving(debug_env):
     await _start()
     data, _ = await _call("fitnesse_debug_steps")
     assert data["steps"] == []
+
+
+def _line(text, at, stream="out"):
+    return {"stream": stream, "text": text, "time": at}
+
+
+def test_log_lines_are_grouped_into_entries():
+    t = 1794241563355
+    lines = [
+        _line("[INFO ] 2026-11-09 16:26:03,355 [main] RestAssuredLog4JFilter - Request method=POST", t),
+        _line("Content-Type=application/json", t + 1),
+        _line("X-Api-Key=secret", t + 2),
+        _line("Mar 9, 2026 4:26:03 PM org.openqa.selenium.remote.http.WebSocket$Listener onError", t + 3, "err"),
+        _line("WARNING: Connection reset", t + 4, "err"),
+        _line("late line", t + 2000),  # more than a second later: an entry of its own
+        _line("[ERROR] 2026-11-09 16:26:05,355 [main] BrowserFixture - boom", t + 2001),
+        _line("\tat a.B.c(B.java:1)", t + 2002),
+        _line("Exit code: 1", t + 2003, "info"),
+    ]
+    entries = my_server._log_entries(lines)
+    assert [(e["stream"], e["level"], e["logger"], len(e["lines"])) for e in entries] == [
+        ("out", "INFO", "RestAssuredLog4JFilter", 3), ("err", "WARN", "WebSocket$Listener", 2),
+        ("out", None, None, 1), ("out", "ERROR", "BrowserFixture", 2), ("info", None, None, 1),
+    ]
+    shown = my_server._log_lines(lines)
+    assert shown[0].endswith("Request method=POST\nContent-Type=application/json\nX-Api-Key=***")
+    many = [_line("[INFO ] d t [main] X - body", t)] + [_line(f"l{i}", t) for i in range(50)]
+    assert my_server._log_lines(many)[0].endswith("… (11 more lines)")
+
+
+@pytest.mark.asyncio
+async def test_status_filters_the_log_by_level_and_text_and_shows_the_newest(debug_env):
+    await _start()
+    t = 1794241563355
+    lines = [
+        _line("[INFO ] d t [main] RestAssuredLog4JFilter - GET /x", t),
+        _line("[WARN ] d t [main] BROWSER_CONSOLE - [abcd1234] warn: slow", t + 10),
+        _line("[ERROR] d t [main] BrowserFixture - no element", t + 20),
+        _line("\tat a.B.c(B.java:1)", t + 21),
+        _line("[INFO ] d t [main] BROWSER_CONSOLE - [abcd1234] log: hi", t + 30),
+    ]
+    running = (200, {"running": True, "session": "s1", "page": "FrontPage.T"})
+    data, fake = await _call("fitnesse_debug_status", {"log_level": "WARN"}, running,
+                             (200, {"lines": lines, "next": 5, "dropped": 0}))
+    assert [l.split("] ", 1)[1].split(" - ")[0] for l in data["log"]["lines"]] == ["[WARN ] d t [main] BROWSER_CONSOLE",
+                                                                                  "[ERROR] d t [main] BrowserFixture"]
+    assert data["log"]["left_out"] == 2 and data["log"]["more"] is False
+    assert data["log"]["lines"][1].endswith("no element\n\tat a.B.c(B.java:1)")
+    data, fake = await _call("fitnesse_debug_status", {"log_filter": "browser_console", "max_log_lines": 1}, running,
+                             (200, {"lines": lines, "next": 5, "dropped": 0}))
+    assert fake.requests[1]["form"]["from"] == "5" and len(data["log"]["lines"]) == 1 and data["log"]["more"] is True
+    assert my_server._debug_state().log_next == 7  # goes on after the entry shown
+    data, fake = await _call("fitnesse_debug_status", {"log_newest": True, "max_log_lines": 2}, running,
+                             (200, {"lines": lines, "next": 12, "dropped": 0}))
+    assert data["log"]["skipped"] == 2 and data["log"]["more"] is False and "log: hi" in data["log"]["lines"][-1]
+    assert my_server._debug_state().log_next == 12
+
+
+@pytest.mark.asyncio
+async def test_a_stop_brings_the_warnings_and_browser_console_of_the_failing_table(debug_env):
+    await _start()
+    page = (200, {"page": "FrontPage.T", "html": STEP_PAGE_HTML})
+    now = int(time.time() * 1000)
+    log = (200, {"lines": [
+        _line("[ERROR] d t [main] Old - before the table", now - 600_000),
+        _line("[INFO ] d t [main] Fixture - clicking", now),
+        _line("[ERROR] d t [main] BrowserFixture - no element", now + 1),
+        _line("[INFO ] d t [main] BROWSER_CONSOLE - [abcd1234] log: clicked", now + 2),
+        _line("Exit code: 1", now + 3, "info"),
+    ], "next": 5, "skipped": 0})
+    data, fake = await _call("fitnesse_debug_run_page", {}, page, _ran("open browser"), _ran("step 1"),
+                             _ran("step 2", "fail"), (200, {"tables": ["|step 1|\n", "|step 2|\n"], "texts": ["", "", ""]}), log)
+    assert fake.actions[-1] == "log" and fake.requests[-1]["form"]["max"] == "400"
+    lines = data["stopped_at"]["log"]["lines"]
+    assert len(lines) == 2 and "no element" in lines[0] and "log: clicked" in lines[1]
+    # nothing worth showing: no log in stopped_at
+    await _start()
+    data, _ = await _call("fitnesse_debug_run_page", {}, page, _ran("open browser"), _ran("step 1", "fail"),
+                          (200, {"tables": ["|step 1|\n"], "texts": ["", ""]}))
+    assert "log" not in data["stopped_at"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replaced", [True, False])
+async def test_status_says_why_this_servers_session_is_gone(debug_env, replaced):
+    await _start()
+    answer = {"running": False, "replaced": True} if replaced else {"running": False}
+    data, fake = await _call("fitnesse_debug_status", {},
+                             (200, {"running": True, "session": "other", "page": "FrontPage.T"}), (200, answer))
+    assert fake.actions == ["status", "status"] and fake.requests[1]["form"]["session"] == "s1"
+    lost = data["lost_session"]
+    assert lost["session"] == "s1" and lost["page"] == "FrontPage.T"
+    assert lost["reason"] == ("replaced" if replaced else "ended")
+    assert ("replaced it" if replaced else "idle time") in lost["hint"]
+    assert my_server._debug_state().session is None
+    data, fake = await _call("fitnesse_debug_status", {}, (200, {"running": False}))
+    assert "lost_session" not in data and fake.actions == ["status"]
+
+
+@pytest.mark.asyncio
+async def test_defined_action_source_while_the_process_is_busy_uses_what_it_read_before(debug_env):
+    await _start()
+    await _call("fitnesse_debug_inspect", {"kind": "definedActions"},
+                (200, {"definedActions": [{"action": "|''greet''|name|", "page": ".Lib.Js"}]}))
+    busy = (423, {"error": "busy"})
+    with patch("time.sleep"):
+        data, fake = await _call("fitnesse_debug_defined_action_source", {"action": "|greet|bob|"},
+                                 busy, busy, busy, busy, busy, busy,
+                                 (200, {"tables": ["|''greet''|name|"], "texts": ["", "\n"]}))
+    assert fake.actions == ["definedAction"] * 3 + ["definedActions"] * 3 + ["source"]
+    assert data["page"] == "Lib.Js" and data["index"] == 0 and "note" not in data
+    # nothing read before: the busy error stays
+    await _start()
+    with patch("time.sleep"), pytest.raises(ToolError, match="HTTP 423.*failed as well.*HTTP 423"):
+        await _call("fitnesse_debug_defined_action_source", {"action": "|greet|bob|"}, *[busy] * 6)
+
+
+@pytest.mark.asyncio
+async def test_defined_action_source_while_a_timed_out_run_goes_on_looks_on_the_page(debug_env):
+    # the session answers definedAction(s) only after the document: as the UI, don't ask it
+    await _start()
+    await _call("fitnesse_debug_inspect", {"kind": "definedActions"},
+                (200, {"definedActions": [{"action": "|''greet''|name|", "page": ".Lib.Js"}]}))
+    with pytest.raises(ToolError, match="No answer to 'runWiki'"):
+        await _call("fitnesse_debug_run_wiki", {"wiki": "|sleep for|60000|"}, TimeoutError("timed out"))
+    busy = (200, {"running": True, "session": "s1", "busy": True,
+                  "sessions": [{"session": "s1", "page": "FrontPage.T", "busy": True}]})
+    data, fake = await _call("fitnesse_debug_defined_action_source", {"action": "|greet|bob|"}, busy, busy,
+                             (200, {"tables": ["|''greet''|name|"], "texts": ["", "\n"]}))
+    assert fake.actions == ["status", "status", "source"]
+    assert data["page"] == "Lib.Js" and data["index"] == 0
+    data, fake = await _call("fitnesse_debug_inspect", {"kind": "definedActions"}, busy)
+    assert fake.actions == ["status"] and data["count"] == 1 and "read before" in data["note"]
+    # done meanwhile: asks the session again, no status any more
+    idle = (200, {"running": True, "session": "s1", "sessions": [{"session": "s1", "page": "FrontPage.T", "busy": False}]})
+    block = (200, {"action": "|greet|name|", "page": ".Lib.Js", "index": 0, "last": None, "original": "o"})
+    data, fake = await _call("fitnesse_debug_defined_action_source", {"action": "|greet|bob|"}, idle, block)
+    assert fake.actions == ["status", "definedAction"]
+    data, fake = await _call("fitnesse_debug_defined_action_source", {"action": "|greet|bob|"}, block)
+    assert fake.actions == ["definedAction"]

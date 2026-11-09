@@ -219,12 +219,12 @@ fitnesse_debug_end
 | A call timed out | `fitnesse_debug_status` until `busy` is false; else `fitnesse_debug_end(abort=true)` |
 | Start refused: a session runs on this page | `fitnesse_debug_status` shows it; it is not yours: use another page or wait for its idle timeout. Only with `FITNESSE_ALLOW_ADOPT`: `adopt=true, session=<id>` if you are meant to continue it, else ask |
 | Start refused: this server's session runs elsewhere | continue it, or `fitnesse_debug_end` first |
-| `replaced` or `noSession` | the session is gone: a start on the same page with the same login replaced it (e.g. a person in the wiki's debug UI), idle timeout, restart. Start again and run the SetUp |
+| `replaced` or `noSession` | the session is gone: a start on the same page with the same login replaced it (e.g. a person in the wiki's debug UI), idle timeout, restart. `fitnesse_debug_status` says which in `lost_session.reason`. Start again and run the SetUp |
 | `tooManySessions` (429) | end sessions of the account listed in `sessions`, or try later |
 | Saving fails with "page changed" | `fitnesse_table_source` again, redo the change |
 | `run_wiki` fails right after the start, with a `hint` about the SetUp | the SetUp has not run: `run_page(setup_only=true)`, then the tables again |
-| You need the whole log | `fitnesse_debug_status` before `fitnesse_debug_end`: end returns only the last 30 unread lines (`log_omitted` counts the rest) |
-| A table shows `[fail]` without a message | `fitnesse_debug_status`: the log of the test process often has the cause (e.g. `command not found`); long lines are cut at 500 characters |
+| You need the whole log | `fitnesse_debug_status` before `fitnesse_debug_end`: end returns only the last 30 unread entries (`log_omitted` counts the lines left out) |
+| A table shows `[fail]` without a message | first `stopped_at.log` of `run_page` (warnings, errors, browser console of that table); more with `fitnesse_debug_status(log_level='WARN')` or `log_filter='BROWSER_CONSOLE'`; after a long run `log_newest=true`. The log of the test process often has the cause (e.g. `command not found`); long lines are cut at 500 characters |
 | A REST call fails and the table doesn't say why | `run_wiki` `\|''set logging''\|true\|` (after `with rest`), run the call again, then `fitnesse_debug_status`: request, status, headers and response body are in the log, secrets masked as `***`. The log shows the headers the test set, not the Authorization of `set basic auth`/OAuth2, and never the request body |
 
 Without a FitNesse login the session belongs to a cookie that this server keeps in memory: after a

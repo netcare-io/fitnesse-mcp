@@ -1328,6 +1328,7 @@ async def test_page_history_compares_two_test_runs():
                    "<td>end</td>", date="2026-11-05T23:00:26Z")
     data, asked = await _compare({"latest": new, "20261105230026": old}, compare_to="20261105230026")
     assert asked == ["latest", "20261105230026"]  # result_date defaults to the latest run
+    assert "result_date" not in data["run"]  # "latest" is not an id worth echoing
     assert data["run"]["date"] == "2026-11-06T23:00:26Z" and data["compared_to"]["result_date"] == "20261105230026"
     assert data["tables_same"] == 2
     assert data["differences"] == [

@@ -1192,12 +1192,12 @@ def _stored_run(page_path: str, result_date: str, timeout_seconds: float) -> dic
     summary = _history_summary(result["body"]) or {}
     if root.tag == "suiteResults":
         return {"kind": "suite", "pages": {p["page"]: p for p in summary["pages"]},
-                "head": {"result_date": result_date, "date": summary.get("date"),
+                "head": {**({"result_date": result_date} if result_date != "latest" else {}), "date": summary.get("date"),
                          "final_counts": summary.get("final_counts")}}
     res = root.find("result")
     content = (res.findtext("content") if res is not None else None) or ""
     return {"kind": "test", "tables": [b for b in _table_blocks(content) if b[0] is not None],
-            "head": {"result_date": result_date, "date": summary.get("date"),
+            "head": {**({"result_date": result_date} if result_date != "latest" else {}), "date": summary.get("date"),
                      "outcome": summary.get("outcome"), "counts": summary.get("counts")}}
 
 
@@ -3410,8 +3410,9 @@ def _document_result(
         "page": page,
         "counts": data.get("counts"),
         "page_totals": _add_counts(state, page, data.get("counts")),
-        "tables": _tables_text(html, document, only_failures, numbers),
     }
+    if text := _tables_text(html, document, only_failures, numbers):
+        result["tables"] = text
     if only_failures:
         passed = sum(1 for t in document["tables"] if not _failed(t))
         if passed:

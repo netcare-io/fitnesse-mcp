@@ -1,0 +1,11 @@
+{
+    "mcpServers": {
+        "fitnesse": {
+            "command": "/app/.venv/bin/fastmcp",
+            "args": [
+                "run",
+                "/app/fastmcp.json"
+            ]
+        }
+    }
+}

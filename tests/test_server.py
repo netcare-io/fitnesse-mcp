@@ -822,6 +822,8 @@ async def test_page_history_condensed_by_default():
     assert data["pages"][1]["outcome"] == "pass" and data["final_counts"]["wrong"] == 1
     assert "stdout" not in data and "command" not in data  # dropped unless asked for
     assert (await _history(_SUITE_RUN_XML, include_stdout=True))["stdout"] == "out"
+    secret = _SUITE_RUN_XML.replace(b"<stdOut>out</stdOut>", b"<stdOut>Authorization=Bearer abc\nAccept=*/*</stdOut>")
+    assert (await _history(secret, include_stdout=True))["stdout"] == "Authorization=Bearer ***\nAccept=*/*"
 
     data = await _history(_TEST_RUN_XML, result_date="20261106230026")
     assert data["page"] == "S.A" and data["outcome"] == "fail" and data["run_time_ms"] == 22914
@@ -1181,6 +1183,37 @@ async def test_search_properties_uses_compatible_names(complete_env):
 @pytest.mark.asyncio
 async def test_complete_toolset_documented_inputs(complete_env, tool, args, expected):
     assert expected <= set(await _query(tool, args))
+
+
+@pytest.mark.parametrize("line,masked", [
+    ("Authorization=Bearer mcp-token-123", "Authorization=Bearer ***"),
+    ("[INFO ] 2026-11-09 18:54:34.345 [main] FITLIBRARYWEB - Authorization=Bearer t", "[INFO ] 2026-11-09 18:54:34.345 [main] FITLIBRARYWEB - Authorization=Bearer ***"),
+    ("X-Api-Key=k-456", "X-Api-Key=***"),
+    ('    "Authorization": "Basic dXNlcjpwdw==",', '    "Authorization": "Basic ***",'),
+    ('"client_secret": "a b c", "x": 1', '"client_secret": "***", "x": 1'),
+    ("&quot;password&quot;: &quot;two words&quot;, &quot;user&quot;: &quot;u&quot;", "&quot;password&quot;: &quot;***&quot;, &quot;user&quot;: &quot;u&quot;"),
+    ("mcpcookie:value", "mcpcookie:***"),
+    ("Cookie=a=1; b=2", "Cookie=***"),
+    ("set-cookie=JSESSIONID=abc; Path=/; HttpOnly", "set-cookie=***"),
+    ("GET https://x/api?access_token=abc&y=1", "GET https://x/api?access_token=***&y=1"),
+    ("Command: java -Ddb.password=xyz -cp a.jar", "Command: java -Ddb.password=*** -cp a.jar"),
+    # no secrets: unchanged
+    ("Accept=*/*", "Accept=*/*"),
+    ("content-type=application/json", "content-type=application/json"),
+    ("FITLIBRARYWEB - Response Headers:", "FITLIBRARYWEB - Response Headers:"),
+    ("Authorization failed for user", "Authorization failed for user"),
+    ("token count 5", "token count 5"),
+])
+def test_mask_secrets_in_logs(line, masked):
+    assert my_server._mask_secrets(line) == masked
+
+
+@pytest.mark.asyncio
+async def test_execution_log_masks_secrets(complete_env):
+    with _patch_urlopen(body=b"<pre>Authorization=Bearer abc\nX-Api-Key=k</pre>", content_type="text/html"):
+        async with Client(my_server.mcp) as c:
+            data = (await c.call_tool("fitnesse_get_execution_log", {"page_path": "A"})).data
+    assert data["body"] == "<pre>Authorization=Bearer ***\nX-Api-Key=***</pre>"
 
 
 @pytest.mark.asyncio

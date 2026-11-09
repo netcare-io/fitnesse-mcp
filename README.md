@@ -236,9 +236,6 @@ Parameter mapping for `fitnesse_search_properties`:
   `live_view_url` used to be `debugTest.liveViewUrl` with its `{session}` and
   `{hub}` placeholders unfilled (or empty without it); now they are filled in,
   per browser in `browsers[].live_view_url`, with the Grid UI as fallback.
-- **`fitnesse_debug_inspect(kind='keywords')` also lists methods of classes
-  without keyword annotations** (`plain: true`, categories `Plain classes /
-  <class>`), from a second request (`keywords`) after `keywordsJson`.
 - **`fitnesse_debug_start` decides by the page's type.** `suite` is optional:
   left out, the page's properties decide (Suite: a suite session, Test: a
   session on the page; both: a suite, with a `note`). A page that is neither
@@ -247,6 +244,34 @@ Parameter mapping for `fitnesse_search_properties`:
   The result always has `suite` and `pages` (for a test page: its
   SuiteSetUp, the page, its SuiteTearDown); filters on a test page are ignored
   (`filters_ignored`).
+- **The debug tools show times as local time.** Log lines of
+  `fitnesse_debug_status` and `fitnesse_debug_end` and `startedAt` (in the
+  status, its `sessions` and the messages of a refused start) used to be epoch
+  milliseconds. Now they are the MCP server's local time with its UTC offset:
+  `16:31:18.391Z [out] …` and `2026-11-09 16:26:03Z` (`Z` = UTC).
+- **`fitnesse_debug_run_page` refuses a page that is neither a test nor a suite
+  page**, as `fitnesse_debug_start` does, unless it is one of the start's
+  `pages`. Before, a static page was run as a test without a word. If its
+  properties can't be read, it runs as before. For a page that does not exist,
+  both say so (FitNesse answers its properties with every flag false, so they
+  ask `pageData` then) instead of calling it neither a test nor a suite page.
+- **Secrets in logs are masked.** KDTA's REST logging (`|''set logging''|true|`)
+  writes request and response headers and bodies to the test process's output.
+  The values of Authorization headers, API keys, tokens, cookies and passwords
+  are now replaced by `***` (the name and an auth scheme such as `Bearer`
+  stay) in the log lines of `fitnesse_debug_status`/`fitnesse_debug_end`, in
+  `fitnesse_get_execution_log` and in the `stdout`/`stderr`/`command` of
+  `fitnesse_get_page_history`. `raw=true` returns FitNesse's answer unchanged.
+- **`restart=true` runs a stopped SuiteSetUp again from its first table.** On a
+  single page whose SuiteSetUp stopped at a failure, `run_page(restart=true)`
+  used to continue it after the failed table, which then never ran. Without
+  `restart` it still continues there.
+- **`fitnesse_debug_steps(drop=[…])` refuses step numbers that were not
+  noted** and drops nothing; before, it ignored them.
+- **A failed check reads `<value> expected ⏎ <value> actual`** in the table
+  text of the debug tools and of test results. FitLibrary separates the two
+  values with a line (`<hr>`), which the text used to drop:
+  `Example Domain expectedExample Domains actual`.
 - **Taking over debug sessions needs `FITNESSE_ALLOW_ADOPT`.**
   `fitnesse_debug_status` has `adopt` and `session` only with
   `FITNESSE_ALLOW_ADOPT=1`; without it a call that passes them is refused,
@@ -446,13 +471,13 @@ All need `debug` in `FITNESSE_TOOLSETS`, plus the listed mode.
 | Tool | Action | Mode |
 |---|---|---|
 | `fitnesse_debug_start` | without `suite`: `properties` (Suite/Test decide; neither: refused); `status`, then `start`; refuses if a session of the account runs on the same page (forks before mod #159: anywhere), unless `replace`, and while this server's own session still runs. Then `suitePages`: with `suite` the suite's pages, without it the page's SuiteSetUp/SuiteTearDown (`suite_setup`/`suite_teardown`, each only if present). The result has `suite` and `pages` | test |
-| `fitnesse_debug_status` | `status` plus new `log` lines (each cut at 500 characters); `sessions` lists all of the account's (mod #159); with `FITNESSE_ALLOW_ADOPT`: `adopt` continues a running session, with several the one named by `session` | read |
+| `fitnesse_debug_status` | `status` plus new `log` lines (each cut at 500 characters; times as local time with UTC offset; secrets masked); `sessions` lists all of the account's (mod #159); with `FITNESSE_ALLOW_ADOPT`: `adopt` continues a running session, with several the one named by `session` | read |
 | `fitnesse_debug_run_wiki` | `runWiki` — wiki tables in the context of the current page, no SetUp/TearDown; `restart` ends the current test first (its TearDown tables not run yet, then `nextPage`; `skip_teardown` leaves the TearDown out). Failing before the SetUp ran in this test, on a page that has one, the result gets a `hint` to run `setup_only` (one `pageHtml` per test to check). `with_variables`/`with_live_view` send `withDynamicVariables`/`withLiveView` (mod v1.5.0/v1.6.0) and return `dynamicVariables`/`liveView` with the result; older forks: the separate actions afterwards | test |
 | `fitnesse_debug_read_link` | `GET` of a `/files/...` link from a debug result (Basic Auth as usual; other links refused): an image as image content; HTML/text without scripts, styles, comments, with `filter` only the places that contain it (`context_chars` around), else the start (`max_chars`). For KDTA's `Screen`/`HTML` links of a table | read |
 | `fitnesse_debug_steps` | none (this server's memory): the `run_wiki` calls whose tables all passed (`record=true`, the default), with `wiki` joined for saving; `drop`, `clear`. Kept after `end`, cleared by `start` | read |
 | `fitnesse_debug_page_tables` | `pageHtml`, split into tables; each with `source_page`/`source_index` for editing (tables of included pages live on that page) | read |
-| `fitnesse_debug_run_page` | on page change or `restart` the current page's TearDown tables not run yet (`pageHtml`, `runTable`; not with `skip_teardown`), then `nextPage`; `pageHtml`, `runTable` per table until the first with `[fail]`/`[error]` (`stopped_at`, `next_table`; the next call without `tables` continues there, `from_table` elsewhere; `page_done` at the end; `stop_on_failure=false`: one `runTable` for all). Outside a suite session the first call runs the SuiteSetUp first (`nextPage`, `pageHtml`, `runTable`, `nextPage` back; result `suite_setup`). `setup_only` (or `tables` that include all SetUp tables) runs the SetUp; a later call without `tables` skips it (`skipped_setup`). With `tables`, the result numbers the tables as on the page. `only_failures` returns only tables with `[fail]`/`[error]`. `with_variables`/`with_live_view` as for `run_wiki` | test |
-| `fitnesse_debug_inspect` | `keywordsJson` plus the `keywords` table for classes without annotations (without filter only the categories with their number of keywords; with filter the matching keywords without help texts unless `details=true`), `definedActions` (the defined actions loaded by `define actions at`: `debugTest definedActions` as JSON, on older forks parsed from `keywords`; filterable), `dynamicVariables`, `scope`, `liveView` (`live_view_url` per browser: `debugTest.liveViewUrl` with `{session}`/`{hub}` filled in, else the Grid UI `<hub without /wd/hub>/ui/#/session/<id>`; VNC password removed) | read |
+| `fitnesse_debug_run_page` | `properties` of a `page_path` that is not one of the start's `pages` (neither test nor suite: refused, with `pageData` to tell a missing page); on page change or `restart` the current page's TearDown tables not run yet (`pageHtml`, `runTable`; not with `skip_teardown`), then `nextPage`; `pageHtml`, `runTable` per table until the first with `[fail]`/`[error]` (`stopped_at`, `next_table`; the next call without `tables` continues there, `from_table` elsewhere; `page_done` at the end; `stop_on_failure=false`: one `runTable` for all). Outside a suite session the first call runs the SuiteSetUp first (`nextPage`, `pageHtml`, `runTable`, `nextPage` back; result `suite_setup`). `setup_only` (or `tables` that include all SetUp tables) runs the SetUp; a later call without `tables` skips it (`skipped_setup`). With `tables`, the result numbers the tables as on the page. `only_failures` returns only tables with `[fail]`/`[error]`. `with_variables`/`with_live_view` as for `run_wiki` | test |
+| `fitnesse_debug_inspect` | `keywordsJson`, also methods without keyword annotations (`generated`) (without filter only the categories with their number of keywords; with filter the matching keywords without help texts unless `details=true`), `definedActions` (the defined actions loaded by `define actions at`: `debugTest definedActions` as JSON, on older forks parsed from `keywords`; filterable), `dynamicVariables`, `scope`, `liveView` (`live_view_url` per browser: `debugTest.liveViewUrl` with `{session}`/`{hub}` filled in, else the Grid UI `<hub without /wd/hub>/ui/#/session/<id>`; VNC password removed) | read |
 | `fitnesse_debug_defined_action_source` | `debugTable definedAction` (with the session, or `page=` without one). Forks without it: page of the defined action from `keywords`, then `debugTable source` of that page, cut to the definition block as FitLibrary reads it (header first or after `----`, exactly four dashes anywhere between two tables, up to the next one; `-----` and dashes inside `!-…-!`, `{{{…}}}` or `#` comments don't separate; refuses a header found twice) | read |
 | `fitnesse_debug_end` | the current page's TearDown tables not run yet (`pageHtml`, `runTable`; `teardown.teardown_tables`); single page with a SuiteTearDown, after a `fitnesse_debug_run_page`: `nextPage` to the SuiteTearDown and run it (`suite_teardown`); `skip_teardown` leaves both out; `log` (number of lines), then `end` or `abort` with `logFrom` and `logMax` (mod #162; older forks send all lines from `logFrom`, cut here): the last unread log lines | test |
 | `fitnesse_table_source` | `debugTable source` | read |
@@ -532,8 +557,10 @@ fitnesse_table_source ──> fitnesse_table_save / _insert / _delete / _move / 
   `page_done=true` when all tables ran. Outside a suite session the same goes
   for the SuiteSetUp: if it stops, the result has `suite_setup.stopped_at` and
   the page has not begun; fix the table the same way, and the next `run_page()`
-  finishes the SuiteSetUp, then runs the page. `tables=[...]` also stops at a failure
-  (`tables_not_run`) but does not move `next_table`. `stop_on_failure=false`
+  finishes the SuiteSetUp, then runs the page (`restart=true`: the SuiteSetUp
+  from its first table, `suite_setup.restarted`). `tables=[...]` also stops at a failure
+  (`tables_not_run`) but does not move `next_table`; while the page's run is
+  stopped, its result repeats `next_table`. `stop_on_failure=false`
   runs everything in one `runTable`. Moving on before `page_done` leaves the
   rest out (`previous_page_teardown.tables_not_run`), except the TearDown (see
   above).
@@ -574,14 +601,15 @@ fitnesse_table_source ──> fitnesse_table_save / _insert / _delete / _move / 
   categories with their number of keywords (the full list runs to tens of
   kilobytes); pass a word or a category such as `Web / Browser` as `filter`
   for syntax, parameters and table rows (`details=true` adds the help texts).
-  `keywordsJson` only has keywords from KDTA's annotations; public methods of
-  fixture classes without any (plain FitLibrary fixtures) come from the
-  session's `keywords` table, as `plain: true` with `keyword`,
-  `parameter_types` and `class`, in categories `Plain classes / <class>`.
-  They are rows of kind `plain`; forks without it mark them `simple`, like
-  annotated ones, so the MCP server takes `simple` rows with neither tooltip
-  nor author whose keyword `keywordsJson` lacks. They are called as FitLibrary
-  reads a row: keyword and argument cells alternate (`|order exists|4711|`).
+  `keywordsJson` lists every public method of the fixture classes in scope;
+  methods without a keyword annotation, also those of plain FitLibrary
+  fixtures, have `generated: true` and their class as category. Their
+  `syntax` works as written (`|create order|%1|%2|`: FitLibrary also reads
+  the first cell as the name and the rest as arguments). The session's
+  `keywords` table knows fewer and is read only for defined actions.
+  Formatting tags in a keyword's `syntax` (`|''<i>excel open file</i>''|%1|`,
+  the annotation's help markup) are removed: FitLibrary would read them as
+  part of the keyword.
   `filter` on `definedActions` searches the call, note, author and page, not
   the body of the action.
 - **Table edits:** `save`/`insert`/`delete`/`move`/`save_text`/`move_text`

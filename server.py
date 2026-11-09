@@ -16,6 +16,7 @@ import xml.etree.ElementTree as ET
 from base64 import b64decode, b64encode
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from html.parser import HTMLParser
 from typing import Annotated, Literal, get_args
 from urllib import parse, request
@@ -1177,7 +1178,7 @@ def _history_summary(xml_bytes: bytes) -> dict | None:
             extras["exit_code"] = int(text(log, "exitCode"))
         for tag, key in (("command", "command"), ("stdOut", "stdout"), ("stdErr", "stderr")):
             if text(log, tag):  # only present when include_* asked for it
-                extras[key] = text(log, tag)
+                extras[key] = _mask_secrets(text(log, tag))
     if root.tag == "suiteResults":
         pages = []
         for ref in root.iter("pageHistoryReference"):
@@ -1210,6 +1211,27 @@ def _history_summary(xml_bytes: bytes) -> dict | None:
             return {**results[0], "page": text(root, "rootPath") or results[0]["page"], **extras}
         return {"page": text(root, "rootPath"), "results": results, **extras}
     return None
+
+
+# Values of secrets in the test process's output (KDTA's REST logging writes 'Authorization=Bearer
+# …', 'X-Api-Key=…', JSON bodies and 'key:value' query parameters), masked before a model sees
+# them. The names stay, and an auth scheme (Bearer, Basic): the log still shows what was set.
+_SECRET_NAME = r"[\w.-]*(?:authorization|api[-_]?key|token|secret|passw(?:or)?d|pwd|j?session[-_]?id|credential)[\w.-]*"
+_QUOTE = r'(?:"|&quot;)'
+_SCHEME = r"((?:bearer|basic|digest|negotiate|ntlm|token)\s+)?"
+_SECRET_QUOTED = re.compile(  # "name": "value with spaces"
+    rf"(?i)({_QUOTE}{_SECRET_NAME}{_QUOTE}\s*:\s*{_QUOTE}){_SCHEME}((?:(?!{_QUOTE}).)+)")
+_SECRET_PLAIN = re.compile(  # name=value, name: value, ?name=value&
+    rf"(?i)(?<![\w.-])({_SECRET_NAME}{_QUOTE}?\s*[=:]\s*{_QUOTE}?){_SCHEME}([^\"&\s,;<]+)")
+_COOKIE = re.compile(rf"(?i)(?<![\w.-])([\w.-]*cookie{_QUOTE}?\s*[=:]\s*{_QUOTE}?)((?:(?!{_QUOTE})[^\n<])+)")
+
+
+def _mask_secrets(text: str) -> str:
+    """text with the values of secrets (see above) replaced by ***."""
+    def mask(m: re.Match) -> str:
+        return f"{m[1]}{m[2] or ''}***"
+    text = _COOKIE.sub(lambda m: f"{m[1]}***", text)
+    return _SECRET_PLAIN.sub(mask, _SECRET_QUOTED.sub(mask, text))
 
 
 def _strip_execution_log(raw: bytes, tags: set[str]) -> bytes:
@@ -2145,7 +2167,8 @@ if COMPLETE_TOOLSET:
         description=(
             "Shows the execution log of a test run of the page: test system, command, exit code, "
             "stdout/stderr and exceptions. result_date is a timestamp (yyyyMMddHHmmss, as in "
-            "fitnesse_get_page_history) or 'latest' (default). Returns HTML."
+            "fitnesse_get_page_history) or 'latest' (default). Returns HTML; values of secrets "
+            "(Authorization, API keys, tokens, cookies, passwords) are masked as ***."
         ),
         tags={"fitnesse", "rest", "history", "read"},
         annotations={"readOnlyHint": True},
@@ -2158,12 +2181,15 @@ if COMPLETE_TOOLSET:
         timeout_seconds: float = _make_timeout(30.0),
     ) -> dict:
         """Execution log via responder=executionLog."""
-        return _request(
+        result = _request(
             "GET",
             page_path,
             params={"responder": "executionLog", "resultDate": result_date},
             timeout_seconds=timeout_seconds,
         )
+        if isinstance(result.get("body"), str):
+            result["body"] = _mask_secrets(result["body"])
+        return result
 
     @mcp.tool(
         name="fitnesse_partition_preview",
@@ -2331,6 +2357,8 @@ class _DebugState:
     # by reset (end, a lost session), so they can still be saved; a new start clears them.
     steps: list[dict] = field(default_factory=list)
     step_count: int = 0
+    # Pages fitnesse_debug_start listed (suitePages): run_page takes them without a type check.
+    pages: set[str] = field(default_factory=set)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def reset(self) -> None:
@@ -2342,6 +2370,7 @@ class _DebugState:
         self.suite = False
         self.log_next = 0
         self.page_counts = {}
+        self.pages = set()
 
 
 def _page_key(path: str | None) -> str | None:
@@ -2710,7 +2739,7 @@ class _TableParser(HTMLParser):
                 self._text("\n")
             elif classes & _FOLDING_CLASSES:
                 self._fold = {"divs": 1, "title": [], "parts": [], "title_tag": None, "owner": self._owner()}
-        elif tag in {"br", "p", "div", "li", "pre"}:
+        elif tag in {"br", "hr", "p", "div", "li", "pre"}:  # FitLibrary's [fail]: expected <hr> actual
             self._text("\n")
         if tag == "p" and self._depth == 0 and "title" in classes:
             self._title = True
@@ -2721,7 +2750,7 @@ class _TableParser(HTMLParser):
         if tag in {"img", "a"}:
             self._media(tag, dict(attrs))
             self._link = None
-        elif tag == "br":
+        elif tag in {"br", "hr"}:
             self._text("\n")
 
     def handle_endtag(self, tag):
@@ -3254,7 +3283,7 @@ def _check_start(page_path: str, sessions: list[dict], state: _DebugState, repla
         raise ToolError(
             f"A debug session started by someone using the same account (maybe in a browser) is "
             f"already running on {page} (session "
-            f"{here['session']}, started {here.get('startedAt')}). " + _foreign_session_advice(here["session"])
+            f"{here['session']}, started {_clock(here.get('startedAt'), with_date=True)}). " + _foreign_session_advice(here["session"])
             + " Sessions on other pages are not affected."
         )
 
@@ -3444,38 +3473,20 @@ def _without_help(node):
     return result
 
 
-def _keyword_key(text: str) -> str:
-    """A keyword compared by its words: '%1' placeholders, markup, case and spacing left out."""
-    return " ".join(_plain(re.sub(r"%\d+", " ", text)).lower().split())
+# keywordsJson lists every public method of the classes in scope; 'generated' ones have no keyword
+# annotation (also those of classes without any). The session's keywords table knows fewer, so
+# only its 'defined' rows are read (defined actions).
+# A syntax is an annotation's wiki as written, i.e. help-page markup such as |''<i>name</i>''|%1|.
+# FitLibrary reads the tags as part of the name (Missing method …LessThanIGreaterThan…), so they go.
+_SYNTAX_TAGS = re.compile(r"</?(?:i|b|em|strong|u)>", re.I)
 
 
-def _plain_keywords(html: str, known: set[str]) -> list[dict]:
-    """Public methods of classes without keyword annotations, from the session's keywords table
-    (keywordsJson has only annotated ones): rows of kind 'plain' (fitlibrary-netcare-mod #88), or
-    on forks without it of kind 'simple' with neither tooltip nor author whose keyword
-    keywordsJson lacks. Row: kind | wiki
-    (|''<i>name''</i>| Type | Type |) | tooltip | author | class."""
-    found = []
-    for row in _query_rows(html):
-        if not row or row[0] not in ("plain", "simple"):
-            continue
-        wiki, tooltip, author, cls = (row[1:] + [""] * 4)[:4]
-        cells = _wiki_cells(wiki)
-        keyword = " ".join(_plain(c) for c in cells if "''" in c)
-        if not keyword or (row[0] == "simple" and (tooltip or author or _keyword_key(keyword) in known)):
-            continue
-        found.append({
-            "category": "Plain classes / " + cls.rsplit(".", 1)[-1],
-            "special": False,
-            "plain": True,
-            "keyword": keyword,
-            "parameter_types": [_plain(c) for c in cells if "''" not in c and _plain(c)],
-            "class": cls,
-        })
-    return found
+def _clean_syntax(entry: dict) -> dict:
+    syntax = entry.get("syntax")
+    return {**entry, "syntax": _SYNTAX_TAGS.sub("", syntax)} if isinstance(syntax, str) else entry
 
 
-def _keywords(html: str, filter: str | None, limit: int, details: bool = False, table_html: str = "") -> dict:
+def _keywords(html: str, filter: str | None, limit: int, details: bool = False) -> dict:
     rows = _query_rows(html)
     cells = rows[0] if rows else []
     try:
@@ -3484,11 +3495,10 @@ def _keywords(html: str, filter: str | None, limit: int, details: bool = False, 
     except json.JSONDecodeError as exc:
         raise ToolError(f"Unexpected keywordsJson answer: {exc}") from exc
     found = [
-        {"category": " / ".join(path), "special": is_special, **entry}
+        {"category": " / ".join(path), "special": is_special, **_clean_syntax(entry)}
         for is_special, source in ((False, keywords), (True, special))
         for path, entry in _walk_keywords(source)
     ]
-    found += _plain_keywords(table_html, {_keyword_key(str(e.get("syntax") or "")) for e in found})
     if filter:
         needle = filter.lower()
         hits = [e for e in found if needle in json.dumps(e, ensure_ascii=False).lower()]
@@ -3783,11 +3793,38 @@ def _reload_defined_actions(page: str) -> dict:
 _LOG_LINE_CHARS = 500  # the test process' command line alone (its classpath) has several KB
 
 
+def _clock(ms, with_date: bool = False) -> str:
+    """A time of the fork (epoch ms: log lines, startedAt) as this server's local time with its UTC
+    offset, Z for UTC: 16:31:18.391Z, with_date 2026-11-09 16:31:18Z. Anything else as it came."""
+    try:
+        moment = datetime.fromtimestamp(int(ms) / 1000).astimezone()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "" if ms is None else str(ms)
+    offset = moment.strftime("%z")
+    zone = "Z" if offset in ("", "+0000", "-0000") else f"{offset[:3]}:{offset[3:]}"
+    if with_date:
+        return moment.strftime("%Y-%m-%d %H:%M:%S") + zone
+    return f"{moment:%H:%M:%S}.{moment.microsecond // 1000:03d}{zone}"
+
+
+def _readable_times(status: dict) -> dict:
+    """status with startedAt, its own and its sessions', as local time (_clock)."""
+    result = dict(status)
+    if "startedAt" in result:
+        result["startedAt"] = _clock(result["startedAt"], with_date=True)
+    if isinstance(result.get("sessions"), list):
+        result["sessions"] = [
+            {**s, "startedAt": _clock(s["startedAt"], with_date=True)} if isinstance(s, dict) and "startedAt" in s else s
+            for s in result["sessions"]
+        ]
+    return result
+
+
 def _log_line(line: dict) -> str:
-    text = str(line.get("text", ""))
+    text = _mask_secrets(str(line.get("text", "")))
     if len(text) > _LOG_LINE_CHARS:
         text = f"{text[:_LOG_LINE_CHARS]}… ({len(text)} chars)"
-    return f"{line.get('time', '')} [{line.get('stream', '')}] {text}"
+    return f"{_clock(line.get('time'))} [{line.get('stream', '')}] {text}"
 
 
 def _log_lines(lines) -> list[str]:
@@ -3933,22 +3970,62 @@ def _suite_frame(state: _DebugState, timeout_seconds: float | None) -> list:
     return pages
 
 
+def _page_flags(page_path: str) -> dict | None:
+    """The page's properties (Test, Suite, …); None when they can't be read."""
+    result = _request("GET", page_path, params={"responder": "properties", "format": "json"}, timeout_seconds=30.0)
+    flags = result.get("body") if result.get("ok") else None
+    return flags if isinstance(flags, dict) else None
+
+
+def _check_exists(page_path: str) -> None:
+    """For a page whose properties say neither test nor suite: FitNesse answers properties of a
+    missing page with 200 and every flag false, so ask pageData (404 there) and say so."""
+    if _request("GET", page_path, params={"responder": "pageData"}, timeout_seconds=30.0).get("status") == 404:
+        raise ToolError(
+            f"{page_path} does not exist on this FitNesse. Check the path: fitnesse_search finds "
+            "pages by name."
+        )
+
+
 def _is_suite(page_path: str) -> tuple[bool, str | None]:
     """Whether to start page_path as a suite, from its Suite/Test properties, and a note for the
     result. Properties that can't be read: a test page (the start then says what is wrong)."""
-    result = _request("GET", page_path, params={"responder": "properties", "format": "json"}, timeout_seconds=30.0)
-    flags = result.get("body") if result.get("ok") else None
-    if not isinstance(flags, dict):
+    flags = _page_flags(page_path)
+    if flags is None:
         return False, None
     suite, test = bool(flags.get("Suite")), bool(flags.get("Test"))
     if suite and test:
         return True, "The page is a suite and a test page; started as a suite. suite=false runs only its own tables."
     if not suite and not test:
+        _check_exists(page_path)
         raise ToolError(
             f"{page_path} is neither a test nor a suite page (its properties). Start a test or suite "
             "page, or pass suite=true or suite=false to start it anyway."
         )
     return suite, None
+
+
+def _check_runnable(state: _DebugState, page: str) -> None:
+    """run_page on a page outside the session's pages: refuse one that is neither a test nor a
+    suite page, as start does (a Static page would run as a test without a word). Properties that
+    can't be read: the run says what is wrong."""
+    if page in (state.page, state.current_page) or page in state.pages:
+        return
+    flags = _page_flags(page)
+    if flags is not None and not flags.get("Test") and not flags.get("Suite"):
+        _check_exists(page)
+        raise ToolError(
+            f"{page} is neither a test nor a suite page (its properties) and not one of this "
+            "session's pages (fitnesse_debug_start's 'pages'). Run a test page, or try its tables "
+            "with fitnesse_debug_run_wiki."
+        )
+
+
+def _session_pages(pages) -> set[str]:
+    """The paths of fitnesse_debug_start's 'pages' (suitePages)."""
+    if not isinstance(pages, list):
+        return set()
+    return {key for p in pages if isinstance(p, dict) and (key := _page_key(str(p.get("path") or "")))}
 
 
 def _continue_page(state: _DebugState, page: str, stop_on_failure: bool, timeout_seconds: float | None) -> dict:
@@ -3981,25 +4058,33 @@ def _continue_page(state: _DebugState, page: str, stop_on_failure: bool, timeout
 
 
 def _run_suite_setup(
-    state: _DebugState, page: str, stop_on_failure: bool, timeout_seconds: float | None
+    state: _DebugState, page: str, stop_on_failure: bool, timeout_seconds: float | None,
+    restart: bool = False,
 ) -> dict | None:
     """Single-page session: run the SuiteSetUp (if any) before the page's test, as ?test does,
     then begin page's test again. Like a page, it stops at its first failing table: then the
     page's test has not begun (suite_setup_pending), and the next run of the page continues the
-    SuiteSetUp first. Returns the SuiteSetUp's result when this call ran some of it.
+    SuiteSetUp first; restart runs it again from its first table instead. Returns the
+    SuiteSetUp's result when this call ran some of it.
     The first page run starts the frame: from then on end runs the SuiteTearDown (if any), with
     or without a SuiteSetUp."""
     if state.suite:
         return None
+    restarted = False
     if not state.frame_started:
         state.frame_started = True
         if not state.suite_setup:
             return None
         _next_page(state, state.suite_setup, timeout_seconds)
         state.suite_setup_pending = True
+    elif restart and state.suite_setup_pending and page != state.suite_setup:
+        _next_page(state, state.suite_setup, timeout_seconds)  # its test begins afresh, as for a page
+        restarted = True
     if not state.suite_setup_pending or page == state.suite_setup:
         return None  # run_page on the SuiteSetUp itself works on it as on any page
     result = _continue_page(state, state.suite_setup, stop_on_failure, timeout_seconds)
+    if restarted:
+        result["restarted"] = True
     if "stopped_at" not in result:
         state.suite_setup_pending = False
         _next_page(state, page, timeout_seconds)
@@ -4110,7 +4195,7 @@ if DEBUG_TOOLSET:
                 raise ToolError(
                     f"A debug session started by {owner} is already running (page "
                     f"{status.get('page')}, current page {status.get('currentPage')}, started "
-                    f"{status.get('startedAt')}); this FitNesse allows one per account. "
+                    f"{_clock(status.get('startedAt'), with_date=True)}); this FitNesse allows one per account. "
                     + ("Continue it with fitnesse_debug_status(adopt=true), end it with fitnesse_debug_end, "
                        "or pass replace=true to kill it without tear down."
                        if owner == "this MCP server" else _foreign_session_advice(None))
@@ -4130,6 +4215,7 @@ if DEBUG_TOOLSET:
             data["note"] = note
         if not suite:
             data["pages"] = _suite_frame(state, 30.0)
+            state.pages = _session_pages(data["pages"])
             if state.suite_setup:
                 data["suite_setup"] = state.suite_setup
             if state.suite_teardown:
@@ -4148,6 +4234,7 @@ if DEBUG_TOOLSET:
                     },
                 )
                 data["pages"] = pages.get("pages")
+                state.pages = _session_pages(data["pages"])
             except ToolError as exc:
                 data["pages_error"] = str(exc)
         return data
@@ -4164,10 +4251,12 @@ if DEBUG_TOOLSET:
             " long table, so use it to watch progress.\n"
             "Result: running (false = no session), page (where the session was started), currentPage "
             "(whose test is running), suite, busy, idleSecondsLeft (the session ends itself after "
-            "this idle time), known_to_this_server, and log.lines ('time [out|err|info] text'; 'info'"
-            " lines show the command, exit code and crashes). These describe this server's session, "
+            "this idle time), known_to_this_server, and log.lines ('time [out|err|info] text', time as this server's local "
+            "time with its UTC offset, Z = UTC; 'info' lines show the command, exit code and crashes; values of "
+            "secrets such as Authorization headers, API keys, tokens, cookies and passwords are masked as ***). "
+            "These describe this server's session, "
             "else the account's session on page_path, else its only one. sessions (mod #159) lists "
-            "all running sessions of the account: session, page, currentPage, suite, busy, startedAt.\n"
+            "all running sessions of the account: session, page, currentPage, suite, busy, startedAt (local time).\n"
             "busy=true means the process is still working on a call that timed out: wait and call "
             "this again until busy is false, or abort with fitnesse_debug_end(abort=true).\n"
             "known_to_this_server=false with running=true means someone else's session (or one from "
@@ -4205,7 +4294,7 @@ if DEBUG_TOOLSET:
                 known = True
         elif state.session and not known:
             state.reset()
-        result = {**status, "known_to_this_server": known}
+        result = {**_readable_times(status), "known_to_this_server": known}
         if known and state.table_count is not None:  # where run_page continues the current page
             result["next_table"] = state.next_table
         if known and max_log_lines:
@@ -4248,7 +4337,8 @@ if DEBUG_TOOLSET:
             "next. All tables of one call run before the result comes back; it can take minutes (up "
             "to ~10).\n"
             "Result: 'tables' holds every table as text, one row per line; a cell's outcome is "
-            "prefixed: [pass] check passed, [fail] check failed (the cell shows expected and actual),"
+            "prefixed: [pass] check passed, [fail] check failed (the cell shows '<value> expected ⏎ "
+            "<value> actual'),"
             " [error] exception (message and shortened stack trace), [ignore] not run. Cells without "
             "prefix are plain input. Cells of nested tables keep their prefix inline. Under a "
             "|condition| table a line says what it did (then ran, else ran, condition false, "
@@ -4309,12 +4399,20 @@ if DEBUG_TOOLSET:
         annotations={"readOnlyHint": False, "destructiveHint": False},
     )
     def fitnesse_debug_steps(
-        drop: Annotated[list[int] | None, Field(description="Numbers of steps to forget.")] = None,
+        drop: Annotated[list[int] | None, Field(description="Numbers of steps to forget. If one of them was not noted, nothing is dropped.")] = None,
         clear: Annotated[bool, Field(description="Forget all steps (after returning them).")] = False,
     ) -> dict:
         """The steps noted in this server's memory; no request to FitNesse."""
         state = _debug_state()  # no session lock: it is held while a table runs
         if drop:
+            noted = [s["step"] for s in state.steps]
+            unknown = sorted(set(drop) - set(noted))
+            if unknown:
+                raise ToolError(
+                    f"No step {', '.join(map(str, unknown))}: the noted steps are "
+                    f"{', '.join(map(str, noted)) or 'none'}. Nothing was dropped; call this without "
+                    "drop to see them."
+                )
             state.steps = [s for s in state.steps if s["step"] not in set(drop)]
         steps = list(state.steps)
         if clear:
@@ -4436,8 +4534,10 @@ if DEBUG_TOOLSET:
             "image; read its 'HTML' link, the page source then, with "
             "fitnesse_debug_read_link(url, filter=...). Result tables as for fitnesse_debug_run_wiki.\n"
             "tables=[...] runs only those indices (see fitnesse_debug_page_tables), in that order, "
-            "and does not move next_table. from_table continues the page at that index instead.\n"
-            "If page_path is not the page currently being tested, the current page's test is ended "
+            "and does not move next_table (repeated in the result while the page's run is stopped). "
+            "from_table continues the page at that index instead.\n"
+            "page_path must be a test or suite page, or one of fitnesse_debug_start's 'pages'. "
+            "If it is not the page currently being tested, the current page's test is ended "
             "first: its TearDown tables that have not run yet (e.g. after a stop) run now, unless "
             "skip_teardown=true. previous_page_teardown reports that end (teardown_tables, and "
             "tables_not_run if it had stopped). Then the new page's test begins; restart=true ends "
@@ -4457,7 +4557,7 @@ if DEBUG_TOOLSET:
     def fitnesse_debug_run_page(
         page_path: DebugPath = None,
         tables: Annotated[list[int] | None, Field(description="Indices from fitnesse_debug_page_tables to run, in this order (the result numbers the tables the same way); omit to run (or continue) the whole page. Including all setup_tables counts as running the SetUp.")] = None,
-        restart: Annotated[bool, Field(description="Begin the page's test afresh even if it is already the current page.")] = False,
+        restart: Annotated[bool, Field(description="Begin the page's test afresh even if it is already the current page. While a single page's SuiteSetUp is stopped: run the SuiteSetUp again from its first table.")] = False,
         skip_teardown: _SKIP_TEARDOWN = False,
         setup_only: Annotated[bool, Field(description="Run only the SetUp tables (setup_tables of fitnesse_debug_page_tables). Not together with tables.")] = False,
         from_table: Annotated[int | None, Field(description="Continue the page at this index instead of next_table, e.g. after tables before it were inserted or deleted. Not together with tables or setup_only.", ge=0)] = None,
@@ -4478,6 +4578,8 @@ if DEBUG_TOOLSET:
         if not state.suite and current and current == state.suite_setup:
             current = state.page  # single page: the SuiteSetUp only leads to the page
         page = _page_key(page_path) or current or state.page
+        if page_path:
+            _check_runnable(state, page)
 
         def run() -> dict:
             html_page = _page_html(state, page, timeout_seconds)
@@ -4547,10 +4649,15 @@ if DEBUG_TOOLSET:
                     result["tables_not_run"] = chosen[len(ran):]
             elif whole:
                 result["page_done"] = True
+            if tables is not None and state.table_count is not None and state.next_table < len(parts):
+                result["next_table"] = state.next_table  # the page's run stopped before: where it goes on
+                result.setdefault("hint", (
+                    f"The page's run is still stopped: call this without tables to continue it at table "
+                    f"{state.next_table}."))
             return _with_extras(state, data, result, with_variables, with_live_view, timeout_seconds)
 
         with _document(state):
-            suite_setup = _run_suite_setup(state, page, stop_on_failure, timeout_seconds)
+            suite_setup = _run_suite_setup(state, page, stop_on_failure, timeout_seconds, restart)
             if suite_setup is not None and "stopped_at" in suite_setup:
                 failed, setup_page = suite_setup["stopped_at"]["index"], state.suite_setup
                 return _with_images({"page": page, "suite_setup": suite_setup, "hint": (
@@ -4560,7 +4667,8 @@ if DEBUG_TOOLSET:
                     "nothing) until one passes and save that one once with fitnesse_table_save "
                     "(stopped_at's source_page/source_index), or report that there is no fix; then "
                     "call this again: it continues the "
-                    f"SuiteSetUp at table {suite_setup['next_table']}, then runs {page}.")})
+                    f"SuiteSetUp at table {suite_setup['next_table']} (restart=true: from its first "
+                    f"table), then runs {page}.")})
             result = _run_document(state, page, restart and suite_setup is None, timeout_seconds, run, skip_teardown)
             if page == state.suite_setup and result.get("page_done"):
                 state.suite_setup_pending = False
@@ -4578,11 +4686,9 @@ if DEBUG_TOOLSET:
             "matching entries: syntax, where %1, %2 are the cells for parameters (e.g. 'click %1' -> "
             "'|click|//button|'), parameters (label, allowed options), returnType and tableItems (the "
             "rows a keyword expects in the rest of its table; mandatory=true marks required rows). "
-            "details=true adds the help texts. plain=true marks a public method of a class without "
-            "keyword annotations (keyword, parameter_types, class; category 'Plain classes / <class>'): "
-            "keyword and argument cells alternate, with several arguments its words spread over the "
-            "keyword cells (|order exists|4711|, |user|fred|creates room|lotr|). Defined actions are "
-            "not in it: see 'definedActions'.\n"
+            "details=true adds the help texts. generated=true marks a public method without keyword "
+            "annotation (category: its class); its syntax works as written. Defined actions are not "
+            "in it: see 'definedActions'.\n"
             "- 'definedActions': the defined actions loaded in this session by |define actions at| "
             "(usually from SetUp): action (call syntax, parameters as cells), parameters, note, "
             "deprecated, author, page (where it is defined; edit it with "
@@ -4617,17 +4723,11 @@ if DEBUG_TOOLSET:
             hits = [a for a in actions if _matches_action(json.dumps(a, ensure_ascii=False), filter)]
             return {"count": len(actions), "matches": len(hits), "definedActions": hits[:limit]}
         action = {"keywords": "keywordsJson"}.get(kind, kind)
-        table = ""
         with _document(state):
             data = _session_action(state, action, timeout_seconds=timeout_seconds)
-            if kind == "keywords":  # methods of classes without annotations are only in this table
-                try:
-                    table = _session_action(state, "keywords", timeout_seconds=timeout_seconds).get("html") or ""
-                except ToolError as exc:
-                    logger.info("keywords table not read, plain classes left out: %s", exc)
         html = data.get("html") or ""
         if kind == "keywords":
-            return _keywords(html, filter, limit, details, table)
+            return _keywords(html, filter, limit, details)
         if kind == "liveView":
             return _live_view(data)
         if kind == "dynamicVariables":
@@ -4640,10 +4740,15 @@ if DEBUG_TOOLSET:
             "Ends the debug session as a normal test run ends: first the current page's TearDown "
             "tables that have not run yet (e.g. after a stop; teardown.teardown_tables) and, outside a "
             "suite session once fitnesse_debug_run_page ran, the SuiteTearDown (suite_teardown); then "
-            "the test process stops. skip_teardown=true leaves both out. Returns the tear-down result, the remaining log "
+            "the test process stops. skip_teardown=true leaves both out. Every end of a page's test "
+            "(here and in fitnesse_debug_run_page's previous_page_teardown) shows FitLibrary's own "
+            "table 'Messages in storytest tear down' (here also '... suite tear down'), also when "
+            "teardown_tables is empty. Returns the "
+            "tear-down result, the remaining log "
             "lines (the last max_log_lines of them; log_omitted counts the others: to read the whole "
-            "log, call fitnesse_debug_status before ending) and page_totals (counts per page). Call it "
-            "whenever you are done.\n"
+            "log, call fitnesse_debug_status before ending) and page_totals (counts per page). The "
+            "log's 'Exit code' is wrong + exceptions of everything the session ran, also before a "
+            "restart: the pages' results are page_totals. Call it whenever you are done.\n"
             "abort=true stops the process immediately without tear down; it works even while another "
             "call is still running. Use it when the session hangs or busy stays true."
         ),

@@ -1,10 +1,10 @@
 # Interactive debug mode
 
-> Copy of the fork's documentation (kdta-devcontainer `main` at 6ba34d5: fitnesse-netcare-mod
-> `origin/master` as of #164, kind `plain` from fitlibrary-netcare-mod PR #88), taken 2026-11-09.
-> It describes the contract the KDTA debug tools in [server.py](../server.py) build on. `AGENTS.md`
-> and `README.md` below are the fork's files, not this repository's. Don't edit it here: replace it
-> with a new copy when the fork changes.
+> Copy of the fork's documentation (kdta-devcontainer `main` at b723ee0: fitnesse-netcare-mod
+> `origin/master` as of #164, kind `plain` from fitlibrary-netcare-mod #88, merged after 1.6.3),
+> taken 2026-11-09. It describes the contract the KDTA debug tools in [server.py](../server.py)
+> build on. `AGENTS.md` and `README.md` below are the fork's files, not this repository's. Don't
+> edit it here: replace it with a new copy when the fork changes.
 
 How the debug mode of the wiki works: the responders `debugTest` and `debugTable` in fitnesse-netcare-mod, the interactive test runner
 in fitlibrary-netcare-mod, the browser parts in fitlibraryweb-netcare and the UI (`debugTest.js`) in fitnesse-netcare-resources. For
@@ -127,11 +127,21 @@ overrides; `note`, `author` and `deprecated` rows of the definition as on the
 help page).
 
 `keywordsJson` returns a one-row table `keywordsJson | <keywords> | <special keywords>`
-with the JSON of `|help json keywords|` (from the `@JsonNetcare*Action`
-annotations, HTML-escaped): categories with `children`, per keyword `syntax`
+with the JSON of `|help json keywords|` (HTML-escaped): categories with `children`, per keyword `syntax`
 (`%1` placeholders), `parameters` (label, `options`), `returnType` and
 `tableItems`, the rows of a keyword that takes over the table; whether a row is
-required is only in its `helpText` ("This statement is mandatory"). The answer
+required is only in its `helpText` ("This statement is mandatory"). Categories and
+entries come from `@JsonNetcareAction` (its `hierarchy`) and the optional
+`KeywordMapping.json`/`SpecialKeywordMapping.json` in FitNesse's working directory.
+Every other public method of a class in scope is in it too, with `generated: true`,
+under a category named after the class's canonical name (e.g.
+`netcare.fixture.browser.BrowserFixture`): annotated with a FitLibrary or netcare
+keyword annotation or not at all, also the methods of a class without any
+annotations; a class with `@ShowSelectedActions` gives only its annotated ones.
+Their `syntax` is the annotation's `wiki` as written, markup included
+(`|''<i>excel open file</i>''|%1|`), which a wiki table can't use as is (FitNesse
+escapes the `<i>`); without an annotation it is the method name, e.g.
+`|create order|%1|%2|`. The answer
 also has that JSON parsed as `keywordsJson` (`{keywords, special}`), and
 `runTable`/`runWiki` add it after the run with `withKeywordsJson=true` (mod #163;
 `withKeywords=true` adds only the HTML of `keywords`).
@@ -177,7 +187,15 @@ commons-logging go through `slf4j-jdk14` to java.util.logging, which writes to
 standard error (INFO and up). The debug UI's console shows it in its Output tab,
 with a checkbox per stream and a dropdown with a checkbox per logger (log4j's
 `%c{1}`, the short class name of a java.util.logging entry; JUL message and
-stack trace lines go with the entry before them).
+stack trace lines go with the entry before them). `log` itself gives raw lines: a
+message with line breaks (e.g. the REST logging's headers and bodies) is several
+lines, only the first with the log4j prefix. The UI adds a line to the entry before
+it on the same stream if it comes within 1 s of it (`ENTRY_MILLIS`) and doesn't
+start a log4j or JUL entry (`continuedEntry` in `debugTest.js`). The `info` line
+`Exit code: <n>` after `end` is the test process's: wrong plus exceptions of all
+documents it ran since `start` (FitLibrary's suite counts), also of earlier runs of
+a page run again in the same session; it isn't the result of the last page. The
+UI's Restart ends the session and starts a new process, so its count starts at 0.
 
 Line formats: log4j writes `[%-5level] %d{yyyy-MM-dd HH:mm:ss.SSS} [%t] %c{1} - %msg`
 (`log4j2.properties` in the working directory), e.g.
@@ -270,11 +288,17 @@ its body collapsed) and by a double-click in a call's expanded body.
 
 - `debugTable` `action=saveBlock` replaces the tables `index` to `last` and the text between them, and refuses if the block changed; a
   defined action is several tables.
-- `keywords` also lists the public methods of plain classes without any keyword annotations (not `keywordsJson`): kind `plain` (since
-  fitlibrary-netcare-mod #88; before it `simple`, indistinguishable from an annotated keyword without tooltip), `wiki` the method name
-  and its parameter types (`|''<i>create order''</i>| String | int |`, the markup in another order than an annotation's), `tooltip`
-  and `author` empty, no `overrides` cell.
+- `keywords` has rows for `@SimpleNetcareAction`, `@CompoundNetcareAction`, `@SimpleAction` and `@CompoundAction` only; methods
+  with `@AnAction`, `@AnNetcareAction` or `@NullaryAction` (e.g. `add global` of `DoTraverse`) and the methods without annotation of
+  an annotated class are missing there and only in `keywordsJson`.
+- `keywords` also lists the public methods of plain classes without any keyword annotations (`keywordsJson` has them as well, see
+  there): kind `plain` (fitlibrary-netcare-mod #88, after 1.6.3; before it `simple`, indistinguishable from an annotated keyword
+  without tooltip), `wiki` the method name and its parameter types (`|''<i>create order''</i>| String | int |`, the markup in another
+  order than an annotation's), `tooltip` and `author` empty, no `overrides` cell.
   Reloading a defined action from its own page replaces it instead of listing it as its own override.
+- On a fail or error the row gets the links Screen and HTML only from a browser fixture (`BrowserFixture`, `MobileAppFixture`) that
+  the row's keyword belongs to (`OnErrorReportHandler`), e.g. `click` or `|check|title|`; `|get|2|is|1|` gets none. If the row's
+  keyword subjects are unknown, every registered fixture reports.
 - The interactive server sends a keep-alive command to its browsers every 60 s while no document runs; `documentLock` keeps it out of a
   running document. The command is `getWindowHandles`: `getTitle` would dismiss an open alert.
 - `KeywordMapping.json` and `SpecialKeywordMapping.json` in the test process's working directory are optional; a missing one doesn't warn.

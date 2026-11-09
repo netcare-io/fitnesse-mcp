@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+import time
 from email.message import Message
 from unittest.mock import patch
 from urllib import parse
@@ -108,11 +109,13 @@ async def _call(tool, args=None, *answers):
 
 
 async def _start(page="FrontPage.T", suite=False):
+    # suitePages: a suite's pages A and B, or for a page its SuiteSetUp/-TearDown (none here)
+    pages = [{"path": f"{page}.{p}", "runnable": True, "kind": "test"} for p in "AB"] if suite else []
     await _call(
         "fitnesse_debug_start", {"page_path": page, "suite": suite},
         (200, {"running": False}),
         (200, {"started": True, "page": page, "session": "s1"}),
-        (200, {"page": page, "pages": []}),  # suitePages: of the suite, or the page's SuiteSetUp/-TearDown
+        (200, {"page": page, "pages": pages}),
     )
 
 
@@ -167,7 +170,7 @@ CONDITION_TRUE_HTML = (
 def test_tables_text_says_what_a_condition_did():
     text = my_server._tables_text(CONDITION_TRUE_HTML)
     assert "Table 0 – condition: then ran" in text
-    assert "[fail] false expected" in text  # a nested cell keeps its status
+    assert "[fail] false expected ⏎ true actual" in text  # a nested cell keeps its status
     assert my_server._failed(my_server._parse_tables(CONDITION_TRUE_HTML)[0])
     assert "Table 0:" in my_server._tables_text(CONDITION_TRUE_HTML, only_failures=True)
 
@@ -654,61 +657,40 @@ async def test_keywords_filter(debug_env):
         {"syntax": "click %1", "parameters": [{"label": "locator"}]},
     ]}]
     html = "<table><tr><td>keywordsJson</td><td>" + json.dumps(kw).replace("&", "&amp;").replace("<", "&lt;") + "</td><td>[]</td></tr></table>"
-    data, fake = await _call("fitnesse_debug_inspect", {"kind": "keywords"}, (200, {"html": html, "counts": {}}), NO_TABLE)
-    assert fake.actions == ["keywordsJson", "keywords"]
+    data, fake = await _call("fitnesse_debug_inspect", {"kind": "keywords"}, (200, {"html": html, "counts": {}}))
+    assert fake.actions == ["keywordsJson"]  # the keywords table is not needed
     assert data["count"] == 2 and data["categories"] == {"Browser": 2} and "filter" in data["hint"]
-    data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords", "filter": "LOCATOR"}, (200, {"html": html, "counts": {}}), NO_TABLE)
+    data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords", "filter": "LOCATOR"}, (200, {"html": html, "counts": {}}))
     assert data["matches"] == 1 and data["keywords"][0]["syntax"] == "click %1"
 
 
-NO_TABLE = (200, {"html": "", "counts": {}})
-# from the fork team: InteractiveTables.plainKeywordRows of master with a sample class, as a session sends it
-PLAIN_ROWS = (
-    '<tr><td>simple</td><td>|\'\'&lt;i&gt;create order\'\'&lt;/i&gt;| String | int |</td><td></td><td></td>'
-    '<td>fitlibrary.suite.KeywordsProbe$OrderFixture</td></tr>'
-    '<tr><td>simple</td><td>|\'\'&lt;i&gt;order exists\'\'&lt;/i&gt;| String |</td><td></td><td></td>'
-    '<td>fitlibrary.suite.KeywordsProbe$OrderFixture</td></tr>'
-    '<tr><td>simple</td><td>|\'\'&lt;i&gt;last order id\'\'&lt;/i&gt;|</td><td></td><td></td>'
-    '<td>fitlibrary.suite.KeywordsProbe$OrderFixture</td></tr>'
-)
-KEYWORDS_TABLE = (
-    '<table border="1" cellspacing="0"><tr><td>keywords</td><td>wiki</td><td>tooltip</td><td>author</td>'
-    '<td>class</td><td>overrides</td></tr>' + PLAIN_ROWS
-    # annotated rows: one keywordsJson has (without tooltip), one with a tooltip; a defined action
-    + '<tr><td>simple</td><td>|\'\'&lt;i&gt;click&lt;/i&gt;\'\'| |</td><td></td><td></td><td>kdta.Web</td></tr>'
-    + '<tr><td>simple</td><td>|\'\'&lt;i&gt;wait&lt;/i&gt;\'\'| |</td><td>waits</td><td>kdta</td><td>kdta.Web</td></tr>'
-    + '<tr><td>defined</td><td>|\'\'greet\'\'|name|</td><td></td><td></td><td>.Lib.Defs</td><td></td></tr>'
-    + "</table>"
-)
+@pytest.mark.asyncio
+async def test_keywords_syntax_comes_without_formatting_tags(debug_env):
+    # tcas-ta-ng: generated entries carry <i> in syntax; copied into a table, FitLibrary takes it for
+    # part of the name (Missing method …LessThanIGreaterThan…)
+    await _start()
+    kw = [{"name": "netcare.fixture.browser.BrowserFixture", "children": [
+        {"syntax": "|''<i>excel open file matching</i>''|%1|''<I>index</I>''|%2|", "generated": True},
+        {"syntax": "|add global|%1|%2|", "generated": True},
+    ]}]
+    html = "<table><tr><td>keywordsJson</td><td>" + json.dumps(kw).replace("&", "&amp;").replace("<", "&lt;") + "</td><td>[]</td></tr></table>"
+    data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords", "filter": "excel"}, (200, {"html": html, "counts": {}}))
+    assert [k["syntax"] for k in data["keywords"]] == ["|''excel open file matching''|%1|''index''|%2|"]
+    data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords", "filter": "global"}, (200, {"html": html, "counts": {}}))
+    assert data["keywords"][0]["syntax"] == "|add global|%1|%2|"
 
 
 @pytest.mark.asyncio
-async def test_keywords_include_methods_of_classes_without_annotations(debug_env):
+async def test_keywords_of_classes_without_annotations_come_from_keywords_json(debug_env):
+    # the fork lists them as generated, in a category named after the class; the syntax runs as written
     await _start()
-    kw = [{"name": "Web", "children": [{"syntax": "click %1"}]}]
-    json_html = "<table><tr><td>keywordsJson</td><td>" + json.dumps(kw) + "</td><td>[]</td></tr></table>"
-    data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords"},
-                          (200, {"html": json_html, "counts": {}}), (200, {"html": KEYWORDS_TABLE, "counts": {}}))
-    assert data["categories"] == {"Web": 1, "Plain classes / KeywordsProbe$OrderFixture": 3}
-    data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords", "filter": "order"},
-                          (200, {"html": json_html, "counts": {}}), (200, {"html": KEYWORDS_TABLE, "counts": {}}))
-    assert data["matches"] == 3
-    assert data["keywords"][0] == {
-        "category": "Plain classes / KeywordsProbe$OrderFixture", "special": False, "plain": True,
-        "keyword": "create order", "parameter_types": ["String", "int"],
-        "class": "fitlibrary.suite.KeywordsProbe$OrderFixture"}
-    assert data["keywords"][2]["keyword"] == "last order id" and data["keywords"][2]["parameter_types"] == []
-
-    # kind 'plain' (fitlibrary-netcare-mod #88) counts whatever else the row says
-    table = KEYWORDS_TABLE.replace("<td>simple</td><td>|''&lt;i&gt;wait", "<td>plain</td><td>|''&lt;i&gt;wait")
-    data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords", "filter": "wait"},
-                          (200, {"html": json_html, "counts": {}}), (200, {"html": table, "counts": {}}))
-    assert [k["keyword"] for k in data["keywords"]] == ["wait"]
-
-    # the keywords table can't be read: the annotated keywords all the same
-    data, fake = await _call("fitnesse_debug_inspect", {"kind": "keywords"},
-                             (200, {"html": json_html, "counts": {}}), (500, {"error": "boom"}))
-    assert data["categories"] == {"Web": 1}
+    kw = [{"name": "fitlibrary.suite.KeywordsProbe$OrderFixture", "children": [
+        {"name": "Create Order", "generated": True, "syntax": "|create order|%1|%2|"}]}]
+    html = "<table><tr><td>keywordsJson</td><td>" + json.dumps(kw) + "</td><td>[]</td></tr></table>"
+    data, fake = await _call("fitnesse_debug_inspect", {"kind": "keywords", "filter": "order"}, (200, {"html": html, "counts": {}}))
+    assert fake.actions == ["keywordsJson"]
+    assert data["keywords"] == [{"category": "fitlibrary.suite.KeywordsProbe$OrderFixture", "special": False,
+                                 "name": "Create Order", "generated": True, "syntax": "|create order|%1|%2|"}]
 
 
 @pytest.mark.asyncio
@@ -723,13 +705,13 @@ async def test_keywords_filter_leaves_out_help_texts(debug_env):
     ]}]
     html = "<table><tr><td>keywordsJson</td><td>" + json.dumps(kw).replace("&", "&amp;").replace("<", "&lt;") + "</td><td>[]</td></tr></table>"
     data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords", "filter": "clicks", "limit": 1},
-                          (200, {"html": html, "counts": {}}), NO_TABLE)
+                          (200, {"html": html, "counts": {}}))
     assert data["matches"] == 2 and len(data["keywords"]) == 1  # the filter still searches help texts
     entry = data["keywords"][0]
     assert "helpText" not in entry
     assert entry["tableItems"] == [{"syntax": "with %1", "mandatory": True}, {"syntax": "or %1"}]
     data, _ = await _call("fitnesse_debug_inspect", {"kind": "keywords", "filter": "clicks", "details": True},
-                          (200, {"html": html, "counts": {}}), NO_TABLE)
+                          (200, {"html": html, "counts": {}}))
     assert data["keywords"][0]["helpText"] == "clicks"
     assert data["keywords"][0]["tableItems"][0]["helpText"] == "This statement is mandatory."
 
@@ -772,7 +754,8 @@ async def test_status_reads_log_and_end_forgets_session(debug_env):
     )
     assert fake.actions == ["status", "log"]
     assert data["known_to_this_server"] is True
-    assert data["log"]["more"] is True and data["log"]["lines"][0] == "t [out] l0"
+    assert data["log"]["more"] is True and data["log"]["lines"][0] == "t [out] l0"  # not epoch ms: as it came
+    assert my_server._log_line({"stream": "out", "text": "X-Api-Key=k1", "time": "t"}) == "t [out] X-Api-Key=***"
     long = {"stream": "info", "text": "Command: java -cp " + "x.jar:" * 1000, "time": "t"}
     assert my_server._log_line(long).endswith(f"… ({len(long['text'])} chars)")
     assert len(my_server._log_line(long)) < 600
@@ -783,6 +766,43 @@ async def test_status_reads_log_and_end_forgets_session(debug_env):
     assert data["ended"] is True and len(data["log"]) == 2 and "log_omitted" not in data
     with pytest.raises(ToolError, match="no debug session"):
         await _call("fitnesse_debug_page_tables", {})
+
+
+def test_times_of_the_fork_read_as_local_time(monkeypatch):
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    try:
+        ms = 1794241563355  # 2026-11-09 16:26:03.355 UTC
+        assert my_server._clock(ms) == "16:26:03.355Z"
+        assert my_server._clock(str(ms), with_date=True) == "2026-11-09 16:26:03Z"
+        assert my_server._log_line({"time": ms, "stream": "out", "text": "x"}) == "16:26:03.355Z [out] x"
+        monkeypatch.setenv("TZ", "CET-1")
+        time.tzset()
+        assert my_server._clock(ms) == "17:26:03.355+01:00"
+        assert my_server._clock(None) == "" and my_server._clock("soon") == "soon"
+        status = my_server._readable_times({"startedAt": ms, "sessions": [{"session": "a", "startedAt": ms}, {"session": "b"}]})
+        assert status["startedAt"] == "2026-11-09 17:26:03+01:00"
+        assert status["sessions"] == [{"session": "a", "startedAt": "2026-11-09 17:26:03+01:00"}, {"session": "b"}]
+    finally:
+        monkeypatch.delenv("TZ")
+        time.tzset()
+
+
+@pytest.mark.asyncio
+async def test_status_and_start_show_started_at_as_time(debug_env, monkeypatch):
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    try:
+        other = _entry("b1", "Other.Page", startedAt=1794241563355)
+        data, _ = await _call("fitnesse_debug_status", {"max_log_lines": 0},
+                              (200, {"running": True, "sessions": [other], **other}))
+        assert data["startedAt"] == data["sessions"][0]["startedAt"] == "2026-11-09 16:26:03Z"
+        with pytest.raises(ToolError, match=r"started 2026-11-09 16:26:03Z\)"):
+            await _call("fitnesse_debug_start", {"suite": False, "page_path": "Other.Page"},
+                        (200, {"running": True, "sessions": [other], **other}))
+    finally:
+        monkeypatch.delenv("TZ")
+        time.tzset()
 
 
 @pytest.mark.asyncio
@@ -1532,7 +1552,13 @@ async def test_start_takes_suite_or_test_from_the_page_type(debug_env):
 @pytest.mark.asyncio
 async def test_start_refuses_a_page_that_is_neither_test_nor_suite(debug_env):
     with pytest.raises(ToolError, match="neither a test nor a suite page.*suite=true or suite=false"):
-        await _call("fitnesse_debug_start", {"page_path": "Static"}, (200, {"Suite": False, "Test": False}))
+        await _call("fitnesse_debug_start", {"page_path": "Static"}, (200, {"Suite": False, "Test": False}),
+                    (200, {"content": "notes"}))  # pageData: the page exists
+    # FitNesse answers properties of a missing page with every flag false; pageData says 404
+    with pytest.raises(ToolError, match="Missing does not exist on this FitNesse.*fitnesse_search") as caught:
+        await _call("fitnesse_debug_start", {"page_path": "Missing"}, (200, {"Suite": False, "Test": False}),
+                    (404, {"error": "not found"}))
+    assert "neither" not in str(caught.value) and "suite=true" not in str(caught.value)
     data, fake = await _call(  # properties not readable: started as a test page, the fork decides
         "fitnesse_debug_start", {"page_path": "P"},
         (404, {"error": "not found"}),
@@ -1609,9 +1635,10 @@ async def test_run_page_stops_at_the_first_failure_and_continues_after_it(debug_
                             (200, {"running": True, "session": "s1", "page": "FrontPage.T"}))
     assert status["next_table"] == 3
 
-    # fixed and run again on its own: does not move where the page goes on
+    # fixed and run again on its own: does not move where the page goes on, and says where that is
     data, fake = await _call("fitnesse_debug_run_page", {"tables": [2]}, page, _ran("step 2"))
-    assert "stopped_at" not in data and "next_table" not in data
+    assert "stopped_at" not in data and data["next_table"] == 3
+    assert "without tables to continue it at table 3" in data["hint"]
 
     data, fake = await _call("fitnesse_debug_run_page", {}, page, _ran("step 3"), _ran("close"))
     assert [r["form"]["html"] for r in fake.requests[1:]] == [_t("step 3"), _t("close")]
@@ -1627,6 +1654,36 @@ async def test_run_page_stops_at_the_first_failure_and_continues_after_it(debug_
         await _call("fitnesse_debug_run_page", {"from_table": 6}, page)
     with pytest.raises(ToolError, match="from_table continues"):
         await _call("fitnesse_debug_run_page", {"from_table": 1, "tables": [1]})
+
+
+@pytest.mark.asyncio
+async def test_run_page_refuses_a_page_that_is_neither_test_nor_suite(debug_env):
+    await _start("FrontPage.Suite", suite=True)
+    with pytest.raises(ToolError, match="FrontPage.Notes is neither a test nor a suite page.*fitnesse_debug_run_wiki") as caught:
+        await _call("fitnesse_debug_run_page", {"page_path": "FrontPage.Notes"}, (200, {"Test": False, "Suite": False}),
+                    (200, {"content": "notes"}))
+    assert "suite=true" not in str(caught.value)  # that is start's way out, not run_page's
+    with pytest.raises(ToolError, match="FrontPage.Gone does not exist"):
+        await _call("fitnesse_debug_run_page", {"page_path": "FrontPage.Gone"}, (200, {"Test": False, "Suite": False}),
+                    (404, {"error": "not found"}))
+    assert my_server._debug_state().current_page == "FrontPage.Suite"  # nothing ran, no page switch
+    # a test page outside the suite's pages runs; so does one whose properties can't be read
+    _, fake = await _call("fitnesse_debug_run_page", {"page_path": "Elsewhere.T", "tables": [0]},
+                          (200, {"Test": True}), (200, {"html": "", "counts": {}, "page": "Elsewhere.T"}),
+                          (200, {"page": "Elsewhere.T", "html": _t("x")}), _ran("x"))
+    assert fake.actions == ["properties", "nextPage", "pageHtml", "runTable"]
+    _, fake = await _call("fitnesse_debug_run_page", {"page_path": "Elsewhere.U", "tables": [0]},
+                          (404, {"error": "notFound"}), (200, {"html": "", "counts": {}, "page": "Elsewhere.U"}),
+                          (200, {"page": "Elsewhere.U", "html": _t("x")}), _ran("x"))
+    assert fake.actions == ["properties", "nextPage", "pageHtml", "runTable"]
+    # the start's pages and the current page: no properties asked
+    _, fake = await _call("fitnesse_debug_run_page", {"page_path": "FrontPage.Suite.B", "tables": [0]},
+                          (200, {"html": "", "counts": {}, "page": "FrontPage.Suite.B"}),
+                          (200, {"page": "FrontPage.Suite.B", "html": _t("b")}), _ran("b"))
+    assert fake.actions == ["nextPage", "pageHtml", "runTable"]
+    _, fake = await _call("fitnesse_debug_run_page", {"page_path": "FrontPage.Suite.B", "tables": [0]},
+                          (200, {"page": "FrontPage.Suite.B", "html": _t("b")}), _ran("b"))
+    assert fake.actions == ["pageHtml", "runTable"]
 
 
 @pytest.mark.asyncio
@@ -1769,7 +1826,7 @@ async def test_single_page_suite_setup_stops_at_a_failure_and_continues_into_the
                                                  "wiki": "|login|\n"}
     assert "stopped_at.wiki" in data["hint"]
     assert data["suite_setup"]["next_table"] == 2 and "tables" not in data
-    assert "fitnesse_debug_run_wiki" in data["hint"] and "table 2, then runs S.T" in data["hint"]
+    assert "fitnesse_debug_run_wiki" in data["hint"] and "table 2 (restart=true: from its first table), then runs S.T" in data["hint"]
 
     # fixed and run again on its own: the SuiteSetUp is the current page, no nextPage
     data, fake = await _call("fitnesse_debug_run_page", {"page_path": "S.SuiteSetUp", "tables": [1]},
@@ -1790,6 +1847,31 @@ async def test_single_page_suite_setup_stops_at_a_failure_and_continues_into_the
     # the SuiteSetUp ran once: the next call stays on the page
     data, fake = await _call("fitnesse_debug_run_page", {}, (200, {"page": "S.T", "html": _t("own")}))
     assert fake.actions == ["pageHtml"] and "suite_setup" not in data
+
+
+@pytest.mark.asyncio
+async def test_single_page_restart_runs_a_stopped_suite_setup_from_its_first_table(debug_env):
+    await _start_with_frame()
+    setup_page = (200, {"page": "S.SuiteSetUp", "html": SUITE_SETUP_HTML})
+    data, _ = await _call(
+        "fitnesse_debug_run_page", {},
+        (200, {"page": "S.SuiteSetUp", "html": "", "counts": {}}), setup_page,
+        _ran("start browser"), _ran("login", "fail"), (200, {"tables": [], "texts": [""]}),
+    )
+    assert data["suite_setup"]["next_table"] == 2 and "restart=true: from its first table" in data["hint"]
+    # restart: the SuiteSetUp's test begins afresh at table 0 instead of going on at 2
+    data, fake = await _call(
+        "fitnesse_debug_run_page", {"restart": True},
+        (200, {"page": "S.SuiteSetUp", "html": "", "counts": {}}),  # nextPage: the SuiteSetUp again
+        setup_page, _ran("start browser"), _ran("login"), _ran("accept cookies"),
+        (200, {"page": "S.T", "html": "", "counts": {}}),  # nextPage to the page
+        (200, {"page": "S.T", "html": _t("own")}), _ran("own"),
+    )
+    assert fake.actions == ["nextPage", "pageHtml", "runTable", "runTable", "runTable", "nextPage", "pageHtml", "runTable"]
+    assert fake.requests[0]["form"]["page"].lstrip(".") == "S.SuiteSetUp"
+    assert [r["form"]["html"] for r in fake.requests[2:5]] == [_t("start browser"), _t("login"), _t("accept cookies")]
+    assert data["suite_setup"]["restarted"] is True and data["suite_setup"]["page_done"] is True
+    assert data["page_done"] is True and "previous_page_teardown" not in data
 
 
 @pytest.mark.asyncio
@@ -1817,6 +1899,12 @@ KDTA_FAIL_HTML = (
     '<td><span class="note"><a target="_blank" href="/files/htmlSource/2026/11/07/03_06_12_683.html">HTML</a></span></td>'
     "</tr></table>"
 )
+
+
+@pytest.mark.parametrize("hr", ["<hr>", "<hr/>"])
+def test_a_failed_check_separates_expected_and_actual(hr):
+    text = my_server._tables_text(KDTA_FAIL_HTML.replace("<hr>", hr))
+    assert "| [fail] @{IHModel} expected ⏎ Actros actual |" in text
 
 
 @pytest.mark.asyncio
@@ -1893,6 +1981,10 @@ async def test_run_wiki_notes_passing_steps_for_saving(debug_env):
     data, _ = await _call("fitnesse_debug_run_wiki", {"wiki": "|click|//good|"}, _ran("click"))
     assert data["step"] == 3
 
+    with pytest.raises(ToolError, match="No step 4, 9: the noted steps are 1, 2, 3. Nothing was dropped"):
+        await _call("fitnesse_debug_steps", {"drop": [2, 9, 4]})
+    data, _ = await _call("fitnesse_debug_steps")
+    assert [s["step"] for s in data["steps"]] == [1, 2, 3]  # all still there
     data, fake = await _call("fitnesse_debug_steps", {"drop": [2]})
     assert fake.requests == []  # from memory, no request
     assert [s["step"] for s in data["steps"]] == [1, 3] and data["steps"][0]["page"] == "FrontPage.T"

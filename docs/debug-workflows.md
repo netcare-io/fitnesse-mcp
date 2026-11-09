@@ -76,11 +76,19 @@ fitnesse_debug_end
 This is the debugger in the browser: run to the failure, try fixes in the console, continue.
 Don't save every attempt and run it with `run_page(tables=[k])`: that changes the real page each
 time. After `run_wiki` passed, the step has happened in the session, so continue without running
-the saved table again. `tables=[k]` does not move `next_table`; `from_table` continues elsewhere (e.g. after tables before it were inserted or
+the saved table again. `tables=[k]` does not move `next_table` (its result repeats it while the
+page's run is stopped); `from_table` continues elsewhere (e.g. after tables before it were inserted or
 deleted). A test page's SuiteSetUp stops the same way: then the result has
 `suite_setup.stopped_at` and the page has not begun; fix the table the same way, and the next
 `run_page()` finishes the SuiteSetUp and goes on with the page. Before each new variant, bring the browser back to the state before
 table k (see below). `stop_on_failure=false` runs the whole page in one go, as a normal run.
+
+KDTA adds the 'Screen' and 'HTML' links to a failing table only when the test switched them on:
+`|''save screen on error''|true|` and `|''save html on error''|true|`, usually in the SetUp, and
+only for a `[fail]` or `[error]` of a browser keyword (`BrowserFixture`, `MobileAppFixture`):
+`click` or `|check|title|…|` get them, `|get|2|is|1|` does not. Without them the stop has no
+screenshot and there is nothing for `read_link`; look with `run_wiki` (`|show|…|`, record=false)
+instead.
 
 ## 2. Build a new test step by step
 
@@ -217,6 +225,7 @@ fitnesse_debug_end
 | `run_wiki` fails right after the start, with a `hint` about the SetUp | the SetUp has not run: `run_page(setup_only=true)`, then the tables again |
 | You need the whole log | `fitnesse_debug_status` before `fitnesse_debug_end`: end returns only the last 30 unread lines (`log_omitted` counts the rest) |
 | A table shows `[fail]` without a message | `fitnesse_debug_status`: the log of the test process often has the cause (e.g. `command not found`); long lines are cut at 500 characters |
+| A REST call fails and the table doesn't say why | `run_wiki` `\|''set logging''\|true\|` (after `with rest`), run the call again, then `fitnesse_debug_status`: request, status, headers and response body are in the log, secrets masked as `***`. The log shows the headers the test set, not the Authorization of `set basic auth`/OAuth2, and never the request body |
 
 Without a FitNesse login the session belongs to a cookie that this server keeps in memory: after a
 restart of the MCP server its old session cannot be adopted (even with `FITNESSE_ALLOW_ADOPT`) and

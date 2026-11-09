@@ -558,14 +558,14 @@ async def test_live_view_fills_in_the_url_per_browser(debug_env, monkeypatch):
                           (200, {**answer, "liveViewUrl": "https://grid.example/ui/#/session/{session}"}))
     assert data["live_view_url"] == "https://grid.example/ui/#/session/s-2" and "note" not in data
 
-    # a KDTA instance serves its grid at <instance>/grid: a localhost hub's links go there
+    # a KDTA instance serves its grid at <instance>/grid/hub: a localhost hub's links go there
     monkeypatch.setenv("FITNESSE_BASE_URL", "https://kdta.example/")
     await _start()  # debug state is per instance
     data, _ = await _call("fitnesse_debug_inspect", {"kind": "liveView"},
                           (200, {**answer, "liveViewUrl": "{hub}/ui/#/session/{session}"}))
-    assert data["live_view_url"] == "https://kdta.example/grid/ui/#/session/s-2" and "note" not in data
+    assert data["live_view_url"] == "https://kdta.example/grid/hub/ui/#/session/s-2" and "note" not in data
     data, _ = await _call("fitnesse_debug_inspect", {"kind": "liveView"}, (200, answer))
-    assert data["browsers"][0]["live_view_url"] == "https://kdta.example/grid/ui/#/session/s-2"
+    assert data["browsers"][0]["live_view_url"] == "https://kdta.example/grid/hub/ui/#/session/s-2"
 
     # no browser yet
     data, _ = await _call("fitnesse_debug_inspect", {"kind": "liveView"}, (200, {

@@ -631,9 +631,9 @@ fitnesse_table_source ──> fitnesse_table_save / _insert / _delete / _move / 
   (`browsers[].live_view_url`, the selected one as `live_view_url`). Without
   it, the link goes to the Grid UI. The hub is the address the test process
   uses, often `localhost`: then the links (`{hub}` too) go to the grid a KDTA
-  instance serves at `<FITNESSE_BASE_URL>/grid` (e.g.
-  `https://kdta.example/grid/ui/#/session/<id>`), unless FitNesse itself runs
-  on `localhost`. A link still on `localhost` gets a `note` that it may need
+  instance serves at `<FITNESSE_BASE_URL>/grid/hub` (e.g.
+  `https://kdta.example/grid/hub/ui/#/session/<id>`), unless FitNesse itself
+  runs on `localhost`. A link still on `localhost` gets a `note` that it may need
   the host's real name.
 
 Notes:

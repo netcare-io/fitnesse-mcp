@@ -3830,10 +3830,10 @@ def _is_local(url: str) -> bool:
 
 def _grid_root(hub: str, instance: str) -> str:
     """The Selenium Grid's address from a hub URL: without /wd/hub and the trailing /. A hub on
-    localhost is the test process's view: a KDTA instance serves its grid at <instance>/grid."""
+    localhost is the test process's view: a KDTA instance serves its grid at <instance>/grid/hub."""
     root = hub.strip().rstrip("/").removesuffix("/wd/hub")
     if root and _is_local(root) and not _is_local(instance):
-        return instance.rstrip("/") + "/grid"
+        return instance.rstrip("/") + "/grid/hub"
     return root
 
 

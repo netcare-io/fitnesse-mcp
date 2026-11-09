@@ -21,6 +21,12 @@ What to keep in mind:
 - **A session is a living test process.** Browsers, objects in scope and variables carry over
   from one call to the next until `fitnesse_debug_end`. Nothing goes into the test history. In a
   suite session they also carry over from page to page, as in a `?suite` run.
+- **One object per class, or named ones.** Several objects of one class only come with
+  `|add named|`, and only while the class has no global (`|add global|`) or local object yet.
+  So either `add named` first: then any number of named objects, but no global or local one of
+  that class any more; or global and local first: then no `add named` for it. With both a
+  global and a local object, the local one comes first in the scope (`inspect(kind='scope')`)
+  and wins, but it is gone at the next test, and the global one answers again.
 - **SetUp first.** `fitnesse_debug_run_wiki` does not add the page's SetUp. Run
   `fitnesse_debug_run_page(setup_only=true)` right after the start, otherwise defined actions,
   the browser and fixtures are missing. As in a normal test run, the first `run_page` also runs

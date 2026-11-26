@@ -1588,6 +1588,55 @@ async def test_auth_headers_mode_never_falls_back_to_server_account(auth_env, he
     urlopen.assert_not_called()
 
 
+def _jwt(claims: dict) -> str:
+    """An unsigned JWT with the given claims (this server reads them, FitNesse's proxy checks them)."""
+    def part(data: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip("=")
+    return f"{part({'alg': 'RS256'})}.{part(claims)}.sig"
+
+
+@pytest.mark.asyncio
+async def test_auth_bearer_mode_passes_each_callers_token_on(auth_env):
+    auth_env("bearer")
+    for sub in ("alice", "bob"):
+        token = _jwt({"iss": "https://sso.example/realms/r", "sub": sub})
+        sent = await _call_over_http({"Authorization": f"Bearer {token}"})
+        assert sent == [f"Bearer {token}"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headers", [
+    {},
+    {"Authorization": "Basic Ym9iOnB3"},
+    {"Authorization": "Token abc"},
+    {"X-FitNesse-Username": "bob", "X-FitNesse-Password": "pw"},
+])
+async def test_auth_bearer_mode_never_falls_back(auth_env, headers):
+    auth_env("bearer")
+    with pytest.raises(ToolError, match="Authorization: Bearer"):
+        await _call_over_http(headers)
+    with _patch_urlopen() as urlopen, pytest.raises(ToolError, match="FITNESSE_AUTH_MODE=bearer"):
+        async with Client(my_server.mcp) as c:  # in-memory: no HTTP request, no headers
+            await c.call_tool("fitnesse_get_properties", {"page_path": "FrontPage"})
+    urlopen.assert_not_called()
+
+
+def test_auth_bearer_mode_keeps_debug_sessions_apart_per_user(auth_env):
+    auth_env("bearer")
+
+    def state(token: str):
+        with patch.object(my_server, "get_http_headers", return_value={"authorization": f"Bearer {token}"}):
+            return my_server._debug_state()
+
+    iss = "https://sso.example/realms/r"
+    alice = state(_jwt({"iss": iss, "sub": "alice", "jti": "1"}))
+    assert state(_jwt({"iss": iss, "sub": "alice", "jti": "2"})) is alice  # refreshed token, same user
+    assert state(_jwt({"iss": iss, "sub": "bob"})) is not alice
+    assert state(_jwt({"iss": "https://other.example", "sub": "alice"})) is not alice
+    opaque = state("not-a-jwt")
+    assert opaque is not alice and state("not-a-jwt") is opaque and state("other-opaque") is not opaque
+
+
 def test_auth_headers_mode_keeps_debug_sessions_apart(auth_env):
     auth_env("headers")
     with patch.object(my_server, "get_http_headers", return_value={"x-fitnesse-username": "alice", "x-fitnesse-password": "a"}):
@@ -1632,10 +1681,11 @@ def test_auth_mode_rejects_unknown_value(monkeypatch):
         my_server._auth_mode_from_env()
 
 
-def test_auth_headers_mode_refuses_stdio(auth_env, monkeypatch):
+@pytest.mark.parametrize("mode", ["headers", "bearer"])
+def test_auth_headers_mode_refuses_stdio(auth_env, monkeypatch, mode):
     import fastmcp
 
-    auth_env("headers")
+    auth_env(mode)
     monkeypatch.setattr(fastmcp.settings, "transport", "stdio")
     with patch.object(my_server.mcp, "run") as run, pytest.raises(SystemExit, match="HTTP transport"):
         my_server.main()

@@ -1030,7 +1030,8 @@ def fitnesse_move_page(
     description=(
         'Lists the child pages of page_path (default: the top level) as a list of names '
         '(body). recursive=true lists the whole subtree as paths relative to page_path. Use it '
-        'to find pages; fitnesse_search finds them by content.'
+        'to find pages. recursive can time out on big trees: '
+        'go level by level, name_filter finds a name in a long list.'
     ),
     tags={"fitnesse", "rest", "pages", "read"},
     annotations={"readOnlyHint": True},
@@ -1041,6 +1042,10 @@ def fitnesse_list_names(
     leaf_only: Annotated[bool, Field(description="Only pages without children.")] = False,
     show_tags: Annotated[bool, Field(description="Append each page's tags to its name.")] = False,
     show_child_count: Annotated[bool, Field(description="Append each page's number of children to its name, e.g. 'MySuite 4'.")] = False,
+    name_filter: Annotated[
+        str | None,
+        Field(description="Only names containing this text (case-insensitive)."),
+    ] = None,
     timeout_seconds: float = _make_timeout(30.0),
 ) -> dict:
     """List page names using responder=names."""
@@ -1053,7 +1058,14 @@ def fitnesse_list_names(
         params["ShowTags"] = None
     if show_child_count:
         params["ShowChildCount"] = None
-    return _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+    result = _request("GET", page_path, params=params, timeout_seconds=timeout_seconds)
+    body = result.get("body")
+    if name_filter and result.get("ok") and isinstance(body, list):
+        needle = name_filter.casefold()
+        result["body"] = [n for n in body if needle in str(n).casefold()]
+        result["count"] = len(result["body"])
+        result["total"] = len(body)
+    return result
 
 
 if COMPLETE_TOOLSET:
@@ -1857,16 +1869,30 @@ def fitnesse_search(
 _SEARCH_TABLE = re.compile(r'<table id="searchResultsTable".*?<tbody>(.*?)</tbody>', re.S)
 _SEARCH_ROW = re.compile(r"<tr>\s*<td>(.*?)</td>\s*<td>(.*?)</td>\s*<td[^>]*>(.*?)</td>\s*<td>(.*?)</td>", re.S)
 _SEARCH_FEEDBACK = re.compile(r"getElementById\(\"feedback\"\)\.innerHTML = '([^']*)'")
+_JAVA_EXCEPTION = re.compile(r"^\s*((?:[a-z]\w*\.)+\w*(?:Exception|Error)\b[^\n<]*)", re.M)
 _MAX_MATCHES = 200
 
 
 def _search_matches(result: dict) -> dict:
-    """The rows of a search responder's result table as matches; the answer as it is if there is none."""
+    """The rows of a search responder's result table as matches; without a table no HTML, only a note."""
     body = result.get("body")
-    if not result.get("ok") or result.get("truncated") or not isinstance(body, str):
+    if not result.get("ok") or not isinstance(body, str):
         return result
-    table = _SEARCH_TABLE.search(body)
+    table = None if result.get("truncated") else _SEARCH_TABLE.search(body)
     if not table:
+        # the search page is ~10k chars of HTML: don't hand it to the model
+        del result["body"]
+        result["count"] = 0
+        result["matches"] = []
+        crash = _JAVA_EXCEPTION.search(body)
+        if crash:
+            result["ok"] = False
+            result["error"] = (f"FitNesse's search failed with {crash.group(1).strip()}; "
+                               "try another search_scope or search_type, or fitnesse_list_names")
+        elif result.get("truncated"):
+            result["note"] = "The answer was too long to read the results; narrow the search with search_scope."
+        else:
+            result["note"] = "No result table in FitNesse's answer."
         return result
     matches = []
     for kind, page, tags, modified in _SEARCH_ROW.findall(table.group(1)):

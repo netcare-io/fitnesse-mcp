@@ -1115,11 +1115,50 @@ def test_search_matches_are_parsed():
     assert out["matches"][1]["page"] == "A.S"
 
 
-def test_search_without_results_says_so_and_unknown_html_passes_through():
+def test_search_without_results_says_so_and_drops_unknown_html():
     none = '<table id="searchResultsTable"><tbody></tbody></table>'
     assert my_server._search_matches({"ok": True, "status": 200, "body": none})["count"] == 0
-    odd = {"ok": True, "status": 200, "body": "<html>no table</html>"}
-    assert my_server._search_matches(odd) == odd
+    odd = my_server._search_matches({"ok": True, "status": 200, "body": "<html>no table</html>"})
+    assert "body" not in odd and odd["count"] == 0 and odd["matches"] == [] and odd["note"]
+
+
+def test_search_crash_is_an_error_without_html():
+    # netcare's FitNesse breaks off the page with a stack trace, e.g. on a title search with searchScope
+    crashed = (
+        '<p id="feedback">Searching...</p><table id="searchResultsTable"><thead></thead>\n <tbody>\n\n'
+        'java.lang.NullPointerException\n\tfitnesse.wiki.search.WikiPageFinder.search(WikiPageFinder.java:20)\n'
+    )
+    out = my_server._search_matches({"ok": True, "status": 200, "body": crashed})
+    assert out["ok"] is False and "body" not in out
+    assert "java.lang.NullPointerException" in out["error"] and out["matches"] == []
+
+
+def test_search_truncated_answer_is_dropped():
+    out = my_server._search_matches({"ok": True, "status": 200, "truncated": True, "body": "<html>" + "x" * 100})
+    assert "body" not in out and "search_scope" in out["note"]
+
+
+def _names_stub(names):
+    def fake(method, path, params=None, timeout_seconds=30.0, **kw):
+        return {"ok": True, "status": 200, "body": list(names), "truncated": False}
+    return patch.object(my_server, "_request", side_effect=fake)
+
+
+@pytest.mark.asyncio
+async def test_list_names_filter_is_case_insensitive():
+    with _names_stub(["FrontPage", "Training", "KdtaTrainingSuite", "FIT"]):
+        async with Client(my_server.mcp) as c:
+            res = await c.call_tool("fitnesse_list_names", {"name_filter": "training"})
+    out = res.structured_content
+    assert out["body"] == ["Training", "KdtaTrainingSuite"] and out["count"] == 2 and out["total"] == 4
+
+
+@pytest.mark.asyncio
+async def test_list_names_without_filter_is_unchanged():
+    with _names_stub(["A", "B"]):
+        async with Client(my_server.mcp) as c:
+            res = await c.call_tool("fitnesse_list_names", {})
+    assert res.structured_content["body"] == ["A", "B"] and "count" not in res.structured_content
 
 
 @pytest.mark.asyncio

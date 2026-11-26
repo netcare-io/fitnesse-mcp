@@ -190,6 +190,11 @@ Parameter mapping for `fitnesse_search_properties`:
   plus `note` when nothing matched and `left_out` above 200 matches. `fitnesse_search`
   now really runs the search (FitNesse answers only the search form without
   `isTextSearch`/`isMethodSearch`). Anything that read `body` has to read `matches`.
+  Since 1.2.0 `fitnesse_search` never returns the HTML: without a result table it
+  answers `count: 0` with a `note`, and when FitNesse's search crashes (it breaks off
+  the page with a Java stack trace) `ok: false` with the exception in `error`.
+- **`fitnesse_list_names` `name_filter`** (1.2.0) keeps only the names that contain the
+  text (case-insensitive) and adds `count` and `total`.
 - **The tools that change pages answer short**: `fitnesse_add_child_page`,
   `fitnesse_delete_page`, `fitnesse_move_page`, `fitnesse_rename_page` and
   `fitnesse_save_page_content` return `ok`, `status` and a `message` (on failure also

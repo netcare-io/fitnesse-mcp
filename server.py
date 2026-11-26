@@ -5,6 +5,7 @@ import binascii
 import difflib
 from html import unescape as _unescape_html
 import http.client
+import hashlib
 import json
 import logging
 import mimetypes
@@ -139,7 +140,9 @@ COMPLETE_TOOLSET = "complete" in FITNESSE_TOOLSETS
 # Whose FitNesse account a call uses. env: FITNESSE_USERNAME/FITNESSE_PASSWORD for every caller.
 # headers: each HTTP request brings its own (HEADER_USERNAME/HEADER_PASSWORD); the env pair is
 # ignored, so a shared server never falls back to its own account.
-type AuthMode = Literal["env", "headers"]
+# bearer: each HTTP request brings an OAuth access token (Authorization: Bearer), which is passed
+# on to FitNesse unchanged; an OIDC proxy in front of FitNesse checks it. No fallback either.
+type AuthMode = Literal["env", "headers", "bearer"]
 AUTH_MODES: tuple[str, ...] = get_args(AuthMode.__value__)
 HEADER_USERNAME = "X-FitNesse-Username"
 HEADER_PASSWORD = "X-FitNesse-Password"
@@ -170,7 +173,7 @@ def _make_run_timeout():
 
 
 def _credentials() -> tuple[str | None, str | None]:
-    """FitNesse username and password for the current call (see FITNESSE_AUTH_MODE)."""
+    """FitNesse username and password for the current call (env and headers modes)."""
     if FITNESSE_AUTH_MODE == "env":
         return os.getenv("FITNESSE_USERNAME"), os.getenv("FITNESSE_PASSWORD")
     headers = get_http_headers()  # lower-case names; {} outside an HTTP request
@@ -182,6 +185,51 @@ def _credentials() -> tuple[str | None, str | None]:
             f"{HEADER_PASSWORD} headers of every request (HTTP transport only)."
         )
     return username, password
+
+
+def _bearer_token() -> str:
+    """The caller's OAuth access token (bearer mode)."""
+    raw = get_http_headers(include={"authorization"}).get("authorization", "")
+    scheme, _, token = raw.strip().partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise ToolError(
+            "FITNESSE_AUTH_MODE=bearer: send your OAuth access token in the Authorization: Bearer "
+            "header of every request (HTTP transport only)."
+        )
+    return token.strip()
+
+
+def _token_owner(token: str) -> str:
+    """Who a bearer token belongs to (issuer and subject), only to keep debug sessions apart.
+
+    The claims are read without checking the signature: the OIDC proxy in front of FitNesse
+    checks the token on every request. A token without readable claims counts as its own owner."""
+    try:
+        part = token.split(".")[1]
+        claims = json.loads(b64decode(part + "=" * (-len(part) % 4), altchars=b"-_", validate=True))
+        subject = claims.get("sub") or claims.get("preferred_username")
+        if subject:
+            return f"{claims.get('iss', '')}#{subject}"
+    except (IndexError, ValueError, AttributeError, binascii.Error):
+        pass
+    return "token:" + hashlib.sha256(token.encode()).hexdigest()
+
+
+def _caller() -> str:
+    """Who the current call acts as: the FitNesse username, or the bearer token's owner."""
+    if FITNESSE_AUTH_MODE == "bearer":
+        return _token_owner(_bearer_token())
+    return _credentials()[0] or ""
+
+
+def _apply_auth(req: request.Request, username: str | None = None, password: str | None = None) -> None:
+    """Add the current call's FitNesse login (see FITNESSE_AUTH_MODE), or the given one."""
+    if username is None and password is None:
+        if FITNESSE_AUTH_MODE == "bearer":
+            req.add_header("Authorization", f"Bearer {_bearer_token()}")
+            return
+        username, password = _credentials()
+    _apply_basic_auth(req=req, username=username, password=password)
 
 
 HEADER_BASE_URL = "X-FitNesse-Url"
@@ -381,12 +429,10 @@ def _request(
 ) -> dict:
     if base_url is None:
         base_url = _base_url()
-    if username is None and password is None:
-        username, password = _credentials()
     url = _build_url(base_url=base_url, path=path, params=params)
     data = body.encode() if isinstance(body, str) else body
     req = request.Request(url=url, data=data, method=method.upper())
-    _apply_basic_auth(req=req, username=username, password=password)
+    _apply_auth(req, username, password)
 
     if content_type:
         req.add_header("Content-Type", content_type)
@@ -464,11 +510,9 @@ def _request_bytes(
     """Like _request, but returns the raw response body bytes undecoded."""
     if base_url is None:
         base_url = _base_url()
-    if username is None and password is None:
-        username, password = _credentials()
     url = _build_url(base_url=base_url, path=path, params=params)
     req = request.Request(url=url, method=method.upper())
-    _apply_basic_auth(req=req, username=username, password=password)
+    _apply_auth(req, username, password)
 
     try:
         with request.urlopen(req, timeout=timeout_seconds) as response:
@@ -2647,7 +2691,7 @@ _DEBUG_STATES_LOCK = threading.Lock()
 def _debug_state() -> _DebugState:
     key = (
         _base_url().rstrip("/"),
-        _credentials()[0] or "",
+        _caller(),
     )
     with _DEBUG_STATES_LOCK:
         return _DEBUG_STATES.setdefault(key, _DebugState())
@@ -2786,7 +2830,6 @@ def _debug_post_once(
     and HTTP errors; 409 noSession/replaced also forget the session.
     """
     base_url = _base_url()
-    username, password = _credentials()
     url = _build_url(base_url, page_path, {"responder": responder})
     fields: dict[str, str] = {"action": action}
     for key, value in (form or {}).items():
@@ -2794,7 +2837,7 @@ def _debug_post_once(
             continue
         fields[key] = ("true" if value else "false") if isinstance(value, bool) else str(value)
     req = request.Request(url=url, data=parse.urlencode(fields).encode(), method="POST")
-    _apply_basic_auth(req=req, username=username, password=password)
+    _apply_auth(req)
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
     req.add_header("Accept", "application/json")
     # Without it an expired SSO login answers each request with a redirect plus state cookie.
@@ -2851,7 +2894,8 @@ def _debug_post_once(
         raise ToolError(
             f"FitNesse answered '{action}' with HTTP {status} and {content_type or 'no content type'} "
             "instead of JSON. Most likely the login is missing, expired or wrong (set "
-            "FITNESSE_USERNAME/FITNESSE_PASSWORD or the X-FitNesse-* headers; Basic Auth bypasses the SSO), or this FitNesse "
+            "FITNESSE_USERNAME/FITNESSE_PASSWORD, the X-FitNesse-* headers or a valid bearer token; Basic Auth "
+            "bypasses the SSO), or this FitNesse "
             f"has no {responder} responder."
         )
     if state is not None and status == 504:
@@ -5607,8 +5651,10 @@ def main() -> None:
     """Entry point of the fitnesse-mcp command: stdio unless FASTMCP_TRANSPORT says otherwise."""
     import fastmcp
 
-    if FITNESSE_AUTH_MODE == "headers" and fastmcp.settings.transport == "stdio":
-        raise SystemExit("FITNESSE_AUTH_MODE=headers needs the HTTP transport (FASTMCP_TRANSPORT=http).")
+    if FITNESSE_AUTH_MODE in {"headers", "bearer"} and fastmcp.settings.transport == "stdio":
+        raise SystemExit(
+            f"FITNESSE_AUTH_MODE={FITNESSE_AUTH_MODE} needs the HTTP transport (FASTMCP_TRANSPORT=http)."
+        )
     mcp.run()
 
 

@@ -62,7 +62,8 @@ that, and both are opt-in:
   can make the server call any host it can reach, including internal ones.
   In `FITNESSE_AUTH_MODE=env` the server also sends its own FitNesse login
   there. Expose an HTTP deployment only to people you trust with that, or use
-  `FITNESSE_AUTH_MODE=headers` so the only credentials sent are the caller's.
+  `FITNESSE_AUTH_MODE=headers` or `bearer` so the only credentials sent are the
+  caller's.
 
 Three further notes:
 
@@ -97,7 +98,7 @@ Three further notes:
 | Variable | Default | Description |
 |---|---|---|
 | `FITNESSE_BASE_URL` | `http://localhost:8080` | FitNesse server base URL. Over HTTP a request can name another instance in the optional `X-FitNesse-Url` header (see [Security](#security)) |
-| `FITNESSE_AUTH_MODE` | `env` | `env`: every call uses `FITNESSE_USERNAME` / `FITNESSE_PASSWORD`. `headers`: every HTTP request brings its own FitNesse login in `X-FitNesse-Username` / `X-FitNesse-Password`; the env pair is ignored and a request without them fails. HTTP transport only |
+| `FITNESSE_AUTH_MODE` | `env` | `env`: every call uses `FITNESSE_USERNAME` / `FITNESSE_PASSWORD`. `headers`: every HTTP request brings its own FitNesse login in `X-FitNesse-Username` / `X-FitNesse-Password`; the env pair is ignored and a request without them fails. `bearer`: every HTTP request brings an OAuth access token in `Authorization: Bearer`, which goes to FitNesse unchanged for the OIDC proxy in front of it to check; the env pair is ignored and a request without a token fails. `headers` and `bearer`: HTTP transport only |
 | `FITNESSE_USERNAME` | _(none)_ | Basic Auth username (`env` mode) |
 | `FITNESSE_PASSWORD` | _(none)_ | Basic Auth password (`env` mode) |
 | `FITNESSE_TOOLSETS` | **required** | Comma-separated toolsets. `all` = `read,write,test` (every mode, no area); `all,debug,complete` grants everything. **Modes** `read`, `write`, `test` (named after FitNesse's `secure-read`/`-write`/`-test`) filter every tool: `read` reads pages, history, and files; `write` changes pages and files (also `fitnesse_shutdown` / `fitnesse_save_account`, which still need their own flag); `test` runs and stops tests. **Areas** `debug` (KDTA debug tools, `fitnesse_debug_*` / `fitnesse_table_*`; needs netcare's FitNesse fork with the `debugTest`/`debugTable` responders) and `complete` (21 lower-traffic tools, marked below) add tools, which are still filtered by the modes: `read,debug` shows only the reading debug tools. A missing or empty value, an area without a mode, or an unknown value stops the server at startup |
@@ -788,6 +789,22 @@ claude mcp add --transport http fitnesse https://fitnesse-mcp.example/mcp \
 Add `--header "X-FitNesse-Url: https://other-fitnesse.example"` to work on
 another FitNesse instance than the server's `FITNESSE_BASE_URL`; debug
 sessions are kept apart per instance and user.
+
+With `FITNESSE_AUTH_MODE=bearer` the server passes each caller's OAuth access
+token on to FitNesse, e.g. when an MCP client such as Open WebUI forwards the
+user's SSO token:
+
+```bash
+claude mcp add --transport http fitnesse https://fitnesse-mcp.example/mcp \
+  --header "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+This needs an OIDC proxy in front of FitNesse that accepts bearer tokens besides
+its browser login (with Apache's mod_auth_openidc: `AuthType auth-openidc` and
+`OIDCOAuthVerifyJwksUri`), and a token whose audience that proxy accepts. The
+server itself does not check the token; it reads the issuer and subject only to
+keep debug sessions apart per user. Which FitNesse user a request acts as is up
+to the proxy.
 
 With `headers`, FitNesse sees each user's own account: its page rights apply,
 and changes and debug sessions are recorded under that user. The headers carry
